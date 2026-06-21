@@ -6,6 +6,7 @@ from typing import Any
 
 from memslicer.acquirer.bridge import (
     DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo,
+    RegisterValue, ThreadInfo, register_role, register_width_bytes,
 )
 from memslicer.acquirer.platform_detect import detect_platform
 
@@ -29,6 +30,17 @@ rpc.exports = {
     },
     enumerateModules: function() {
         return Process.enumerateModules();
+    },
+    enumerateThreads: function() {
+        return Process.enumerateThreads().map(function(t) {
+            var ctx = {};
+            var raw = t.context || {};
+            for (var k in raw) {
+                try { ctx[k] = raw[k].toString(); }
+                catch (e) { ctx[k] = String(raw[k]); }
+            }
+            return {id: t.id, state: t.state, context: ctx};
+        });
     },
     getPlatform: function() {
         return Process.platform;
@@ -197,6 +209,56 @@ class FridaBridge:
             )
             for m in raw
         ]
+
+    # Frida thread.state strings -> MSL ThreadState codes (spec Table 19a).
+    _STATE_MAP = {
+        "running": 1, "stopped": 3, "waiting": 4,
+        "uninterruptible": 4, "halted": 3,
+    }
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Enumerate threads with register state via Frida RPC.
+
+        Frida exposes both arch-specific names (``rip``/``rsp``) and the
+        generic ``pc``/``sp`` aliases. On x86/x86_64 the generic aliases
+        duplicate ``rip``/``rsp``/``eip``/``esp`` and are dropped; on
+        AArch64 ``pc``/``sp`` ARE the canonical names and are kept.
+        """
+        try:
+            raw = self._api.enumerate_threads()
+        except Exception as exc:
+            self._log.warning("Thread enumeration failed: %s", exc)
+            return []
+
+        arch = self._platform_info.arch if self._platform_info else None
+        width = register_width_bytes(arch) if arch is not None else 8
+
+        threads: list[ThreadInfo] = []
+        for idx, t in enumerate(raw):
+            ctx = t.get("context", {}) or {}
+            names = set(ctx)
+            drop_pc = bool(names & {"rip", "eip"})
+            drop_sp = bool(names & {"rsp", "esp"})
+            regs: list[RegisterValue] = []
+            for name, val in ctx.items():
+                if name == "pc" and drop_pc:
+                    continue
+                if name == "sp" and drop_sp:
+                    continue
+                try:
+                    ival = _parse_frida_addr(val)
+                except (TypeError, ValueError):
+                    continue
+                regs.append(RegisterValue(
+                    name=name, value=ival, size=width, role=register_role(name),
+                ))
+            threads.append(ThreadInfo(
+                tid=t.get("id", 0),
+                registers=regs,
+                is_current=(idx == 0),
+                state=self._STATE_MAP.get(t.get("state", ""), 0),
+            ))
+        return threads
 
     def read_memory(self, address: int, size: int) -> bytes | None:
         """Read memory via Frida RPC. Returns None on failure."""

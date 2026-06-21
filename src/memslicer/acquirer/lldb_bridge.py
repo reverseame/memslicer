@@ -9,6 +9,10 @@ from memslicer.acquirer.bridge import (
     MemoryRange,
     ModuleInfo,
     PlatformInfo,
+    RegisterValue,
+    ThreadInfo,
+    register_role,
+    register_width_bytes,
 )
 from memslicer.acquirer.platform_detect import (
     detect_os_from_maps,
@@ -384,6 +388,56 @@ class LLDBBridge:
 
         self._log.debug("Enumerated %d modules via LLDB", len(modules))
         return modules
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Enumerate threads with register state via the LLDB Python API.
+
+        Reads the frame-0 register file for every thread. Vector/extended
+        registers wider than 8 bytes are skipped (the value pipeline carries
+        integer registers); GPRs and the program counter are preserved.
+        """
+        _lldb = self._lldb
+        process = self._process
+        if process is None:
+            return []
+
+        try:
+            selected_tid = process.GetSelectedThread().GetThreadID()
+        except Exception:
+            selected_tid = None
+
+        width = register_width_bytes(self.get_platform_info().arch)
+        threads: list[ThreadInfo] = []
+
+        for i in range(process.GetNumThreads()):
+            thread = process.GetThreadAtIndex(i)
+            tid = thread.GetThreadID()
+            frame = thread.GetFrameAtIndex(0)
+            regs: list[RegisterValue] = []
+            if frame.IsValid():
+                error = _lldb.SBError()
+                for reg_set in frame.GetRegisters():
+                    for reg in reg_set:
+                        name = reg.GetName()
+                        if not name:
+                            continue
+                        byte_size = reg.GetByteSize() or width
+                        if byte_size > 8:
+                            continue  # vector/extended register; skip
+                        value = reg.GetValueAsUnsigned(error, 0)
+                        if error.Fail():
+                            continue
+                        regs.append(RegisterValue(
+                            name=name.lower(), value=value, size=byte_size,
+                            role=register_role(name),
+                        ))
+            threads.append(ThreadInfo(
+                tid=tid,
+                registers=regs,
+                is_current=(tid == selected_tid) if selected_tid is not None else (i == 0),
+                state=3,  # process is stopped while attached
+            ))
+        return threads
 
     def read_memory(self, address: int, size: int) -> bytes | None:
         """Read *size* bytes starting at *address*. Return None on failure."""

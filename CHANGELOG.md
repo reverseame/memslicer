@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Capture per-thread CPU register state into Thread Context blocks
+  (0x0011, spec Section 5.7) so a slice can be emulated/stepped by a
+  consumer. Supported on the Frida, GDB and LLDB backends; the
+  `ThreadContexts` capability bit is set when registers are captured.
+  Disable with `--no-registers`. Bumps the MSL format version to 1.1.
+
 ### Bug Fixes
 
 - Investigation mode: the `SystemProcessTable` / `SystemNetworkTable` /

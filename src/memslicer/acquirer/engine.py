@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from memslicer.acquirer.base import AcquireResult, BaseAcquirer
-from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange
+from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange, ThreadInfo
 from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
 from memslicer.acquirer.investigation import InvestigationCollector
@@ -19,11 +19,13 @@ from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
     CompAlgo, HashAlgo, OSType, PageState, RegionType, CapBit,
     Endianness, VERSION, HASH_SIZE, FLAG_INVESTIGATION, FLAG_ENCRYPTED,
+    ThreadState, THREAD_FLAG_CURRENT,
+    REG_FLAG_PC, REG_FLAG_SP, REG_FLAG_FP, REG_FLAG_FLAGS,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, TargetIntrospection,
-    KernelSymbolBundle,
+    KernelSymbolBundle, ThreadContext, ThreadRegister,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.protection import (
@@ -34,6 +36,54 @@ from memslicer.utils.timestamps import now_ns
 
 # Default max chunk size for splitting large regions (same as fridump)
 _DEFAULT_MAX_CHUNK = 20971520  # 20 MB
+
+
+_REG_ROLE_FLAG = {
+    "pc": REG_FLAG_PC, "sp": REG_FLAG_SP,
+    "fp": REG_FLAG_FP, "flags": REG_FLAG_FLAGS,
+}
+
+
+def _build_thread_contexts(threads: list[ThreadInfo]) -> list[ThreadContext]:
+    """Convert bridge :class:`ThreadInfo` records into MSL ThreadContext blocks.
+
+    Register integer values are encoded as little-endian bytes of the
+    reported width. Exactly one resulting block carries the ``Current``
+    flag (falling back to the first thread when no bridge marked one).
+    """
+    contexts: list[ThreadContext] = []
+    for t in threads:
+        regs: list[ThreadRegister] = []
+        for rv in t.registers:
+            width = rv.size or 8
+            try:
+                value = int(rv.value) & ((1 << (width * 8)) - 1)
+                value_bytes = value.to_bytes(width, "little")
+            except (OverflowError, ValueError, TypeError):
+                continue
+            regs.append(ThreadRegister(
+                name=rv.name,
+                value=value_bytes,
+                flags=_REG_ROLE_FLAG.get(rv.role, 0),
+            ))
+        try:
+            state = ThreadState(t.state)
+        except ValueError:
+            state = ThreadState.Unknown
+        contexts.append(ThreadContext(
+            thread_id=t.tid,
+            flags=THREAD_FLAG_CURRENT if t.is_current else 0,
+            state=state,
+            name=t.name,
+            registers=regs,
+        ))
+    # Spec Section 5.7: a producer MUST include at least PC/SP, so blocks
+    # without any register are dropped before this list is written. Ensure
+    # the Current flag lands on a block that survives that filter.
+    with_regs = [c for c in contexts if c.registers]
+    if with_regs and not any(c.flags & THREAD_FLAG_CURRENT for c in with_regs):
+        with_regs[0].flags |= THREAD_FLAG_CURRENT
+    return contexts
 
 
 def _build_target_introspection(proc_info, pid: int) -> TargetIntrospection:
@@ -246,10 +296,12 @@ class AcquisitionEngine(BaseAcquirer):
         *,
         attribution: AttributionConfig | None = None,
         hash_algo: HashAlgo = HashAlgo.BLAKE3,
+        capture_threads: bool = True,
     ) -> None:
         self._bridge = bridge
         self._comp_algo = comp_algo
         self._hash_algo = hash_algo
+        self._capture_threads = capture_threads
         self._filter = region_filter or RegionFilter()
         self._os_override = os_override
         self._abort = threading.Event()
@@ -365,10 +417,25 @@ class AcquisitionEngine(BaseAcquirer):
                         "build-id extraction failed: %s", exc,
                     )
 
+            # Enumerate thread register state (capture-time). Done before
+            # the header is serialized so the CapBitmap reflects it.
+            thread_contexts: list[ThreadContext] = []
+            if self._capture_threads:
+                self._log.info("Enumerating threads...")
+                try:
+                    threads_raw = self._bridge.enumerate_threads()
+                except Exception as exc:  # noqa: BLE001
+                    self._log.warning("Thread enumeration failed: %s", exc)
+                    threads_raw = []
+                thread_contexts = _build_thread_contexts(threads_raw)
+                self._log.debug("threads: %d", len(thread_contexts))
+
             # Build CapBitmap dynamically based on what will be emitted
             cap_bitmap = (1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
             if module_entries:
                 cap_bitmap |= (1 << CapBit.ModuleList)
+            if any(tc.registers for tc in thread_contexts):
+                cap_bitmap |= (1 << CapBit.ThreadContexts)
 
             # Pre-collect the system-wide tables (investigation mode) BEFORE
             # the header is built. The file header is hashed into the BLAKE3
@@ -660,6 +727,17 @@ class AcquisitionEngine(BaseAcquirer):
                             writer.write_connection_table(connection_table, parent_uuid=sys_ctx_uuid)
                         if handle_table:
                             writer.write_handle_table(handle_table, parent_uuid=sys_ctx_uuid)
+
+                    # Thread Context blocks (0x0011, capture-time). Emitted
+                    # after Block 2 (SystemContext) so investigation block
+                    # ordering (Process Identity / Module List / System
+                    # Context as Blocks 0/1/2) is preserved. Blocks without
+                    # register state are skipped (spec Section 5.7 requires
+                    # at least PC/SP).
+                    for tc in thread_contexts:
+                        if not tc.registers:
+                            continue
+                        writer.write_thread_context(tc)
 
                     # Memory regions
                     self._log.info("Enumerating memory ranges...")

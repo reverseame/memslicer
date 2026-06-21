@@ -162,6 +162,7 @@ def _create_acquirer(
     passphrase: str | None = None,
     attribution=None,
     hash_algo: HashAlgo = HashAlgo.BLAKE3,
+    capture_threads: bool = True,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -248,6 +249,7 @@ def _create_acquirer(
         collector=collector,
         attribution=attribution,
         hash_algo=hash_algo,
+        capture_threads=capture_threads,
     )
 
 
@@ -270,10 +272,11 @@ def _create_acquirer(
 @click.option("--no-encrypt", is_flag=True, default=False, help="Disable encryption (overrides investigation default)")
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
+@click.option("--no-registers", is_flag=True, default=False, help="Do not capture thread register state (Thread Context blocks)")
 @attribution_options
 def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, max_region_size, investigation,
-        encrypt, no_encrypt, passphrase, hash_algo_str,
+        encrypt, no_encrypt, passphrase, hash_algo_str, no_registers,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
         include_kernel_symbols, include_kernel_modules,
@@ -422,6 +425,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         passphrase=passphrase if use_encryption else None,
         attribution=attribution,
         hash_algo=hash_algo,
+        capture_threads=not no_registers,
     )
     acquirer.set_progress_callback(progress)
 
