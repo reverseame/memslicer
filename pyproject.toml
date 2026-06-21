@@ -22,6 +22,7 @@ dependencies = [
 memslicer = "memslicer.cli:cli"
 memslicer-sysctx = "memslicer.cli_sysctx:main"
 memslicer-enrich = "memslicer.cli_enrich:main"
+memslicer-emu = "memslicer.cli_emu:main"
 
 [project.optional-dependencies]
 dev = [
@@ -32,6 +33,10 @@ dev = [
 ]
 pretty = [
     "rich>=13.0",
+]
+emu = [
+    "unicorn>=2.0",
+    "capstone>=5.0",
 ]
 
 [tool.pytest.ini_options]

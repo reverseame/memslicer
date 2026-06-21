@@ -274,6 +274,54 @@ Progress: [##################################################] 100.00% Complete
 
 ---
 
+## Emulating & analyzing slices
+
+When a slice captures thread registers (the default; disable with
+`--no-registers`), its execution can be *advanced by emulation* — a slice is a
+static snapshot, so there is no live process to step.
+
+### Built-in emulator (`memslicer-emu`)
+
+A first-party emulator built on [Unicorn](https://www.unicorn-engine.org/) +
+[Capstone](https://www.capstone-engine.org/). Install the extra and step:
+
+```bash
+pip install memslicer[emu]
+
+memslicer-emu dump.msl --steps 5 -r
+#   arch    : x86_64
+#   entry   : 0x401000
+#   0x00401000  mov rax, 1    [rax=0x1 rip=0x401007]
+#   0x00401007  mov rbx, 2    [rbx=0x2 rip=0x40100e]
+#   ...
+```
+
+It is also usable as a library for programmatic / differential analysis:
+
+```python
+from memslicer.emu import open_slice
+emu = open_slice("dump.msl")        # registers seeded from the Thread Context
+emu.step()
+print(hex(emu.read_reg("rax")))
+```
+
+### radare2 plugins
+
+A slice can also be opened in [radare2](https://github.com/radareorg/radare2)
+via the `io.msl` / `bin.msl` / `debug.msl` plugins:
+
+```bash
+r2 dump.msl                          # static analysis: maps, arch, entrypoint
+r2 -D msl -d msl://dump.msl          # emulated debugging: ds / dr step via ESIL
+```
+
+See `doc/msl.md` in the radare2 tree. The `msl://` io plugin decodes lz4
+slices; zstd slices are not decodable by radare2 (no zstd) — use `-c lz4`/
+`-c none` or `memslicer-emu`. Encrypted slices are not supported by the
+plugins. `memslicer-emu` handles both zstd and lz4.
+
+---
+
 ## Architecture
 
 ```

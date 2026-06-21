@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
   consumer. Supported on the Frida, GDB and LLDB backends; the
   `ThreadContexts` capability bit is set when registers are captured.
   Disable with `--no-registers`. Bumps the MSL format version to 1.1.
+- New `memslicer-emu` tool (and `memslicer.emu` library) that emulates a
+  slice with Unicorn + Capstone: maps the captured regions, seeds registers
+  from the Thread Context, and single-steps execution. Install with the
+  `emu` extra (`pip install memslicer[emu]`). Supports x86/x86_64/ARM/ARM64.
 
 ### Bug Fixes
 
