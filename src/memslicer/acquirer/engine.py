@@ -370,10 +370,33 @@ class AcquisitionEngine(BaseAcquirer):
             if module_entries:
                 cap_bitmap |= (1 << CapBit.ModuleList)
 
+            # Pre-collect the system-wide tables (investigation mode) BEFORE
+            # the header is built. The file header is hashed into the BLAKE3
+            # chain at write time and cannot be patched afterwards, so its
+            # CapBitmap must already reflect these tables. The collected
+            # values are reused — not re-collected — when the blocks are
+            # written below.
+            process_table = None
+            connection_table = None
+            handle_table = None
             flags = 0
             if self._investigation:
                 flags |= FLAG_INVESTIGATION
                 cap_bitmap |= (1 << CapBit.SystemContext)
+                if self._collector is not None:
+                    process_table = self._collector.collect_process_table(pid)
+                    connection_table = self._collector.collect_connection_table()
+                    handle_table = self._collector.collect_handle_table(pid)
+                else:
+                    process_table = self._collect_process_table(pid)
+                    connection_table = self._collect_connection_table()
+                    handle_table = self._collect_handle_table(pid)
+                if process_table:
+                    cap_bitmap |= (1 << CapBit.SystemProcessTable)
+                if connection_table:
+                    cap_bitmap |= (1 << CapBit.SystemNetworkTable)
+                if handle_table:
+                    cap_bitmap |= (1 << CapBit.SystemHandleTable)
 
             # Encryption setup
             encryption_key = None
@@ -444,16 +467,9 @@ class AcquisitionEngine(BaseAcquirer):
                         import getpass
                         import platform as platform_mod
 
-                        # Collect system tables before writing context
-                        # so we can set table_bitmap accurately
-                        if self._collector is not None:
-                            process_table = self._collector.collect_process_table(pid)
-                            connection_table = self._collector.collect_connection_table()
-                            handle_table = self._collector.collect_handle_table(pid)
-                        else:
-                            process_table = self._collect_process_table(pid)
-                            connection_table = self._collect_connection_table()
-                            handle_table = self._collect_handle_table(pid)
+                        # System-wide tables (process/connection/handle) were
+                        # pre-collected before the header so the CapBitmap is
+                        # accurate; they are reused here.
 
                         # System-context extension block collection. These
                         # must be materialized BEFORE ``SystemContext`` is
@@ -485,13 +501,10 @@ class AcquisitionEngine(BaseAcquirer):
                         table_bitmap = 0
                         if process_table:
                             table_bitmap |= 0x01  # bit 0 = ProcessTable
-                            cap_bitmap |= (1 << CapBit.SystemProcessTable)
                         if connection_table:
                             table_bitmap |= 0x02  # bit 1 = ConnectionTable
-                            cap_bitmap |= (1 << CapBit.SystemNetworkTable)
                         if handle_table:
                             table_bitmap |= 0x04  # bit 2 = HandleTable
-                            cap_bitmap |= (1 << CapBit.SystemHandleTable)
                         # System-context extension-block bits. All
                         # bits are opt-in (default off) to keep the
                         # process-centric acquire path lean.
@@ -525,9 +538,6 @@ class AcquisitionEngine(BaseAcquirer):
                             and self._attribution.include_target_introspection
                         ):
                             table_bitmap |= 0x200  # bit 9 = TargetIntrospection
-
-                        # Update header cap_bitmap before writing tables
-                        header.cap_bitmap = cap_bitmap
 
                         # Operator attribution (CLI-validated).
                         attribution = self._attribution

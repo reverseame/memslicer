@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file.
 
 
+## [Unreleased]
+
+### Bug Fixes
+
+- Investigation mode: the `SystemProcessTable` / `SystemNetworkTable` /
+  `SystemHandleTable` capability bits are now written to the on-disk file
+  header. They were previously set on the header object only after it had
+  already been serialized into the BLAKE3 chain, so they never reached disk
+  and consumers under-reported the captured system tables. The tables are now
+  collected before the header is built.
 
 
 ## [0.2.7] - 2026-04-20
