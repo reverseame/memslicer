@@ -328,6 +328,38 @@ simgr = project.factory.simgr(state)
 simgr.explore(find=0x401050)
 ```
 
+### Behavior graph (`memslicer-behavior`)
+
+Emulate a slice and extract a **behavior graph** — control flow (basic blocks
+or instructions) plus the system interactions (syscalls / APIs) the code
+performs — for graph-based dynamic analysis:
+
+```bash
+pip install memslicer[emu]
+
+# 1. discover which system calls the code makes
+memslicer-behavior dump.msl --emit-stubs stubs.py -o graph.dot
+
+# 2. edit stubs.py so each call returns what your investigation needs,
+#    then re-run with the edited stubs
+memslicer-behavior dump.msl --stubs stubs.py -o graph.json
+```
+
+A static snapshot has no OS, so system calls cannot be truly executed. Each one
+is modelled by an analyst-editable **stub** (the Speakeasy/Qiling approach): the
+first run auto-generates a skeleton (one function per observed call, pre-filled
+with the observed arguments); you fill in the bodies to return handles, buffers
+or errors and `--stubs` reloads them so emulation advances down the path of
+interest. Output is JSON (node-link) or Graphviz DOT; granularity switches
+between basic blocks and instructions with `--granularity`.
+
+```python
+from memslicer.behavior import trace_slice
+graph = trace_slice("dump.msl")            # registers seeded, hooks installed
+print(graph.meta, len(graph.nodes), graph.events)
+open("graph.dot", "w").write(graph.to_dot())
+```
+
 ### radare2 plugins
 
 A slice can also be opened in [radare2](https://github.com/radareorg/radare2)

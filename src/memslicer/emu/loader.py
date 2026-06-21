@@ -17,6 +17,7 @@ from memslicer.utils.padding import pad8
 
 _REGION_HDR = "<QQBBB5sQ"   # BaseAddr, RegionSize, Protection, RegionType, PageSizeLog2, rsv, Timestamp
 _TC_HDR = "<QQHBBIH6s"       # ThreadID, StartTime, Flags, State, rsv, RegCount, NameLen, rsv
+_MOD_HDR = "<QQHHI"          # BaseAddr, ModuleSize, PathLen, VersionLen, rsv
 _THREAD_FLAG_CURRENT = 0x1
 
 
@@ -60,12 +61,27 @@ class EmuRegion:
 
 
 @dataclass
+class EmuModule:
+    """A loaded module (image): base, size and path. Used to resolve an
+    address back to ``module+offset`` during behavior tracing."""
+    base: int
+    size: int
+    path: str
+
+    @property
+    def name(self) -> str:
+        p = self.path.replace("\\", "/")
+        return p.rsplit("/", 1)[-1] or self.path
+
+
+@dataclass
 class SliceImage:
     """Everything needed to emulate a slice."""
     arch: ArchType
     os: OSType
     regions: list[EmuRegion] = field(default_factory=list)
     threads: list[EmuThread] = field(default_factory=list)
+    modules: list[EmuModule] = field(default_factory=list)
 
     @property
     def current_thread(self) -> EmuThread | None:
@@ -123,6 +139,13 @@ def _parse_thread(payload: bytes) -> EmuThread:
                      registers=regs)
 
 
+def _parse_module(payload: bytes) -> EmuModule:
+    base, size, pathlen, _verlen, _r = struct.unpack(_MOD_HDR, payload[:24])
+    raw = payload[24:24 + pathlen]
+    path = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    return EmuModule(base=base, size=size, path=path)
+
+
 def load_slice(path: str) -> SliceImage:
     """Load *path* (an ``.msl`` file) into a :class:`SliceImage`."""
     with open(path, "rb") as f:
@@ -146,4 +169,6 @@ def load_slice(path: str) -> SliceImage:
                 image.regions.append(_parse_region(blk.payload))
             elif blk.block_type == BlockType.ThreadContext:
                 image.threads.append(_parse_thread(blk.payload))
+            elif blk.block_type == BlockType.ModuleEntry:
+                image.modules.append(_parse_module(blk.payload))
     return image

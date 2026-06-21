@@ -21,6 +21,15 @@ All notable changes to this project will be documented in this file.
   slice into [angr](https://angr.io) — captured memory and registers become a
   `SimState` at the captured PC — for symbolic execution / exploration. Behind
   the optional `symbex` extra (`pip install memslicer[symbex]`).
+- New `memslicer-behavior` tool (and `memslicer.behavior` library) that
+  extracts a *behavior graph* from a slice: it emulates with Unicorn,
+  instruments execution with hooks, and emits control flow (basic blocks or
+  instructions) plus system interactions (syscalls/APIs) as JSON or Graphviz
+  DOT. Granularity is a one-line switch (`--granularity block|instruction`).
+  System calls are modelled by an analyst-editable *stub skeleton*:
+  `--emit-stubs` writes a template (one function per observed call, pre-filled
+  with the observed arguments) and `--stubs` reloads the edited version so the
+  analyst controls return values and side effects. Uses the `emu` extra.
 
 ### Bug Fixes
 

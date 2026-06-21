@@ -24,6 +24,7 @@ memslicer-sysctx = "memslicer.cli_sysctx:main"
 memslicer-enrich = "memslicer.cli_enrich:main"
 memslicer-emu = "memslicer.cli_emu:main"
 memslicer-symbex = "memslicer.cli_symbex:main"
+memslicer-behavior = "memslicer.cli_behavior:main"
 
 [project.optional-dependencies]
 dev = [
