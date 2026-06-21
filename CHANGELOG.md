@@ -17,6 +17,10 @@ All notable changes to this project will be documented in this file.
   from the Thread Context, and single-steps execution. Install with the
   `emu` extra (`pip install memslicer[emu]`). Supports x86/x86_64/ARM/ARM64,
   and reverse execution (step back) via a CPU-context + memory-write journal.
+- New `memslicer-symbex` tool (and `memslicer.symbex` library) that loads a
+  slice into [angr](https://angr.io) — captured memory and registers become a
+  `SimState` at the captured PC — for symbolic execution / exploration. Behind
+  the optional `symbex` extra (`pip install memslicer[symbex]`).
 
 ### Bug Fixes
 

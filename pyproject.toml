@@ -23,6 +23,7 @@ memslicer = "memslicer.cli:cli"
 memslicer-sysctx = "memslicer.cli_sysctx:main"
 memslicer-enrich = "memslicer.cli_enrich:main"
 memslicer-emu = "memslicer.cli_emu:main"
+memslicer-symbex = "memslicer.cli_symbex:main"
 
 [project.optional-dependencies]
 dev = [
@@ -37,6 +38,9 @@ pretty = [
 emu = [
     "unicorn>=2.0",
     "capstone>=5.0",
+]
+symbex = [
+    "angr>=9.2",
 ]
 
 [tool.pytest.ini_options]

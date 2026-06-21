@@ -310,6 +310,24 @@ It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
 CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
 instructions, reverting both registers and memory.
 
+### Symbolic execution (angr)
+
+Load a slice into [angr](https://angr.io) for symbolic execution from the exact
+captured point — the memory and the Current thread's registers become an angr
+`SimState`:
+
+```bash
+pip install memslicer[symbex]
+memslicer-symbex dump.msl --find 0x401050 --avoid 0x401080
+```
+
+```python
+from memslicer.symbex import load_angr
+project, state = load_angr("dump.msl")     # state at the captured PC
+simgr = project.factory.simgr(state)
+simgr.explore(find=0x401050)
+```
+
 ### radare2 plugins
 
 A slice can also be opened in [radare2](https://github.com/radareorg/radare2)
