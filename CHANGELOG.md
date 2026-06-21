@@ -15,7 +15,8 @@ All notable changes to this project will be documented in this file.
 - New `memslicer-emu` tool (and `memslicer.emu` library) that emulates a
   slice with Unicorn + Capstone: maps the captured regions, seeds registers
   from the Thread Context, and single-steps execution. Install with the
-  `emu` extra (`pip install memslicer[emu]`). Supports x86/x86_64/ARM/ARM64.
+  `emu` extra (`pip install memslicer[emu]`). Supports x86/x86_64/ARM/ARM64,
+  and reverse execution (step back) via a CPU-context + memory-write journal.
 
 ### Bug Fixes
 

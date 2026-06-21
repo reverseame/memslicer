@@ -100,6 +100,25 @@ class MSLEmulator:
         self._map_memory()
         self._seed_registers()
 
+        # Reverse-execution journal: Unicorn has no native undo, so before each
+        # step we snapshot the CPU context and record every memory write (with
+        # its pre-write bytes) via a hook. step_back() restores the context and
+        # reverts the writes.
+        self._history = []        # list of (UcContext, [(addr, old_bytes), ...])
+        self._max_back = 4096
+        self._pending = None      # write log of the in-progress step
+        self.uc.hook_add (self._U.UC_HOOK_MEM_WRITE, self._on_mem_write)
+
+    def _on_mem_write(self, uc, access, address, size, value, user):
+        # Called before the write is applied, so mem_read returns the old bytes.
+        if self._pending is None:
+            return
+        try:
+            old = bytes (uc.mem_read (address, size))
+        except self._U.UcError:
+            return
+        self._pending.append ((address, old))
+
     # -- setup ---------------------------------------------------------------
 
     def _map_memory(self) -> None:
@@ -178,11 +197,33 @@ class MSLEmulator:
         """Emulate a single instruction at the current PC."""
         pc = self.pc
         size, mnemonic, op_str = self._disasm_at(pc)
+        ctx = self.uc.context_save()       # CPU state before the step
+        self._pending = []                 # collect this step's memory writes
         try:
             self.uc.emu_start(pc, self._until, count=1)
-            return StepResult(pc, size, mnemonic, op_str, True)
+            res = StepResult(pc, size, mnemonic, op_str, True)
         except self._U.UcError as exc:
-            return StepResult(pc, size, mnemonic, op_str, False, str(exc))
+            res = StepResult(pc, size, mnemonic, op_str, False, str(exc))
+        writes = self._pending
+        self._pending = None
+        self._history.append((ctx, writes))
+        if len(self._history) > self._max_back:
+            self._history.pop(0)
+        return res
+
+    def can_step_back(self) -> bool:
+        return bool(self._history)
+
+    def step_back(self) -> bool:
+        """Undo the last step: restore the CPU context and revert the memory
+        writes recorded for that step. Returns False if there is no history."""
+        if not self._history:
+            return False
+        ctx, writes = self._history.pop()
+        self.uc.context_restore(ctx)
+        for addr, old in reversed(writes):   # reverse order for overlaps
+            self.uc.mem_write(addr, old)
+        return True
 
     def step_until(self, addr: int, max_steps: int = 100000):
         """Step until PC == *addr* or a fault, yielding each StepResult."""

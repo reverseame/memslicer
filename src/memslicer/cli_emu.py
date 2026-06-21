@@ -57,9 +57,11 @@ def _trace(emu: MSLEmulator, results) -> None:
               help="Override the start program counter")
 @click.option("--max-steps", type=int, default=100000,
               help="Safety cap when using --until")
+@click.option("-b", "--back", type=int, default=0,
+              help="After stepping, step back this many instructions (reverse)")
 @click.option("-r", "--registers", "show_regs", is_flag=True,
               help="Dump registers after stepping")
-def main(dump, steps, until_addr, pc_override, show_regs, max_steps):
+def main(dump, steps, until_addr, pc_override, show_regs, max_steps, back):
     """Emulate the MSL slice DUMP."""
     image = load_slice(dump)
     _print_summary(image)
@@ -86,6 +88,21 @@ def main(dump, steps, until_addr, pc_override, show_regs, max_steps):
                     if not res.ok:
                         return
             _trace(emu, _stepper())
+
+    if back > 0:
+        click.echo("")
+        click.echo(f"[rewind {back}]")
+        prev = emu.registers()
+        for _ in range(back):
+            if not emu.step_back():
+                click.echo("  (no more history)")
+                break
+            now = emu.registers()
+            changed = " ".join(
+                f"{k}={now[k]:#x}" for k in now if now.get(k) != prev.get(k)
+            )
+            click.echo(f"  <- {emu.pc:#012x}" + (f"    [{changed}]" if changed else ""))
+            prev = now
 
     if show_regs:
         click.echo("")

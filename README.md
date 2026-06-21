@@ -303,7 +303,12 @@ from memslicer.emu import open_slice
 emu = open_slice("dump.msl")        # registers seeded from the Thread Context
 emu.step()
 print(hex(emu.read_reg("rax")))
+emu.step_back()                     # reverse execution (undo the last step)
 ```
+
+It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
+CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
+instructions, reverting both registers and memory.
 
 ### radare2 plugins
 

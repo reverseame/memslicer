@@ -125,3 +125,77 @@ def test_emulator_read_write_mem_and_reg(tmp_path):
     assert emu.read_mem(CODE_VA, len(CODE)) == CODE
     emu.write_reg("rax", 0x1234)
     assert emu.read_reg("rax") == 0x1234
+
+
+# ---- reverse execution (requires the emu extra) ----
+
+def _write_code(path, code, regs):
+    """Write a minimal slice: one r-x code page + one rw- stack page + a
+    Thread Context with the given registers."""
+    page = code + b"\x90" * (PS - len(code))
+    cap = (1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity) | (1 << CapBit.ThreadContexts)
+    hdr = FileHeader(os_type=OSType.Linux, arch_type=ArchType.x86_64, pid=1, cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="/bin/demo"))
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[page]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
+        w.write_thread_context(ThreadContext(
+            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=regs))
+        w.finalize()
+
+
+def test_emulator_step_back_registers(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "code.msl"
+    _write_slice(p)                                  # seeds rax=0xcafe
+    emu = MSLEmulator(load_slice(str(p)))
+    for _ in range(3):                               # mov rax,1; mov rbx,2; add
+        emu.step()
+    assert emu.read_reg("rax") == 3
+    assert emu.pc == CODE_VA + 0x11
+
+    assert emu.step_back()                            # undo add
+    assert emu.read_reg("rax") == 1
+    assert emu.step_back()                            # undo mov rbx,2
+    assert emu.read_reg("rbx") == 0
+    assert emu.step_back()                            # undo mov rax,1
+    assert emu.read_reg("rax") == 0xcafe              # back to the seeded value
+    assert emu.pc == CODE_VA
+    assert not emu.step_back()                        # no more history
+
+
+def test_emulator_step_back_memory(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    rsp = STACK_VA + 0x100
+    # mov rax, 0x4142 ; mov [rsp], rax
+    code = bytes.fromhex("48c7c042410000" "48890424")
+    p = tmp_path / "mem.msl"
+    _write_code(p, code, [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("rsp", rsp.to_bytes(8, "little"), REG_FLAG_SP),
+    ])
+    emu = MSLEmulator(load_slice(str(p)))
+    emu.step()                                        # mov rax, 0x4142
+    before = emu.read_mem(rsp, 8)
+    emu.step()                                        # mov [rsp], rax
+    assert emu.read_mem(rsp, 8) != before
+    assert emu.read_reg("rax") == 0x4142
+
+    assert emu.step_back()                            # undo the store
+    assert emu.read_mem(rsp, 8) == before             # memory reverted
+    assert emu.step_back()                            # undo mov rax
+    assert emu.read_reg("rax") != 0x4142
