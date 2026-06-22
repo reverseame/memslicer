@@ -2021,12 +2021,10 @@ class LinuxCollector:
             state_code = state_map.get(state_str, 0)
             base = 0
             if len(parts) > 5:
-                base_s = parts[-1]
+                # The address field is always hex; int(_, 16) accepts it with or
+                # without the "0x" prefix. It is 0 when kptr_restrict redacts it.
                 try:
-                    if base_s.startswith("0x") or base_s.startswith("0X"):
-                        base = int(base_s, 16)
-                    else:
-                        base = int(base_s, 16)
+                    base = int(parts[-1], 16)
                 except ValueError:
                     base = 0
             parsed.append((name, size, refcount, state_code, base))

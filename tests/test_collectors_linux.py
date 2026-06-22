@@ -1860,6 +1860,23 @@ class TestLinuxKernelModules:
         # No sysfs tree -> every row is proc-only (flag bit 0).
         assert all(r.flags == 0x01 for r in table.rows)
 
+    def test_parse_proc_modules_base_hex_with_and_without_prefix(self, tmp_path):
+        # /proc/modules addresses are hex; parse correctly with or without 0x,
+        # and report 0 when kptr_restrict redacts the address.
+        collector, _ = _make_posture_collector(tmp_path)
+        content = (
+            "withpfx 1000 0 - Live 0xffffffffc0000000\n"
+            "nopfx 1000 0 - Live ffffffffc0100000\n"
+            "redacted 1000 0 - Live 0x0000000000000000\n"
+        )
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        collector._sys_module_dir = str(tmp_path / "nonexistent_sysmod")
+
+        rows = {r.name: r.base for r in collector.collect_kernel_module_list().rows}
+        assert rows["withpfx"] == 0xffffffffc0000000
+        assert rows["nopfx"] == 0xffffffffc0100000
+        assert rows["redacted"] == 0
+
     def test_parse_proc_modules_unloading_state(self, tmp_path):
         collector, _ = _make_posture_collector(tmp_path)
         content = "foo 1000 0 - Unloading 0xffffffffc0000000\n"
