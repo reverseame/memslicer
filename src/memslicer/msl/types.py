@@ -3,7 +3,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
-    OSType, ArchType, CompAlgo, PageState, RegionType, BlockType,
+    OSType, ArchType, PageState, RegionType,
     Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo, ThreadState,
 )
 

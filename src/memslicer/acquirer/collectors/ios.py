@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import plistlib
-import re
 
 from memslicer.acquirer.collectors.darwin import DarwinCollector
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo

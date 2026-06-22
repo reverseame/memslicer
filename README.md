@@ -274,6 +274,183 @@ Progress: [##################################################] 100.00% Complete
 
 ---
 
+## Emulating & analyzing slices
+
+When a slice captures thread registers (the default; disable with
+`--no-registers`), its execution can be *advanced by emulation* — a slice is a
+static snapshot, so there is no live process to step.
+
+### Built-in emulator (`memslicer-emu`)
+
+A first-party emulator built on [Unicorn](https://www.unicorn-engine.org/) +
+[Capstone](https://www.capstone-engine.org/). Install the extra and step:
+
+```bash
+pip install memslicer[emu]
+
+memslicer-emu dump.msl --steps 5 -r
+#   arch    : x86_64
+#   entry   : 0x401000
+#   0x00401000  mov rax, 1    [rax=0x1 rip=0x401007]
+#   0x00401007  mov rbx, 2    [rbx=0x2 rip=0x40100e]
+#   ...
+```
+
+It is also usable as a library for programmatic / differential analysis:
+
+```python
+from memslicer.emu import open_slice
+emu = open_slice("dump.msl")        # registers seeded from the Thread Context
+emu.step()
+print(hex(emu.read_reg("rax")))
+emu.step_back()                     # reverse execution (undo the last step)
+```
+
+It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
+CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
+instructions, reverting both registers and memory.
+
+### Symbolic execution (angr)
+
+Load a slice into [angr](https://angr.io) for symbolic execution from the exact
+captured point — the memory and the Current thread's registers become an angr
+`SimState`:
+
+```bash
+pip install memslicer[symbex]
+memslicer-symbex dump.msl --find 0x401050 --avoid 0x401080
+```
+
+```python
+from memslicer.symbex import load_angr
+project, state = load_angr("dump.msl")     # state at the captured PC
+simgr = project.factory.simgr(state)
+simgr.explore(find=0x401050)
+```
+
+### Behavior graph (`memslicer-behavior`)
+
+Emulate a slice and extract a **behavior graph** — control flow (basic blocks
+or instructions) plus the system interactions (syscalls / APIs) the code
+performs — for graph-based dynamic analysis:
+
+```bash
+pip install memslicer[emu]
+
+# 1. discover which system calls the code makes
+memslicer-behavior dump.msl --emit-stubs stubs.py -o graph.dot
+
+# 2. edit stubs.py so each call returns what your investigation needs,
+#    then re-run with the edited stubs
+memslicer-behavior dump.msl --stubs stubs.py -o graph.json
+```
+
+A static snapshot has no OS, so system calls cannot be truly executed. Each one
+is modelled by an analyst-editable **stub** (the Speakeasy/Qiling approach): the
+first run auto-generates a skeleton (one function per observed call, pre-filled
+with the observed arguments); you fill in the bodies to return handles, buffers
+or errors and `--stubs` reloads them so emulation advances down the path of
+interest. Output is JSON (node-link) or Graphviz DOT; granularity switches
+between basic blocks and instructions with `--granularity`.
+
+**API calls** are handled the same way: when a call lands on a module's export
+it is resolved to `module!Export`, intercepted, routed to the same stub registry
+(Win64/SysV calling conventions), recorded as a behavior node and returned to
+the caller — so the API body is never emulated. Both **PE exports** (Windows)
+and **ELF `.dynsym` / PLT-GOT imports** (Linux) are resolved; the latter uses
+the captured process's already-bound GOT, so `call func@plt` resolves to the
+owning library's `lib!symbol`. Other addresses are labelled `module+offset`, and
+syscalls are named from per-architecture Linux tables.
+
+**Bundled stub library.** Instead of writing stubs by hand you can start from a
+curated, categorized library covering the APIs malware most often touches
+(file / network / registry / process / memory / library / crypto / system).
+Each stub decodes its interesting arguments, logs them readably, and returns a
+plausible value (a fresh handle, an allocation address, success) so emulation
+keeps advancing. `--stublib` enables it; `--stubs` merges your edits on top:
+
+```bash
+memslicer-behavior dump.msl --stublib -o graph.json              # bundled stubs
+memslicer-behavior dump.msl --stublib --stubs mine.py -o g.json  # + overrides
+```
+
+Every syscall / API node carries a **behavior category**, so the graph groups
+by what the code *does*, not just which symbol it called.
+
+**Data-flow edges.** A lightweight value-equality taint links calls causally:
+a `dataflow` edge when one call's return value is later passed as an argument
+(the handle `CreateFile` returns, consumed by `WriteFile`; the address
+`VirtualAlloc` returns, written by `WriteProcessMemory`), and a `buffer` edge
+when two calls share the same pointer/handle argument (`ReadFile` fills a
+buffer, `send` ships it). Both run automatically for either backend.
+
+**Memory annotations** (`--memory`, on by default). Writes into executable
+memory — unpacking, self-modifying code, code injection — are flagged (the
+writing block is highlighted), every write is bucketed by its target region
+type (heap / stack / image / …), and statically-RWX regions are listed under
+`meta.memory`.
+
+**Dynamic call graph** (`--call-graph`). Overlays function nodes and
+`call`/`ret` edges (a shadow call stack tracks the current function) on top of
+the basic-block CFG.
+
+**High-fidelity Windows emulation (Speakeasy).** For Windows, `--backend
+speakeasy` drives [Speakeasy](https://github.com/mandiant/speakeasy) — built on
+the same Unicorn engine but shipping hundreds of real API handlers plus
+PEB/TEB, the object manager and a fake filesystem/registry/network — and
+projects its emulation onto the same behavior graph. Your `--stublib`/`--stubs`
+stubs still override individual handlers when you want to steer a path:
+
+```bash
+pip install 'memslicer[speakeasy]'   # git head; the PyPI release pins unicorn 1.x
+memslicer-behavior dump.msl --backend speakeasy -o graph.json
+```
+
+**Export & features.** The graph serializes to JSON, Graphviz DOT, **GraphML**
+and **GEXF** (`-f`, or inferred from the `.json`/`.dot`/`.graphml`/`.gexf`
+extension; the XML formats need no extra dependency). `--features` writes a
+fixed-key numeric **feature vector** (node/edge counts by kind/type, calls per
+category, memory and data-flow tallies) ready to stack into an ML matrix.
+`BehaviorGraph.to_networkx()` returns a live `MultiDiGraph` with the optional
+`graph` extra.
+
+For deeper analysis you can also hand a *live* emulator off to angr
+(concrete → symbolic) and let angr's SimOS model the OS from that point on:
+
+```python
+from memslicer.emu import open_slice
+from memslicer.symbex import handoff_to_angr
+emu = open_slice("dump.msl")
+for _ in range(20):
+    emu.step()                       # run concretely to a point of interest
+project, state = handoff_to_angr(emu)  # continue symbolically from here
+simgr = project.factory.simgr(state)
+```
+
+```python
+from memslicer.behavior import trace_slice
+graph = trace_slice("dump.msl")            # registers seeded, hooks installed
+print(graph.meta, len(graph.nodes), graph.events)
+open("graph.dot", "w").write(graph.to_dot())
+```
+
+### radare2 plugins
+
+A slice can also be opened in [radare2](https://github.com/radareorg/radare2)
+via the `io.msl` / `bin.msl` / `debug.msl` plugins:
+
+```bash
+r2 dump.msl                          # static analysis: maps, arch, entrypoint
+r2 -D msl -d msl://dump.msl          # emulated debugging: ds / dr step via ESIL
+```
+
+See `doc/msl.md` in the radare2 tree. The `msl://` io plugin decodes lz4
+slices; zstd slices are not decodable by radare2 (no zstd) — use `-c lz4`/
+`-c none` or `memslicer-emu`. Encrypted slices are not supported by the
+plugins. `memslicer-emu` handles both zstd and lz4.
+
+---
+
 ## Architecture
 
 ```

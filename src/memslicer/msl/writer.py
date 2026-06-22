@@ -4,13 +4,16 @@ from __future__ import annotations
 import struct
 import uuid
 import warnings
-from typing import BinaryIO
+from typing import TYPE_CHECKING, BinaryIO
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
     BLOCK_HEADER_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
-    CONTINUATION, FLAG_ENCRYPTED, BlockType, CompAlgo, PageState,
+    BlockType, CompAlgo, PageState,
 )
+
+if TYPE_CHECKING:
+    from memslicer.msl.encryption import EncryptionParams
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
@@ -62,7 +65,6 @@ class MSLWriter:
         if self._encrypted:
             from memslicer.msl.encryption import (
                 EncryptionParams, StreamingEncryptor,
-                pack_encryption_extension,  # noqa: F811 — used in _write_header
             )
             if encryption_params is None:
                 encryption_params = EncryptionParams()
@@ -244,8 +246,6 @@ class MSLWriter:
         + PageSizeLog2(1) + Reserved(5) + Timestamp(8)
         + PageStateMap(var, pad8) + PageData(var)
         """
-        num_pages = len(region.page_states)
-
         # Build PageStateMap: 2 bits per page, MSB-first packing, padded to 8B
         page_state_map = self._encode_page_state_map(region.page_states)
 

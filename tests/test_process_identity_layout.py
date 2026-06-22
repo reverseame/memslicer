@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from memslicer.msl.writer import MSLWriter
 from memslicer.msl.types import FileHeader, ProcessIdentity
 from memslicer.msl.constants import (
-    HEADER_SIZE, BLOCK_HEADER_SIZE, BlockType, CompAlgo,
+    HEADER_SIZE, BLOCK_HEADER_SIZE, CompAlgo,
 )
 from memslicer.utils.padding import pad8
 

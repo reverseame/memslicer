@@ -8,7 +8,7 @@ import pytest
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE,
-    BlockType, CompAlgo, OSType, ArchType, PageState, RegionType,
+    BlockType, OSType, ArchType, PageState, RegionType,
 )
 from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry
 from memslicer.msl.writer import MSLWriter
@@ -43,7 +43,7 @@ class TestMinimalMSL:
 
     def test_header_size_64(self, header):
         buf = io.BytesIO()
-        writer = MSLWriter(buf, header)
+        MSLWriter(buf, header)
         # Before finalize, header is already written
         assert buf.tell() == HEADER_SIZE
 

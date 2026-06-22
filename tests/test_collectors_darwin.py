@@ -1,7 +1,7 @@
 """Tests for DarwinCollector (macOS investigation data collection)."""
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import subprocess
 
 import pytest
@@ -11,7 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.collectors.constants import (
     HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE, HT_UNKNOWN,
-    AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
+    AF_INET, AF_INET6, PROTO_TCP,
 )
 from memslicer.acquirer.collectors.darwin import DarwinCollector
 

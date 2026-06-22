@@ -355,7 +355,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         outpath2 = Path(tmpdir) / "normal.msl"
         engine2 = AcquisitionEngine(bridge2, investigation=False)
-        result2 = engine2.acquire(outpath2)
+        engine2.acquire(outpath2)
 
         raw2 = outpath2.read_bytes()
 
@@ -457,8 +457,7 @@ def main() -> int:
                 # Parse variable-length strings
                 str_offset3 = SYSCTX_FIXED_HEADER_SIZE
 
-                # acq_user
-                acq_user_raw3 = sc_payload3[str_offset3 : str_offset3 + acq_user_len3]
+                # acq_user (not asserted here; just advance past it)
                 str_offset3 += _pad8(acq_user_len3)
 
                 # hostname
@@ -470,8 +469,7 @@ def main() -> int:
                                    hostname3 == "forensic-target",
                                    f"hostname={hostname3!r}")
 
-                # domain
-                domain_raw3 = sc_payload3[str_offset3 : str_offset3 + domain_len3]
+                # domain (not asserted here; just advance past it)
                 str_offset3 += _pad8(domain_len3)
 
                 # os_detail

@@ -2,13 +2,10 @@
 from __future__ import annotations
 
 import queue
-import re
-import threading
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from memslicer.acquirer.bridge import MemoryRange, ModuleInfo
 from memslicer.acquirer.gdb_bridge import GDBBridge
 from memslicer.acquirer.platform_detect import parse_gdb_architecture as _parse_gdb_architecture
 from memslicer.msl.constants import ArchType
