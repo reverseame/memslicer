@@ -33,8 +33,12 @@ All notable changes to this project will be documented in this file.
   Windows API calls are resolved too: call targets that land on a module's PE
   export are labelled `module!Export`, intercepted, routed to the same stub
   registry (Win64/SysV calling conventions), and returned to the caller without
-  emulating the API body. The address resolver also maps any address back to
-  `module+offset`.
+  emulating the API body. On Linux, ELF `.dynsym` exports and PLT/GOT imports
+  are resolved as well — the latter via the already-bound GOT of the captured
+  process, so a `call func@plt` resolves to the owning library's `lib!symbol`.
+  The address resolver also maps any address back to `module+offset`.
+  Syscalls are named from per-architecture Linux tables (x86-64 complete; i386,
+  AArch64 and ARM common subsets).
 - `memslicer.symbex.handoff_to_angr(emu)` performs a concrete→symbolic
   hand-off: it builds an angr `Project`/`SimState` from a *live* emulator's
   current registers and memory, so you can emulate concretely up to a point of

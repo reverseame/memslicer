@@ -8,6 +8,7 @@ so use :meth:`from_emulator`; :meth:`from_image` gives module+offset only.
 """
 from __future__ import annotations
 
+from memslicer.behavior.elf import parse_elf
 from memslicer.behavior.pe import parse_pe_exports
 from memslicer.emu.loader import EmuModule, SliceImage
 
@@ -35,11 +36,31 @@ class AddressResolver:
         if self._exports is None:
             self._exports = {}
             if self._mem_read is not None:
-                for mod in self._modules:
-                    for addr, name in parse_pe_exports(self._mem_read,
-                                                       mod.base).items():
-                        self._exports[addr] = f"{mod.name}!{name}"
+                self._build_exports()
         return self._exports
+
+    def _build_exports(self) -> None:
+        elf_imports: dict[int, str] = {}   # resolved_addr -> bare symbol
+        for mod in self._modules:
+            try:
+                magic = self._mem_read(mod.base, 4)
+            except Exception:  # noqa: BLE001
+                continue
+            if magic[:2] == b"MZ":                       # PE
+                for addr, name in parse_pe_exports(self._mem_read, mod.base).items():
+                    self._exports[addr] = f"{mod.name}!{name}"
+            elif magic == b"\x7fELF":                    # ELF
+                defined, imports = parse_elf(self._mem_read, mod.base)
+                for addr, name in defined.items():
+                    self._exports[addr] = f"{mod.name}!{name}"
+                elf_imports.update(imports)
+        # Attribute each PLT/GOT-bound import to the module that owns the
+        # resolved address (e.g. libc), falling back to the bare name.
+        for addr, name in elf_imports.items():
+            if addr in self._exports:
+                continue
+            owner = self.module_at(addr)
+            self._exports[addr] = f"{owner.name}!{name}" if owner else name
 
     def export_at(self, addr: int) -> str | None:
         """Return ``module!Export`` if *addr* is an export entry, else None."""

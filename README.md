@@ -353,11 +353,14 @@ or errors and `--stubs` reloads them so emulation advances down the path of
 interest. Output is JSON (node-link) or Graphviz DOT; granularity switches
 between basic blocks and instructions with `--granularity`.
 
-**Windows API calls** are handled the same way: when a call lands on a module's
-PE export it is resolved to `module!Export`, intercepted, routed to the same
-stub registry (Win64/SysV calling conventions), recorded as a behavior node and
-returned to the caller — so the API body is never emulated. Other addresses are
-labelled `module+offset`.
+**API calls** are handled the same way: when a call lands on a module's export
+it is resolved to `module!Export`, intercepted, routed to the same stub registry
+(Win64/SysV calling conventions), recorded as a behavior node and returned to
+the caller — so the API body is never emulated. Both **PE exports** (Windows)
+and **ELF `.dynsym` / PLT-GOT imports** (Linux) are resolved; the latter uses
+the captured process's already-bound GOT, so `call func@plt` resolves to the
+owning library's `lib!symbol`. Other addresses are labelled `module+offset`, and
+syscalls are named from per-architecture Linux tables.
 
 For deeper analysis you can also hand a *live* emulator off to angr
 (concrete → symbolic) and let angr's SimOS model the OS from that point on:

@@ -263,6 +263,92 @@ def test_api_call_intercepted_and_stubbed(tmp_path):
     assert ev[0]["args"][0] == 0x1234            # rcx (Win64 arg0)
 
 
+# -- syscall tables ---------------------------------------------------------
+
+def test_syscall_tables_per_arch():
+    from memslicer.behavior.syscalls import syscall_name
+    assert syscall_name(ArchType.x86_64, 257) == "openat"
+    assert syscall_name(ArchType.x86_64, 9) == "mmap"
+    assert syscall_name(ArchType.x86_64, 435) == "clone3"
+    assert syscall_name(ArchType.x86, 11) == "execve"        # i386 numbering
+    assert syscall_name(ArchType.ARM64, 221) == "execve"     # generic numbering
+    assert syscall_name(ArchType.ARM32, 322) == "openat"
+    assert syscall_name(ArchType.x86_64, 99999) == "sys_99999"
+
+
+# -- ELF dynsym + PLT/GOT resolution ----------------------------------------
+
+ELF_BASE = 0x555555554000
+LIBC_BASE = 0x7FFFF7A00000
+MALLOC_ADDR = 0x7FFFF7A12345
+
+
+def _build_elf_image():
+    import struct as _s
+    img = bytearray(0x600)
+
+    def put(off, data):
+        img[off:off + len(data)] = data
+
+    # ELF header (ET_DYN, x86-64)
+    put(0, b"\x7fELF\x02\x01\x01")
+    put(16, _s.pack("<H", 3))          # e_type = ET_DYN
+    put(18, _s.pack("<H", 0x3E))       # e_machine = x86-64
+    put(32, _s.pack("<Q", 64))         # e_phoff
+    put(52, _s.pack("<H", 64))         # e_ehsize
+    put(54, _s.pack("<H", 56))         # e_phentsize
+    put(56, _s.pack("<H", 2))          # e_phnum
+    # PT_LOAD
+    put(64, _s.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, 0x600, 0x600, 0x1000))
+    # PT_DYNAMIC @ vaddr 0x200
+    put(120, _s.pack("<IIQQQQQQ", 2, 6, 0x200, 0x200, 0, 0xA0, 0xA0, 8))
+    # dynamic table @ 0x200
+    dyn = [(6, 0x300), (5, 0x348), (11, 24), (23, 0x360), (2, 24),
+           (20, 7), (0, 0)]
+    off = 0x200
+    for tag, val in dyn:
+        put(off, _s.pack("<QQ", tag, val))
+        off += 16
+    # .dynsym @ 0x300: [null, foo(defined), malloc(undef)]
+    put(0x318, _s.pack("<IBBHQQ", 1, 0x12, 0, 1, 0x500, 0))   # foo @ 0x500
+    put(0x330, _s.pack("<IBBHQQ", 5, 0x12, 0, 0, 0, 0))       # malloc (UNDEF)
+    # .dynstr @ 0x348
+    put(0x348, b"\x00foo\x00malloc\x00")
+    # .rela.plt @ 0x360: one JUMP_SLOT for malloc (symidx 2), GOT slot @ 0x4F0
+    put(0x360, _s.pack("<QQQ", 0x4F0, (2 << 32) | 7, 0))
+    # bound GOT slot -> resolved malloc address
+    put(0x4F0, _s.pack("<Q", MALLOC_ADDR))
+    return bytes(img)
+
+
+def _elf_mem(base):
+    img = _build_elf_image()
+    def mem(a, n):                                            # noqa: ANN001
+        off = a - base
+        if 0 <= off < len(img):
+            return img[off:off + n]
+        return b"\x00" * n
+    return mem
+
+
+def test_elf_parser_defined_and_imports():
+    from memslicer.behavior.elf import parse_elf
+    defined, imports = parse_elf(_elf_mem(ELF_BASE), ELF_BASE)
+    assert defined == {ELF_BASE + 0x500: "foo"}
+    assert imports == {MALLOC_ADDR: "malloc"}
+
+
+def test_resolver_elf_dynsym_and_plt():
+    from memslicer.behavior.resolver import AddressResolver
+    from memslicer.emu.loader import EmuModule
+    mods = [EmuModule(ELF_BASE, 0x600, "/lib/libfoo.so"),
+            EmuModule(LIBC_BASE, 0x100000, "/lib/x86_64-linux-gnu/libc.so.6")]
+    res = AddressResolver(mods, mem_read=_elf_mem(ELF_BASE))
+    assert res.export_at(ELF_BASE + 0x500) == "libfoo.so!foo"
+    # PLT/GOT import attributed to the module owning the bound address (libc)
+    assert res.export_at(MALLOC_ADDR) == "libc.so.6!malloc"
+
+
 def test_graph_serializers(tmp_path):
     pytest.importorskip("unicorn")
     from memslicer.behavior import trace_slice

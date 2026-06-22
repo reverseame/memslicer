@@ -26,7 +26,13 @@ from __future__ import annotations
 import importlib.util
 from dataclasses import dataclass, field
 
+from memslicer.behavior.syscalls import syscall_name
 from memslicer.msl.constants import ArchType, OSType
+
+__all__ = [
+    "StubContext", "StubRegistry", "default_stub", "make_context",
+    "make_api_context", "emit_skeleton", "load_stubs", "syscall_name",
+]
 
 # arch -> (syscall-number register, [arg registers...], return register)
 _SYS_ABI = {
@@ -44,26 +50,8 @@ _ARM32_ARGS = ["r0", "r1", "r2", "r3"]
 _SYSV64_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 _WIN64_ARGS = ["rcx", "rdx", "r8", "r9"]
 
-# Common Linux x86-64 syscall numbers -> names (subset; unknown -> "sys_<nr>").
-_LINUX_X86_64 = {
-    0: "read", 1: "write", 2: "open", 3: "close", 4: "stat", 5: "fstat",
-    9: "mmap", 10: "mprotect", 11: "munmap", 12: "brk", 22: "pipe",
-    39: "getpid", 41: "socket", 42: "connect", 43: "accept", 44: "sendto",
-    45: "recvfrom", 49: "bind", 50: "listen", 56: "clone", 57: "fork",
-    59: "execve", 60: "exit", 62: "kill", 63: "uname", 78: "getdents",
-    79: "getcwd", 83: "mkdir", 87: "unlink", 101: "ptrace", 105: "setuid",
-    157: "prctl", 200: "tkill", 202: "futex", 231: "exit_group",
-    257: "openat", 262: "newfstatat", 280: "utimensat", 318: "getrandom",
-}
-
 # Syscalls that terminate the process -> default stub stops emulation.
-_TERMINATORS = {"exit", "exit_group", "execve"}
-
-
-def syscall_name(arch: ArchType, nr: int) -> str:
-    if arch == ArchType.x86_64:
-        return _LINUX_X86_64.get(nr, f"sys_{nr}")
-    return f"sys_{nr}"
+_TERMINATORS = {"exit", "exit_group", "execve", "execveat"}
 
 
 @dataclass
