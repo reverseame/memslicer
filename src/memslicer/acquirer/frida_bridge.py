@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from memslicer.acquirer.bridge import (
-    DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo,
+    MemoryRange, ModuleInfo, PlatformInfo,
     RegisterValue, ThreadInfo, register_role, register_width_bytes,
 )
 from memslicer.acquirer.platform_detect import detect_platform
