@@ -54,16 +54,17 @@ from memslicer.emu.engine import EmuError, open_slice
 def main(dump, granularity, max_steps, start, backend, memory, call_graph,
          stublib, stubs, emit_stubs, output, fmt, features):
     """Extract the behavior graph of the MSL slice DUMP."""
-    if backend == "speakeasy":
-        graph = _run_speakeasy(dump, granularity)
-        _write_graph(graph, output, fmt)
-        _write_features(graph, features)
-        return
-
     registry = build_default_registry() if stublib else None
     if stubs:
         edited = load_stubs(stubs)
         registry = registry.merge(edited) if registry else edited
+
+    if backend == "speakeasy":
+        graph = _run_speakeasy(dump, granularity, registry)
+        _write_graph(graph, output, fmt)
+        _write_features(graph, features)
+        return
+
     try:
         emu = open_slice(dump)
     except EmuError as exc:
@@ -82,14 +83,14 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
     _write_features(graph, features)
 
 
-def _run_speakeasy(dump, granularity):
+def _run_speakeasy(dump, granularity, registry):
     """Drive the Speakeasy backend over the slice's main PE image."""
     from memslicer.behavior.speakeasy_backend import (
         SpeakeasyUnavailable, trace_slice_speakeasy,
     )
     gran = granularity if granularity == "instruction" else None
     try:
-        return trace_slice_speakeasy(dump, granularity=gran)
+        return trace_slice_speakeasy(dump, granularity=gran, registry=registry)
     except SpeakeasyUnavailable as exc:
         raise click.ClickException(str(exc))
 

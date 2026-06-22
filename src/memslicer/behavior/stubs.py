@@ -157,21 +157,26 @@ class StubContext:
     def read_cstr(self, addr: int, limit: int = 4096) -> bytes:
         if not addr:
             return b""
-        try:
-            raw = self.emu.read_mem(addr, limit)
-        except Exception:  # noqa: BLE001 - unmapped/short read
-            return b""
+        raw = self._read_upto(addr, limit)
         nul = raw.find(b"\x00")
         return raw if nul < 0 else raw[:nul]
+
+    def _read_upto(self, addr: int, limit: int) -> bytes:
+        """Read up to *limit* bytes, shrinking the request if the tail is
+        unmapped (a string near a page boundary would over-read otherwise)."""
+        n = limit
+        while n > 0:
+            try:
+                return self.emu.read_mem(addr, n)
+            except Exception:  # noqa: BLE001 - unmapped tail; try a shorter read
+                n = n // 2 if n > 64 else n - 8
+        return b""
 
     def read_wcstr(self, addr: int, limit: int = 4096) -> bytes:
         """Read a NUL-terminated UTF-16LE (Windows wide) string, raw bytes."""
         if not addr:
             return b""
-        try:
-            raw = self.emu.read_mem(addr, limit * 2)
-        except Exception:  # noqa: BLE001 - unmapped/short read
-            return b""
+        raw = self._read_upto(addr, limit * 2)
         end = 0
         while end + 1 < len(raw):
             if raw[end] == 0 and raw[end + 1] == 0:
@@ -240,13 +245,21 @@ class StubRegistry:
         self._byname[name] = fn
 
     def handler(self, name: str):
+        fn = self._lookup(name)
+        return fn or default_stub
+
+    def _lookup(self, name: str):
         fn = self._byname.get(name) or self._byname.get(name.lower())
         # Windows A/W twins: fall back to the base name, but only when it is
         # actually registered (so we never mis-strip an unrelated trailing A/W).
         if fn is None and name and name[-1] in "AW":
             base = name[:-1]
             fn = self._byname.get(base) or self._byname.get(base.lower())
-        return fn or default_stub
+        return fn
+
+    def has(self, name: str) -> bool:
+        """True if an *explicit* stub is registered for *name* (no default)."""
+        return self._lookup(name) is not None
 
     def note(self, name: str, args: list[int]) -> None:
         rec = self.observed.setdefault(name, {"count": 0, "sample_args": args})

@@ -177,6 +177,31 @@ def test_merge_lets_analyst_override_library():
     assert emu.read_reg("rax") == 0xABCD         # analyst stub won
 
 
+def test_registry_has_detects_explicit_stubs():
+    reg = build_default_registry()
+    assert reg.has("CreateFileW")      # via A/W twin -> bare CreateFile
+    assert reg.has("mmap")             # exact
+    assert reg.has("VIRTUALALLOC")     # case-insensitive
+    assert not reg.has("TotallyUnknownApi")
+    assert not StubRegistry().has("CreateFileW")
+
+
+def test_read_cstr_handles_unmapped_tail():
+    # a string just before an unmapped boundary must not over-read to b""
+    class BoundedEmu(FakeEmu):
+        BOUNDARY = 0x5010
+
+        def read_mem(self, addr, size):
+            if addr + size > self.BOUNDARY:
+                raise ValueError("unmapped tail")
+            return super().read_mem(addr, size)
+
+    emu = BoundedEmu()
+    emu.put(0x5000, b"hi\x00")
+    ctx = _api_ctx(emu, "x")
+    assert ctx.read_str(0x5000) == "hi"
+
+
 def test_stub_library_covers_each_category():
     cats = {categorize(name) for name in STUBS}
     for expected in ("file", "network", "registry", "process", "memory",

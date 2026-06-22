@@ -28,7 +28,8 @@ from __future__ import annotations
 from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EdgeType, EventKind
 from memslicer.behavior.graph import BehaviorGraph
-from memslicer.behavior.stubs import categorize
+from memslicer.behavior.stubs import categorize, make_api_context
+from memslicer.msl.constants import ArchType, OSType
 
 __all__ = [
     "SpeakeasyBackend", "SpeakeasyUnavailable",
@@ -38,6 +39,33 @@ __all__ = [
 
 class SpeakeasyUnavailable(RuntimeError):
     """Raised when the optional ``speakeasy`` package is not importable."""
+
+
+class _SpeakeasyEmuAdapter:
+    """A minimal MSLEmulator-shaped view over a Speakeasy emulator, so analyst
+    :class:`~memslicer.behavior.stubs.StubContext` stubs (written against the
+    Unicorn backend) run unchanged when overriding a Speakeasy handler."""
+
+    def __init__(self, emu) -> None:
+        self._emu = emu
+        self.bits = emu.ptr_size * 8
+        self._sp_name = "rsp" if self.bits == 64 else "esp"
+        adapter = self
+
+        class _UC:
+            def mem_write(self, addr, data):
+                adapter._emu.mem_write(addr, bytes(data))
+
+        self.uc = _UC()
+
+    def read_reg(self, name: str) -> int:
+        return self._emu.reg_read(name)
+
+    def write_reg(self, name: str, value: int) -> None:
+        self._emu.reg_write(name, value)
+
+    def read_mem(self, addr: int, size: int) -> bytes:
+        return bytes(self._emu.mem_read(addr, size))
 
 
 def speakeasy_available() -> bool:
@@ -71,8 +99,9 @@ class SpeakeasyBackend:
     """
 
     def __init__(self, *, granularity: str | None = None,
-                 max_api_calls: int = 100000) -> None:
+                 registry=None, max_api_calls: int = 100000) -> None:
         self.granularity = granularity
+        self.registry = registry          # optional analyst/stublib overrides
         self.max_api_calls = max_api_calls
         self.graph = BehaviorGraph()
         self.seq = 0
@@ -112,17 +141,25 @@ class SpeakeasyBackend:
         return f"{mod}{suffix}!{bare}", bare
 
     def _on_api(self, emu, api_name, func, params):
-        rv = func(params) if callable(func) else None
         self._api_calls += 1
         # The caller (its return address) is the code that invoked the API.
         try:
             site = emu.get_ret_address()
         except Exception:  # noqa: BLE001
             site = 0
+        label, bare = self._norm_label(api_name)
+        # An analyst/stublib stub, when present, overrides Speakeasy's handler:
+        # it decides the return value (and side effects) and the real handler is
+        # skipped -- Speakeasy still performs the call return via the rv we give.
+        stub_log = None
+        if self.registry is not None and self.registry.has(bare):
+            rv, stub_log, stop = self._run_stub(emu, bare, site)
+        else:
+            rv = func(params) if callable(func) else None
+            stop = False
         if site:
             self._cur_code = f"0x{site:x}"
             self.graph.touch_node_id(self._cur_code, "block", addr=site)
-        label, bare = self._norm_label(api_name)
         # Speakeasy decodes some args to str/bytes; keep them but render safely.
         argv = list(params)[:4] if params else []
         shown = ", ".join(hex(a) if isinstance(a, int) else repr(a)
@@ -134,12 +171,25 @@ class SpeakeasyBackend:
                    "args": [a if isinstance(a, (int, str)) else repr(a)
                             for a in argv],
                    "ret": rv if isinstance(rv, int) else 0,
-                   "log": f"{bare}({shown})"},
+                   "log": stub_log or f"{bare}({shown})"},
         ))
-        if self._api_calls >= self.max_api_calls:
+        if stop:
+            self.graph.meta.setdefault("stop_reason", "stub requested stop")
+            emu.stop()
+        elif self._api_calls >= self.max_api_calls:
             self.graph.meta.setdefault("stop_reason", "max_api_calls reached")
             emu.stop()
         return rv
+
+    def _run_stub(self, emu, bare, site):
+        """Dispatch an analyst stub against a Speakeasy-backed StubContext.
+        Returns (return_value, log_line, should_stop)."""
+        adapter = _SpeakeasyEmuAdapter(emu)
+        arch = ArchType.x86_64 if adapter.bits == 64 else ArchType.x86
+        ctx = make_api_context(adapter, arch, OSType.Windows, bare, site)
+        result = self.registry.dispatch(ctx)
+        rv = ctx.get_reg(ctx._retreg)
+        return rv, (ctx.logs[-1] if ctx.logs else None), result == ctx.STOP
 
     def _on_code(self, emu, addr, size):
         if self.granularity == "instruction":
@@ -206,9 +256,13 @@ class SpeakeasyBackend:
 
 def trace_pe_speakeasy(*, path: str | None = None, data: bytes | None = None,
                        granularity: str | None = None,
-                       arch: str | None = None) -> BehaviorGraph:
-    """Convenience: emulate a Windows PE (or shellcode) with Speakeasy."""
-    return SpeakeasyBackend(granularity=granularity).trace(
+                       arch: str | None = None,
+                       registry=None) -> BehaviorGraph:
+    """Convenience: emulate a Windows PE (or shellcode) with Speakeasy.
+
+    Pass *registry* to let analyst/stublib stubs override Speakeasy's handlers.
+    """
+    return SpeakeasyBackend(granularity=granularity, registry=registry).trace(
         path=path, data=data, arch=arch)
 
 
@@ -236,30 +290,32 @@ def _main_image_bytes(slice_path: str) -> bytes:
             addr += region.page_size
         return bytes(out)
 
-    candidates = []
+    # Prefer the main executable: an MZ-headed module whose path ends in .exe;
+    # then any MZ-headed module; then any MZ-headed region.
+    exes, mods = [], []
     for mod in sorted(img.modules, key=lambda m: m.base):
         region = region_by_base.get(mod.base)
         if region is None:
             continue
         blob = region_bytes(region)
+        if blob[:2] != b"MZ":
+            continue
+        (exes if mod.path.lower().endswith(".exe") else mods).append(blob)
+    if exes:
+        return exes[0]
+    if mods:
+        return mods[0]
+    for region in sorted(img.regions, key=lambda r: r.base):
+        blob = region_bytes(region)
         if blob[:2] == b"MZ":
-            candidates.append(blob)
-    if not candidates:
-        # fall back to any MZ-headed region
-        for region in sorted(img.regions, key=lambda r: r.base):
-            blob = region_bytes(region)
-            if blob[:2] == b"MZ":
-                candidates.append(blob)
-                break
-    if not candidates:
-        raise SpeakeasyUnavailable(
-            "no PE image (MZ header) found in slice; the Speakeasy backend "
-            "needs a Windows PE")
-    return candidates[0]
+            return blob
+    raise SpeakeasyUnavailable(
+        "no PE image (MZ header) found in slice; the Speakeasy backend "
+        "needs a Windows PE")
 
 
-def trace_slice_speakeasy(slice_path: str, *,
-                          granularity: str | None = None) -> BehaviorGraph:
+def trace_slice_speakeasy(slice_path: str, *, granularity: str | None = None,
+                          registry=None) -> BehaviorGraph:
     """Best-effort: extract the main PE image from an MSL slice and emulate it
     with Speakeasy.
 
@@ -269,4 +325,7 @@ def trace_slice_speakeasy(slice_path: str, *,
     :func:`trace_pe_speakeasy`.
     """
     data = _main_image_bytes(slice_path)
-    return trace_pe_speakeasy(data=data, granularity=granularity)
+    graph = trace_pe_speakeasy(data=data, granularity=granularity,
+                               registry=registry)
+    graph.meta["source"] = "msl-image"   # a memory image, not a file-layout PE
+    return graph

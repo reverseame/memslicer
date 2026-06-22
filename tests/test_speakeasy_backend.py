@@ -76,6 +76,34 @@ def test_graph_is_serializable():
     assert graph.to_dot().startswith("digraph behavior {")
 
 
+def test_analyst_stub_overrides_speakeasy_handler():
+    pytest.importorskip("speakeasy")
+    from memslicer.behavior.speakeasy_backend import trace_pe_speakeasy
+    from memslicer.behavior.stubs import StubRegistry
+
+    reg = StubRegistry()
+
+    def MessageBoxA(ctx):
+        ctx.log(f"hooked text={ctx.arg_str(1)!r}")
+        ctx.set_ret(0x4242)
+        return ctx.CONTINUE
+
+    reg.register("MessageBoxA", MessageBoxA)
+    graph = trace_pe_speakeasy(path=_decoy_pe(), registry=reg)
+    ev = [e for e in graph.events if e["name"].endswith("MessageBoxA")][0]
+    assert ev["ret"] == 0x4242                  # analyst return overrode Speakeasy
+    assert "hooked text='Hello World!'" == ev["log"]   # ctx.arg_str read via bridge
+
+
+def test_baseline_handler_used_without_registry():
+    pytest.importorskip("speakeasy")
+    from memslicer.behavior.speakeasy_backend import trace_pe_speakeasy
+
+    graph = trace_pe_speakeasy(path=_decoy_pe())
+    ev = [e for e in graph.events if e["name"].endswith("MessageBoxA")][0]
+    assert ev["ret"] == 0x2                      # Speakeasy's own MessageBoxA rv
+
+
 def test_category_flows_through_for_known_api():
     pytest.importorskip("speakeasy")
     # An API whose name our classifier recognizes lands with its category;
