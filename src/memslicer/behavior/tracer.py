@@ -106,7 +106,8 @@ class BehaviorTracer:
         result = self.registry.dispatch(ctx)
         self.emit(BehaviorEvent(
             kind=EventKind.API, seq=self.next_seq(), addr=site, label=name,
-            attrs={"args": ctx.args(4), "ret": ctx.get_reg(ctx._retreg),
+            attrs={"category": ctx.category, "args": ctx.args(4),
+                   "ret": ctx.get_reg(ctx._retreg),
                    "log": ctx.logs[-1] if ctx.logs else ""},
         ))
         if result == ctx.STOP:

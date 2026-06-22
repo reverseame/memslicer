@@ -119,6 +119,7 @@ class SyscallProbe(Probe):
             kind=EventKind.SYSCALL, seq=tracer.next_seq(), addr=site,
             label=name, attrs={
                 "number": number,
+                "category": ctx.category,
                 "args": ctx.args(4),
                 "ret": ctx.get_reg(ctx._retreg),
                 "log": ctx.logs[-1] if ctx.logs else "",

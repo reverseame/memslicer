@@ -30,12 +30,16 @@ no OS). Three interchangeable *handler strategies* model them:
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.graph import BehaviorGraph
 from memslicer.behavior.resolver import AddressResolver
-from memslicer.behavior.stubs import StubRegistry, StubContext, emit_skeleton, load_stubs
+from memslicer.behavior.stubs import (
+    StubRegistry, StubContext, categorize, emit_skeleton, load_stubs,
+)
+from memslicer.behavior.stublib import build_default_registry
 from memslicer.behavior.tracer import BehaviorTracer, trace_slice
 
 __all__ = [
     "BehaviorEvent", "EventKind", "EdgeType",
     "BehaviorGraph", "AddressResolver",
-    "StubRegistry", "StubContext", "emit_skeleton", "load_stubs",
+    "StubRegistry", "StubContext", "categorize", "emit_skeleton", "load_stubs",
+    "build_default_registry",
     "BehaviorTracer", "trace_slice",
 ]

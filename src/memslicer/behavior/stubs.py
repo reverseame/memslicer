@@ -32,6 +32,7 @@ from memslicer.msl.constants import ArchType, OSType
 __all__ = [
     "StubContext", "StubRegistry", "default_stub", "make_context",
     "make_api_context", "emit_skeleton", "load_stubs", "syscall_name",
+    "categorize",
 ]
 
 # arch -> (syscall-number register, [arg registers...], return register)
@@ -52,6 +53,44 @@ _WIN64_ARGS = ["rcx", "rdx", "r8", "r9"]
 
 # Syscalls that terminate the process -> default stub stops emulation.
 _TERMINATORS = {"exit", "exit_group", "execve", "execveat"}
+
+# Behavior categories keyed by *substring* of the lower-cased call name. The
+# first matching entry wins, so order from most to least specific. Used to tag
+# syscall/API nodes for behavior-graph grouping and feature vectors.
+_CATEGORY_RULES: list[tuple[tuple[str, ...], str]] = [
+    (("socket", "connect", "bind", "listen", "accept", "send", "recv",
+      "wsastartup", "wsasocket", "winhttp", "internetopen", "inet", "gethostby",
+      "getaddrinfo", "urldownload"), "network"),
+    (("regopen", "regset", "regquery", "regcreate", "regdelete", "regget",
+      "regclose", "regenum"), "registry"),
+    (("createprocess", "shellexecute", "winexec", "fork", "clone", "execve",
+      "vfork", "ptrace", "createthread", "createremotethread", "openprocess",
+      "terminateprocess", "exit"), "process"),
+    (("createfile", "readfile", "writefile", "deletefile", "movefile",
+      "copyfile", "openat", "open", "read", "write", "close", "unlink",
+      "stat", "lstat", "fstat", "mkdir", "rmdir", "rename", "findfirstfile",
+      "findnextfile", "setfilepointer", "createdirectory"), "file"),
+    (("virtualalloc", "virtualprotect", "virtualfree", "mmap", "mprotect",
+      "munmap", "heapalloc", "heapcreate", "mapviewoffile", "ntmapview",
+      "writeprocessmemory", "readprocessmemory", "brk"), "memory"),
+    (("loadlibrary", "getprocaddress", "getmodulehandle", "dlopen", "dlsym"),
+     "library"),
+    (("regopenkey",), "registry"),
+    (("cryptacquire", "cryptencrypt", "cryptdecrypt", "crypthashdata",
+      "bcrypt", "rc4", "rand", "getrandom"), "crypto"),
+    (("getsysteminfo", "getversion", "getcomputername", "getusername",
+      "isdebuggerpresent", "gettickcount", "queryperformance", "uname",
+      "getpid", "getppid"), "system"),
+]
+
+
+def categorize(name: str) -> str:
+    """Map a syscall/API *name* to a coarse behavior category."""
+    low = name.lower()
+    for needles, cat in _CATEGORY_RULES:
+        if any(n in low for n in needles):
+            return cat
+    return "other"
 
 
 @dataclass
@@ -74,6 +113,8 @@ class StubContext:
     _ptr: int = 8
     _stack_arg0: int | None = None   # sp offset to first stacked arg, or None
     logs: list[str] = field(default_factory=list)
+    category: str = "other"          # behavior category (file/network/...)
+    state: dict = field(default_factory=dict)   # cross-call scratch (registry-shared)
 
     CONTINUE = False
     STOP = True
@@ -123,6 +164,51 @@ class StubContext:
         nul = raw.find(b"\x00")
         return raw if nul < 0 else raw[:nul]
 
+    def read_wcstr(self, addr: int, limit: int = 4096) -> bytes:
+        """Read a NUL-terminated UTF-16LE (Windows wide) string, raw bytes."""
+        if not addr:
+            return b""
+        try:
+            raw = self.emu.read_mem(addr, limit * 2)
+        except Exception:  # noqa: BLE001 - unmapped/short read
+            return b""
+        end = 0
+        while end + 1 < len(raw):
+            if raw[end] == 0 and raw[end + 1] == 0:
+                break
+            end += 2
+        return raw[:end]
+
+    # -- decode helpers ------------------------------------------------------
+
+    def read_str(self, addr: int, limit: int = 4096) -> str:
+        """NUL-terminated narrow string, decoded latin-1 (lossless bytes)."""
+        return self.read_cstr(addr, limit).decode("latin-1", "replace")
+
+    def read_wstr(self, addr: int, limit: int = 4096) -> str:
+        """NUL-terminated UTF-16LE (Windows wide) string, decoded."""
+        return self.read_wcstr(addr, limit).decode("utf-16-le", "replace")
+
+    def read_ptr(self, addr: int) -> int:
+        """Dereference a pointer-sized word at *addr* (0 on failure)."""
+        if not addr:
+            return 0
+        try:
+            return int.from_bytes(self.emu.read_mem(addr, self._ptr), "little")
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def arg_str(self, i: int, limit: int = 4096) -> str:
+        """Narrow string pointed to by the *i*-th argument."""
+        return self.read_str(self.arg(i), limit)
+
+    def arg_wstr(self, i: int, limit: int = 4096) -> str:
+        """Wide string pointed to by the *i*-th argument."""
+        return self.read_wstr(self.arg(i), limit)
+
+    def set_category(self, category: str) -> None:
+        self.category = category
+
     def log(self, message: str) -> None:
         self.logs.append(message)
 
@@ -130,6 +216,7 @@ class StubContext:
 def default_stub(ctx: StubContext):
     """Built-in *observe* behavior: record up to 4 args, return 0, continue
     (or stop on a process-terminating syscall)."""
+    ctx.category = categorize(ctx.name)
     ctx.log(f"{ctx.name}({', '.join(hex(a) for a in ctx.args(4))})")
     if ctx.name in _TERMINATORS:
         return ctx.STOP
@@ -147,20 +234,36 @@ class StubRegistry:
     def __init__(self) -> None:
         self._byname: dict[str, callable] = {}
         self.observed: dict[str, dict] = {}
+        self.state: dict = {}   # cross-call scratch shared by every stub
 
     def register(self, name: str, fn) -> None:
         self._byname[name] = fn
 
     def handler(self, name: str):
-        return self._byname.get(name, default_stub)
+        fn = self._byname.get(name) or self._byname.get(name.lower())
+        # Windows A/W twins: fall back to the base name, but only when it is
+        # actually registered (so we never mis-strip an unrelated trailing A/W).
+        if fn is None and name and name[-1] in "AW":
+            base = name[:-1]
+            fn = self._byname.get(base) or self._byname.get(base.lower())
+        return fn or default_stub
 
     def note(self, name: str, args: list[int]) -> None:
         rec = self.observed.setdefault(name, {"count": 0, "sample_args": args})
         rec["count"] += 1
 
     def dispatch(self, ctx: StubContext):
+        ctx.state = self.state
+        ctx.category = categorize(ctx.name)
         self.note(ctx.name, ctx.args(6))
         return self.handler(ctx.name)(ctx)
+
+    def merge(self, other: "StubRegistry") -> "StubRegistry":
+        """Overlay *other*'s stubs onto this registry (other wins) and return
+        self. Lets a curated stub library combine with analyst-edited stubs."""
+        if other is not None:
+            self._byname.update(other._byname)
+        return self
 
 
 def make_context(emu, arch: ArchType, name: str, number: int, site: int,

@@ -36,6 +36,8 @@ class BehaviorGraph:
             node = self._touch_node(nid, ev.kind, label=ev.label)
             node["attrs"].setdefault("calls", 0)
             node["attrs"]["calls"] += 1
+            if ev.attrs.get("category"):
+                node["attrs"]["category"] = ev.attrs["category"]
             self.events.append({
                 "seq": ev.seq, "kind": ev.kind, "name": ev.label,
                 "site": self._code_id(ev.addr), **ev.attrs,

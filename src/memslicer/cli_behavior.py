@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import click
 
+from memslicer.behavior.stublib import build_default_registry
 from memslicer.behavior.stubs import emit_skeleton, load_stubs
 from memslicer.behavior.tracer import BehaviorTracer
 from memslicer.emu.engine import EmuError, open_slice
@@ -27,17 +28,24 @@ from memslicer.emu.engine import EmuError, open_slice
 @click.option("-n", "--max-steps", type=int, default=100000,
               help="Maximum instructions to emulate. [default: 100000]")
 @click.option("--start", default=None, help="Override start address (hex/dec).")
+@click.option("--stublib", is_flag=True, default=False,
+              help="Start from the bundled, categorized stub library.")
 @click.option("--stubs", type=click.Path(exists=True, dir_okay=False),
-              default=None, help="Load analyst-edited syscall/API stubs.")
+              default=None, help="Load analyst-edited syscall/API stubs "
+              "(merged on top of --stublib if both are given).")
 @click.option("--emit-stubs", type=click.Path(dir_okay=False), default=None,
               help="After the run, write an editable stub skeleton here.")
 @click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
               help="Write the graph to FILE (.json or .dot by extension).")
 @click.option("-f", "--format", "fmt", type=click.Choice(["json", "dot"]),
               default=None, help="Output format (else inferred from -o).")
-def main(dump, granularity, max_steps, start, stubs, emit_stubs, output, fmt):
+def main(dump, granularity, max_steps, start, stublib, stubs, emit_stubs,
+         output, fmt):
     """Extract the behavior graph of the MSL slice DUMP."""
-    registry = load_stubs(stubs) if stubs else None
+    registry = build_default_registry() if stublib else None
+    if stubs:
+        edited = load_stubs(stubs)
+        registry = registry.merge(edited) if registry else edited
     try:
         emu = open_slice(dump)
     except EmuError as exc:
