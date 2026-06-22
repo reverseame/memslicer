@@ -13,7 +13,6 @@ from memslicer.acquirer.investigation import (
     TargetProcessInfo,
     TargetSystemInfo,
 )
-from memslicer.msl.types import ProcessEntry, ConnectionEntry, HandleEntry
 
 
 @pytest.fixture

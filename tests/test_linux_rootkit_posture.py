@@ -15,16 +15,14 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.collectors.linux import (
-    LinuxCollector,
     _decode_kernel_taint,
 )
-from memslicer.msl.types import PersistenceManifest, PersistenceRow
+from memslicer.msl.types import PersistenceManifest
 
 # Reuse the fixture helpers from the sibling Linux-collector test module.
 sys.path.insert(0, str(Path(__file__).resolve().parent))

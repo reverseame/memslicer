@@ -2,20 +2,17 @@
 from __future__ import annotations
 
 import struct
-import threading
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
-from memslicer.acquirer.base import AcquireResult
 from memslicer.acquirer.bridge import MemoryRange, ModuleInfo, PlatformInfo
 from memslicer.acquirer.engine import AcquisitionEngine, classify_region, volatility_key
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
-    ArchType, CapBit, CompAlgo, HEADER_SIZE, OSType, RegionType,
-    BLOCK_HEADER_SIZE, BLOCK_MAGIC, BlockType, FLAG_INVESTIGATION,
+    ArchType, CapBit, HEADER_SIZE, OSType, RegionType,
+    BLOCK_HEADER_SIZE, BLOCK_MAGIC, BlockType,
 )
 from memslicer.msl.types import ProcessEntry, ConnectionEntry, HandleEntry
 

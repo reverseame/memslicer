@@ -55,6 +55,11 @@ graph = [
     "networkx>=3.0",
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Several test modules bootstrap sys.path (insert ../src) before importing
+# memslicer, so their package imports intentionally follow module-level code.
+"tests/*" = ["E402"]
+
 [tool.pytest.ini_options]
 markers = [
     "requires_root: skipped unless os.geteuid() == 0",

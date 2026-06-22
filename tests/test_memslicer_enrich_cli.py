@@ -8,13 +8,11 @@ stub test has been replaced with real end-to-end tests; the
 """
 from __future__ import annotations
 
-import io
 import struct
 import sys
 import warnings
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

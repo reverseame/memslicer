@@ -4,9 +4,8 @@ from __future__ import annotations
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
 
-from memslicer.acquirer.bridge import MemoryRange, ModuleInfo, PlatformInfo
+from memslicer.acquirer.bridge import PlatformInfo
 from memslicer.msl.constants import ArchType, OSType
 
 
