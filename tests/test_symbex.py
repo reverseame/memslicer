@@ -59,6 +59,32 @@ def test_load_angr_seeds_state(tmp_path):
     assert rsp == STACK_VA + 0xf00
 
 
+def test_handoff_from_live_emulator(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("angr")
+    from memslicer.emu.engine import open_slice
+    from memslicer.symbex import handoff_to_angr
+
+    p = tmp_path / "code.msl"
+    _write_slice(p)
+    emu = open_slice(str(p))
+    emu.step()              # concrete: mov rax, 1
+    emu.step()              # concrete: mov rbx, 2
+
+    # hand the live emulator off to angr; the state must reflect the concrete
+    # registers already computed and sit at the current PC.
+    project, state = handoff_to_angr(emu)
+    assert project.arch.name == "AMD64"
+    assert state.addr == emu.pc
+    assert state.solver.eval(state.regs.rax) == 1
+    assert state.solver.eval(state.regs.rbx) == 2
+
+    # and angr can continue symbolically from there (add rax,rbx -> rax=3).
+    simgr = project.factory.simgr(state)
+    simgr.step()
+    assert simgr.active
+
+
 def test_load_angr_can_execute(tmp_path):
     pytest.importorskip("angr")
     from memslicer.symbex import load_angr

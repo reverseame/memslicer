@@ -30,6 +30,15 @@ All notable changes to this project will be documented in this file.
   `--emit-stubs` writes a template (one function per observed call, pre-filled
   with the observed arguments) and `--stubs` reloads the edited version so the
   analyst controls return values and side effects. Uses the `emu` extra.
+  Windows API calls are resolved too: call targets that land on a module's PE
+  export are labelled `module!Export`, intercepted, routed to the same stub
+  registry (Win64/SysV calling conventions), and returned to the caller without
+  emulating the API body. The address resolver also maps any address back to
+  `module+offset`.
+- `memslicer.symbex.handoff_to_angr(emu)` performs a concrete→symbolic
+  hand-off: it builds an angr `Project`/`SimState` from a *live* emulator's
+  current registers and memory, so you can emulate concretely up to a point of
+  interest and then continue symbolically with angr's SimOS modelling the OS.
 
 ### Bug Fixes
 

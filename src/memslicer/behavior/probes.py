@@ -60,13 +60,11 @@ class ControlFlowProbe(Probe):
 
     def _on_node(self, uc, address, size, user):
         tracer = self._tracer
-        tracer.tick()
-        label = tracer.resolver.label(address)
-        tracer.emit(BehaviorEvent(
-            kind=EventKind.NODE, seq=tracer.seq, addr=address, size=size,
-            node_kind="block" if self.granularity == "block" else "insn",
-            label=label,
-        ))
+        # The tracer creates the node (and may intercept the address as an API
+        # call, in which case no plain code node/edge is emitted and the caller
+        # stays the current node).
+        if tracer.on_code_node(address, size, self.granularity):
+            return
         if self._prev is not None:
             paddr, psize = self._prev
             etype = self._classify(paddr, psize)

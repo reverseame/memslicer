@@ -353,6 +353,25 @@ or errors and `--stubs` reloads them so emulation advances down the path of
 interest. Output is JSON (node-link) or Graphviz DOT; granularity switches
 between basic blocks and instructions with `--granularity`.
 
+**Windows API calls** are handled the same way: when a call lands on a module's
+PE export it is resolved to `module!Export`, intercepted, routed to the same
+stub registry (Win64/SysV calling conventions), recorded as a behavior node and
+returned to the caller — so the API body is never emulated. Other addresses are
+labelled `module+offset`.
+
+For deeper analysis you can also hand a *live* emulator off to angr
+(concrete → symbolic) and let angr's SimOS model the OS from that point on:
+
+```python
+from memslicer.emu import open_slice
+from memslicer.symbex import handoff_to_angr
+emu = open_slice("dump.msl")
+for _ in range(20):
+    emu.step()                       # run concretely to a point of interest
+project, state = handoff_to_angr(emu)  # continue symbolically from here
+simgr = project.factory.simgr(state)
+```
+
 ```python
 from memslicer.behavior import trace_slice
 graph = trace_slice("dump.msl")            # registers seeded, hooks installed

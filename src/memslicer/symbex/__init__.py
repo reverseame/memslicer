@@ -8,6 +8,6 @@ The captured memory and the Current thread's registers are loaded into an angr
 ``SimState`` positioned at the captured program counter, so symbolic execution
 can start from the exact point the slice was taken.
 """
-from memslicer.symbex.angr_loader import load_angr, SymbexError
+from memslicer.symbex.angr_loader import load_angr, handoff_to_angr, SymbexError
 
-__all__ = ["load_angr", "SymbexError"]
+__all__ = ["load_angr", "handoff_to_angr", "SymbexError"]

@@ -26,7 +26,7 @@ from __future__ import annotations
 import importlib.util
 from dataclasses import dataclass, field
 
-from memslicer.msl.constants import ArchType
+from memslicer.msl.constants import ArchType, OSType
 
 # arch -> (syscall-number register, [arg registers...], return register)
 _SYS_ABI = {
@@ -35,6 +35,14 @@ _SYS_ABI = {
     ArchType.ARM64:  ("x8",  ["x0", "x1", "x2", "x3", "x4", "x5"], "x0"),
     ArchType.ARM32:  ("r7",  ["r0", "r1", "r2", "r3", "r4", "r5"], "r0"),
 }
+
+# Function-call ABIs for API stubs: argument registers spilled to the stack
+# after they run out. ``stack0`` is the byte offset from the stack pointer to
+# the first *stacked* argument (past the return address and any shadow space).
+_ARM64_ARGS = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+_ARM32_ARGS = ["r0", "r1", "r2", "r3"]
+_SYSV64_ARGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+_WIN64_ARGS = ["rcx", "rdx", "r8", "r9"]
 
 # Common Linux x86-64 syscall numbers -> names (subset; unknown -> "sys_<nr>").
 _LINUX_X86_64 = {
@@ -74,6 +82,9 @@ class StubContext:
     kind: str = "syscall"     # "syscall" | "api"
     _argregs: list[str] = field(default_factory=list)
     _retreg: str = "rax"
+    _spreg: str = "rsp"
+    _ptr: int = 8
+    _stack_arg0: int | None = None   # sp offset to first stacked arg, or None
     logs: list[str] = field(default_factory=list)
 
     CONTINUE = False
@@ -82,9 +93,16 @@ class StubContext:
     # -- arguments / registers ----------------------------------------------
 
     def arg(self, i: int) -> int:
-        """Value of the *i*-th integer argument (ABI-ordered)."""
+        """Value of the *i*-th integer argument (ABI-ordered; reg then stack)."""
         if i < len(self._argregs):
             return self.emu.read_reg(self._argregs[i])
+        if self._stack_arg0 is not None:
+            idx = i - len(self._argregs)
+            addr = self.emu.read_reg(self._spreg) + self._stack_arg0 + idx * self._ptr
+            try:
+                return int.from_bytes(self.emu.read_mem(addr, self._ptr), "little")
+            except Exception:  # noqa: BLE001
+                return 0
         return 0
 
     def args(self, n: int) -> list[int]:
@@ -162,6 +180,30 @@ def make_context(emu, arch: ArchType, name: str, number: int, site: int,
     _nr, argregs, retreg = _SYS_ABI.get(arch, ("rax", [], "rax"))
     return StubContext(emu=emu, arch=arch, name=name, number=number, site=site,
                        kind=kind, _argregs=list(argregs), _retreg=retreg)
+
+
+def make_api_context(emu, arch: ArchType, os: OSType, name: str,
+                     site: int) -> StubContext:
+    """Build a :class:`StubContext` for an API call using the function-call ABI
+    of *arch*/*os* (Win64 vs SysV vs ARM AAPCS)."""
+    ptr = emu.bits // 8
+    spreg = emu._sp_name
+    if arch == ArchType.x86_64:
+        if os == OSType.Windows:
+            argregs, retreg, stack0 = _WIN64_ARGS, "rax", ptr + 32  # +shadow
+        else:
+            argregs, retreg, stack0 = _SYSV64_ARGS, "rax", ptr
+    elif arch == ArchType.x86:
+        argregs, retreg, stack0 = [], "eax", ptr                    # cdecl/stdcall
+    elif arch == ArchType.ARM64:
+        argregs, retreg, stack0 = _ARM64_ARGS, "x0", 0
+    elif arch == ArchType.ARM32:
+        argregs, retreg, stack0 = _ARM32_ARGS, "r0", 0
+    else:
+        argregs, retreg, stack0 = [], "rax", None
+    return StubContext(emu=emu, arch=arch, name=name, number=-1, site=site,
+                       kind="api", _argregs=list(argregs), _retreg=retreg,
+                       _spreg=spreg, _ptr=ptr, _stack_arg0=stack0)
 
 
 def emit_skeleton(registry: StubRegistry, path: str) -> None:
