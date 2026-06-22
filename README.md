@@ -521,6 +521,40 @@ ruff check src/
 ruff format src/
 ```
 
+CI (`.github/workflows/tests.yml`) runs `ruff` and the test suite on every pull
+request and on pushes to `main`, across Python 3.10 and 3.12.
+
+### Releasing
+
+Releases are automated by `.github/workflows/publish.yml`, triggered by the
+**version in `pyproject.toml`**. To cut a release:
+
+1. Bump `version` under `[project]` in `pyproject.toml` (e.g. `0.2.7` → `0.2.8`).
+2. Open a PR and merge it to `main`.
+
+On that push to `main` the workflow:
+
+1. Detects that the version changed (compares `pyproject.toml` at `HEAD` vs
+   `HEAD~1`; merges that don't change the version skip publishing entirely).
+2. Runs the test suite on Python 3.10–3.12.
+3. Builds the sdist + wheel and publishes to PyPI via OIDC **trusted
+   publishing** (no API token stored).
+4. Creates and pushes the `vX.Y.Z` git tag.
+
+A separate workflow (`changelog.yml`) regenerates the `CHANGELOG.md` section for
+the new version from the commit messages since the previous tag.
+
+**Before the first PyPI release, two things must be set up:**
+
+- **PyPI trusted publisher** — configure it once at pypi.org → *memslicer* →
+  *Publishing*: owner `reverseame`, repository `memslicer`, workflow
+  `publish.yml`, environment `pypi`. Without it the publish step fails at the
+  OIDC token exchange (`invalid-publisher`).
+- **The `speakeasy` extra** — it pins a direct git source, and PyPI rejects
+  distributions that declare direct-reference (`@ git+https://…`) dependencies.
+  Drop or rework that extra (e.g. document installing Speakeasy manually) before
+  publishing, otherwise the upload is rejected even after OIDC is configured.
+
 ---
 
 ## Dependencies
