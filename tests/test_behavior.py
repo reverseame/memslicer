@@ -349,6 +349,112 @@ def test_resolver_elf_dynsym_and_plt():
     assert res.export_at(MALLOC_ADDR) == "libc.so.6!malloc"
 
 
+# -- end-to-end ELF PLT/GOT interception (emulate through a real PLT stub) ---
+
+MAIN_BASE = 0x400000
+MALLOC_RESOLVED = LIBC_BASE + 0x1234
+
+
+def _build_elf_plt_image():
+    """A 4 KiB ET_DYN image: user code does `call malloc@plt`; the PLT stub
+    jumps through a GOT slot bound to a libc address."""
+    import struct as _s
+    img = bytearray(PS)
+
+    def put(off, data):
+        img[off:off + len(data)] = data
+
+    put(0, b"\x7fELF\x02\x01\x01")
+    put(16, _s.pack("<H", 3))            # ET_DYN -> load bias = base
+    put(18, _s.pack("<H", 0x3E))         # x86-64
+    put(32, _s.pack("<Q", 0x40))         # e_phoff
+    put(52, _s.pack("<H", 64))
+    put(54, _s.pack("<H", 56))
+    put(56, _s.pack("<H", 2))            # 2 program headers
+    put(0x40, _s.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, PS, PS, 0x1000))    # PT_LOAD
+    put(0x78, _s.pack("<IIQQQQQQ", 2, 6, 0x200, 0x200, 0, 0xA0, 0xA0, 8))  # DYNAMIC
+    # user code @0x100: mov rdi,0x20 ; call <plt@0x140> ; mov rbx,rax
+    put(0x100, bytes.fromhex("48c7c720000000" "e834000000" "4889c3"))
+    # PLT stub @0x140: jmp qword [rip+0x2aa]  (-> GOT slot @0x3F0)
+    put(0x140, bytes.fromhex("ff25aa020000"))
+    # dynamic table @0x200
+    for i, (t, v) in enumerate([(6, 0x300), (5, 0x330), (11, 24), (23, 0x360),
+                                (2, 24), (20, 7), (0, 0)]):
+        put(0x200 + i * 16, _s.pack("<QQ", t, v))
+    # .dynsym @0x300: sym0 null, sym1 malloc (UNDEF) @0x318
+    put(0x318, _s.pack("<IBBHQQ", 1, 0x12, 0, 0, 0, 0))
+    put(0x330, b"\x00malloc\x00")        # .dynstr
+    # .rela.plt @0x360: JUMP_SLOT for malloc (symidx 1), GOT slot @0x3F0
+    put(0x360, _s.pack("<QQQ", 0x3F0, (1 << 32) | 7, 0))
+    put(0x3F0, _s.pack("<Q", MALLOC_RESOLVED))   # bound GOT slot
+    return bytes(img)
+
+
+def _write_elf_plt_slice(path):
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ThreadContexts)
+           | (1 << CapBit.ModuleList))
+    hdr = FileHeader(os_type=OSType.Linux, arch_type=ArchType.x86_64, pid=7,
+                     cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="/bin/app"))
+        w.write_module_list([
+            ModuleEntry(base_addr=MAIN_BASE, module_size=PS, path="/bin/app"),
+            ModuleEntry(base_addr=LIBC_BASE, module_size=0x2000,
+                        path="/lib/x86_64-linux-gnu/libc.so.6")])
+        w.write_memory_region(MemoryRegion(
+            base_addr=MAIN_BASE, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED],
+            page_data_chunks=[_build_elf_plt_image()]))
+        # libc region: the resolved malloc address must be mapped so the block
+        # hook (and thus interception) fires there.
+        w.write_memory_region(MemoryRegion(
+            base_addr=LIBC_BASE, region_size=0x2000, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED, PageState.CAPTURED],
+            page_data_chunks=[b"\xc3" * PS, b"\xc3" * PS]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
+        w.write_thread_context(ThreadContext(
+            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=[
+                ThreadRegister("rip", (MAIN_BASE + 0x100).to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", (STACK_VA + 0x800).to_bytes(8, "little"), REG_FLAG_SP),
+            ]))
+        w.finalize()
+
+
+def test_elf_plt_call_intercepted_and_stubbed(tmp_path):
+    pytest.importorskip("unicorn")
+    from memslicer.behavior.stubs import load_stubs
+    from memslicer.behavior.tracer import BehaviorTracer
+    from memslicer.emu.engine import open_slice
+
+    stub_file = tmp_path / "stubs.py"
+    stub_file.write_text(
+        "def malloc(ctx):\n"
+        "    ctx.log(f'malloc(size={ctx.arg(0)})')\n"
+        "    ctx.set_ret(0xdead000)\n"
+        "    return ctx.CONTINUE\n"
+    )
+    p = tmp_path / "plt.msl"
+    _write_elf_plt_slice(p)
+    emu = open_slice(str(p))
+    tracer = BehaviorTracer(emu, registry=load_stubs(str(stub_file)))
+    graph = tracer.run(max_steps=20)
+
+    # call malloc@plt -> PLT stub jmp [GOT] -> libc entry (intercepted) ->
+    # stub returned 0xdead000 -> back to caller -> mov rbx, rax.
+    assert emu.read_reg("rbx") == 0xDEAD000
+    assert "api:libc.so.6!malloc" in graph.nodes
+    ev = [e for e in graph.events if e["kind"] == "api"]
+    assert ev and ev[0]["name"] == "libc.so.6!malloc"
+    assert ev[0]["args"][0] == 0x20            # rdi (SysV arg0 = size)
+
+
 def test_graph_serializers(tmp_path):
     pytest.importorskip("unicorn")
     from memslicer.behavior import trace_slice
