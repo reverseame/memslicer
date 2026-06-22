@@ -46,14 +46,18 @@ from memslicer.emu.engine import EmuError, open_slice
               help="After the run, write an editable stub skeleton here.")
 @click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
               help="Write the graph to FILE (.json or .dot by extension).")
-@click.option("-f", "--format", "fmt", type=click.Choice(["json", "dot"]),
+@click.option("-f", "--format", "fmt",
+              type=click.Choice(["json", "dot", "graphml", "gexf"]),
               default=None, help="Output format (else inferred from -o).")
+@click.option("--features", type=click.Path(dir_okay=False), default=None,
+              help="Write a per-graph feature vector (JSON) to FILE.")
 def main(dump, granularity, max_steps, start, backend, memory, call_graph,
-         stublib, stubs, emit_stubs, output, fmt):
+         stublib, stubs, emit_stubs, output, fmt, features):
     """Extract the behavior graph of the MSL slice DUMP."""
     if backend == "speakeasy":
         graph = _run_speakeasy(dump, granularity)
         _write_graph(graph, output, fmt)
+        _write_features(graph, features)
         return
 
     registry = build_default_registry() if stublib else None
@@ -75,6 +79,7 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
         click.echo(f"wrote stub skeleton: {emit_stubs}")
 
     _write_graph(graph, output, fmt)
+    _write_features(graph, features)
 
 
 def _run_speakeasy(dump, granularity):
@@ -89,10 +94,30 @@ def _run_speakeasy(dump, granularity):
         raise click.ClickException(str(exc))
 
 
+_EXT_FMT = {".dot": "dot", ".graphml": "graphml", ".gexf": "gexf",
+            ".json": "json"}
+_SERIALIZERS = {
+    "dot": lambda g: g.to_dot(),
+    "graphml": lambda g: g.to_graphml(),
+    "gexf": lambda g: g.to_gexf(),
+    "json": lambda g: g.to_json(),
+}
+
+
+def _write_features(graph, features):
+    if not features:
+        return
+    import json
+    with open(features, "w") as f:
+        json.dump(graph.feature_vector(), f, indent=2)
+    click.echo(f"wrote feature vector: {features}")
+
+
 def _write_graph(graph, output, fmt):
     if fmt is None and output:
-        fmt = "dot" if output.lower().endswith(".dot") else "json"
-    text = graph.to_dot() if fmt == "dot" else graph.to_json()
+        ext = output[output.rfind("."):].lower() if "." in output else ""
+        fmt = _EXT_FMT.get(ext, "json")
+    text = _SERIALIZERS.get(fmt, _SERIALIZERS["json"])(graph)
 
     if output:
         with open(output, "w") as f:

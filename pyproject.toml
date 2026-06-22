@@ -49,6 +49,11 @@ speakeasy = [
     # unicorn>=2.1 and Python>=3.10.
     "speakeasy-emulator @ git+https://github.com/mandiant/speakeasy.git",
 ]
+graph = [
+    # Optional: BehaviorGraph.to_networkx(). GraphML/GEXF export are
+    # dependency-free, so networkx is only needed for the live nx object.
+    "networkx>=3.0",
+]
 
 [tool.pytest.ini_options]
 markers = [
