@@ -362,6 +362,58 @@ the captured process's already-bound GOT, so `call func@plt` resolves to the
 owning library's `lib!symbol`. Other addresses are labelled `module+offset`, and
 syscalls are named from per-architecture Linux tables.
 
+**Bundled stub library.** Instead of writing stubs by hand you can start from a
+curated, categorized library covering the APIs malware most often touches
+(file / network / registry / process / memory / library / crypto / system).
+Each stub decodes its interesting arguments, logs them readably, and returns a
+plausible value (a fresh handle, an allocation address, success) so emulation
+keeps advancing. `--stublib` enables it; `--stubs` merges your edits on top:
+
+```bash
+memslicer-behavior dump.msl --stublib -o graph.json              # bundled stubs
+memslicer-behavior dump.msl --stublib --stubs mine.py -o g.json  # + overrides
+```
+
+Every syscall / API node carries a **behavior category**, so the graph groups
+by what the code *does*, not just which symbol it called.
+
+**Data-flow edges.** A lightweight value-equality taint links calls causally:
+a `dataflow` edge when one call's return value is later passed as an argument
+(the handle `CreateFile` returns, consumed by `WriteFile`; the address
+`VirtualAlloc` returns, written by `WriteProcessMemory`), and a `buffer` edge
+when two calls share the same pointer/handle argument (`ReadFile` fills a
+buffer, `send` ships it). Both run automatically for either backend.
+
+**Memory annotations** (`--memory`, on by default). Writes into executable
+memory — unpacking, self-modifying code, code injection — are flagged (the
+writing block is highlighted), every write is bucketed by its target region
+type (heap / stack / image / …), and statically-RWX regions are listed under
+`meta.memory`.
+
+**Dynamic call graph** (`--call-graph`). Overlays function nodes and
+`call`/`ret` edges (a shadow call stack tracks the current function) on top of
+the basic-block CFG.
+
+**High-fidelity Windows emulation (Speakeasy).** For Windows, `--backend
+speakeasy` drives [Speakeasy](https://github.com/mandiant/speakeasy) — built on
+the same Unicorn engine but shipping hundreds of real API handlers plus
+PEB/TEB, the object manager and a fake filesystem/registry/network — and
+projects its emulation onto the same behavior graph. Your `--stublib`/`--stubs`
+stubs still override individual handlers when you want to steer a path:
+
+```bash
+pip install 'memslicer[speakeasy]'   # git head; the PyPI release pins unicorn 1.x
+memslicer-behavior dump.msl --backend speakeasy -o graph.json
+```
+
+**Export & features.** The graph serializes to JSON, Graphviz DOT, **GraphML**
+and **GEXF** (`-f`, or inferred from the `.json`/`.dot`/`.graphml`/`.gexf`
+extension; the XML formats need no extra dependency). `--features` writes a
+fixed-key numeric **feature vector** (node/edge counts by kind/type, calls per
+category, memory and data-flow tallies) ready to stack into an ML matrix.
+`BehaviorGraph.to_networkx()` returns a live `MultiDiGraph` with the optional
+`graph` extra.
+
 For deeper analysis you can also hand a *live* emulator off to angr
 (concrete → symbolic) and let angr's SimOS model the OS from that point on:
 
