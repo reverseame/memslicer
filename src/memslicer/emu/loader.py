@@ -57,7 +57,11 @@ class EmuRegion:
     size: int
     protection: int
     page_size: int
+    region_type: int = 0      # RegionType: Heap/Stack/Image/MappedFile/...
     pages: dict[int, bytes] = field(default_factory=dict)
+
+    def contains(self, addr: int) -> bool:
+        return self.base <= addr < self.base + self.size
 
 
 @dataclass
@@ -115,7 +119,7 @@ def _parse_region(payload: bytes) -> EmuRegion:
             pages[base + i * page_size] = data[off:off + page_size]
             captured += 1
     return EmuRegion(base=base, size=size, protection=prot,
-                     page_size=page_size, pages=pages)
+                     page_size=page_size, region_type=_rt, pages=pages)
 
 
 def _parse_thread(payload: bytes) -> EmuThread:

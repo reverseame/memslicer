@@ -16,7 +16,9 @@ from __future__ import annotations
 from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.graph import BehaviorGraph
-from memslicer.behavior.probes import ControlFlowProbe, SyscallProbe
+from memslicer.behavior.probes import (
+    ControlFlowProbe, FunctionProbe, MemProbe, SyscallProbe,
+)
 from memslicer.behavior.resolver import AddressResolver
 from memslicer.behavior.stubs import StubRegistry, make_api_context
 from memslicer.emu.engine import MSLEmulator, open_slice
@@ -27,14 +29,21 @@ class BehaviorTracer:
     def __init__(self, emu: MSLEmulator, *, granularity: str = "block",
                  registry: StubRegistry | None = None,
                  resolver: AddressResolver | None = None,
-                 intercept_apis: bool = True, probes=None) -> None:
+                 intercept_apis: bool = True, memory: bool = True,
+                 call_graph: bool = False, probes=None) -> None:
         self.emu = emu
         self.graph = BehaviorGraph()
         self.resolver = resolver or AddressResolver.from_emulator(emu)
         self.registry = registry or StubRegistry()
         self.granularity = granularity
         self.intercept_apis = intercept_apis
-        self.probes = probes or [ControlFlowProbe(granularity), SyscallProbe()]
+        if probes is None:
+            probes = [ControlFlowProbe(granularity), SyscallProbe()]
+            if memory:
+                probes.append(MemProbe())
+            if call_graph:
+                probes.append(FunctionProbe())
+        self.probes = probes
         self.seq = 0
         self._steps = 0
         self._cur_code: str | None = None

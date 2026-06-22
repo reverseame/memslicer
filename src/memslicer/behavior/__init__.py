@@ -30,6 +30,9 @@ no OS). Three interchangeable *handler strategies* model them:
 from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.graph import BehaviorGraph
+from memslicer.behavior.probes import (
+    ControlFlowProbe, FunctionProbe, MemProbe, SyscallProbe,
+)
 from memslicer.behavior.resolver import AddressResolver
 from memslicer.behavior.stubs import (
     StubRegistry, StubContext, categorize, emit_skeleton, load_stubs,
@@ -44,6 +47,7 @@ from memslicer.behavior.tracer import BehaviorTracer, trace_slice
 __all__ = [
     "BehaviorEvent", "EventKind", "EdgeType",
     "BehaviorGraph", "AddressResolver", "link_dataflow",
+    "ControlFlowProbe", "SyscallProbe", "MemProbe", "FunctionProbe",
     "StubRegistry", "StubContext", "categorize", "emit_skeleton", "load_stubs",
     "build_default_registry",
     "SpeakeasyBackend", "SpeakeasyUnavailable", "speakeasy_available",

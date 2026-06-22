@@ -9,9 +9,19 @@ moves. Adding a new granularity is a new probe, nothing else.
 """
 from __future__ import annotations
 
+import bisect
+
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.stubs import make_context, syscall_name
-from memslicer.msl.constants import ArchType
+from memslicer.msl.constants import ArchType, RegionType
+from memslicer.utils.protection import PROT_X, is_rwx
+
+_RT_CATEGORY = {
+    RegionType.Heap: "heap", RegionType.Stack: "stack",
+    RegionType.Image: "image", RegionType.MappedFile: "mapped",
+    RegionType.Anon: "anon", RegionType.SharedMem: "shared",
+    RegionType.Other: "other", RegionType.Unknown: "unknown",
+}
 
 
 class Probe:
@@ -127,3 +137,121 @@ class SyscallProbe(Probe):
         ))
         if result == ctx.STOP:
             tracer.stop("syscall stub requested stop")
+
+
+class MemProbe(Probe):
+    """Annotates memory writes (A3): writes to *executable* memory (unpacking,
+    self-modifying code, code injection), the write-target's region type
+    (heap/stack/image/...), and any statically-RWX regions.
+
+    Aggregates land in ``graph.meta['memory']``; a code node that writes to
+    executable memory is tagged with ``attrs['writes_exec']`` so the suspicious
+    block stands out in the graph.
+    """
+
+    def attach(self, tracer) -> None:
+        self._tracer = tracer
+        regions = sorted(tracer.emu.image.regions, key=lambda r: r.base)
+        self._bases = [r.base for r in regions]
+        self._regions = regions
+        U = tracer.emu._U
+        tracer.emu.uc.hook_add(U.UC_HOOK_MEM_WRITE, self._on_write)
+        mem = tracer.graph.meta.setdefault("memory", {
+            "writes": 0, "exec_writes": 0, "by_region": {},
+            "exec_write_targets": [], "rwx_regions": [],
+        })
+        for r in regions:
+            if is_rwx(r.protection):
+                mem["rwx_regions"].append(f"0x{r.base:x}")
+
+    def _region_at(self, addr: int):
+        i = bisect.bisect_right(self._bases, addr) - 1
+        if i < 0:
+            return None
+        r = self._regions[i]
+        return r if r.base <= addr < r.base + r.size else None
+
+    def _on_write(self, uc, access, address, size, value, user):
+        tracer = self._tracer
+        mem = tracer.graph.meta["memory"]
+        mem["writes"] += 1
+        r = self._region_at(address)
+        # RegionType is an IntEnum, so the raw int key matches directly.
+        cat = ("unmapped" if r is None
+               else _RT_CATEGORY.get(r.region_type, "other"))
+        mem["by_region"][cat] = mem["by_region"].get(cat, 0) + 1
+        if r is not None and (r.protection & PROT_X):
+            mem["exec_writes"] += 1
+            tgt = f"0x{address:x}"
+            tgts = mem["exec_write_targets"]
+            if len(tgts) < 64 and tgt not in tgts:
+                tgts.append(tgt)
+            src = tracer._cur_code
+            node = tracer.graph.nodes.get(src) if src else None
+            if node is not None:
+                node["attrs"]["writes_exec"] = \
+                    node["attrs"].get("writes_exec", 0) + 1
+
+
+class FunctionProbe(Probe):
+    """Builds a dynamic call graph (A2): function nodes keyed by entry address,
+    ``call`` edges caller->callee, and ``ret`` edges back.
+
+    An overlay -- it runs alongside the block/instruction CFG without disturbing
+    it. Call/return are detected from each block's terminator (Capstone groups),
+    and a shadow call stack tracks the current function so returns rejoin the
+    caller. API thunk addresses (resolved exports) are skipped: those are
+    intercepted as API nodes by the tracer.
+    """
+
+    def attach(self, tracer) -> None:
+        self._tracer = tracer
+        from capstone import CS_GRP_CALL, CS_GRP_RET
+        self._CALL, self._RET = CS_GRP_CALL, CS_GRP_RET
+        tracer.emu.cs.detail = True
+        U = tracer.emu._U
+        tracer.emu.uc.hook_add(U.UC_HOOK_BLOCK, self._on_block)
+        self._stack: list[str] = []
+        self._cur: str | None = None
+        self._prev_term: str | None = None
+
+    def _terminator(self, addr: int, size: int) -> str | None:
+        emu = self._tracer.emu
+        try:
+            code = bytes(emu.uc.mem_read(addr, size))
+        except emu._U.UcError:
+            return None
+        last = None
+        for insn in emu.cs.disasm(code, addr):
+            last = insn
+        if last is None:
+            return None
+        if self._CALL in last.groups:
+            return "call"
+        if self._RET in last.groups:
+            return "ret"
+        return None
+
+    def _on_block(self, uc, address, size, user):
+        tracer = self._tracer
+        if tracer.resolver.export_at(address) is not None:
+            return  # an API thunk: handled as an API node, not a function
+        fid = f"func:0x{address:x}"
+        graph = tracer.graph
+        prev = self._prev_term
+        if self._cur is None:
+            self._cur = fid
+            graph.touch_node_id(fid, "func", label=tracer.resolver.label(address),
+                                addr=address)
+        elif prev == "call":
+            graph.touch_node_id(fid, "func",
+                                label=tracer.resolver.label(address), addr=address)
+            graph.add_edge(self._cur, fid, EdgeType.CALL)
+            self._stack.append(self._cur)
+            self._cur = fid
+        elif prev == "ret":
+            if self._stack:
+                caller = self._stack.pop()
+                graph.add_edge(self._cur, caller, EdgeType.RET)
+                self._cur = caller
+        self._prev_term = self._terminator(address, size)

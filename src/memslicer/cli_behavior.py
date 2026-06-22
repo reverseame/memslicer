@@ -37,14 +37,19 @@ from memslicer.emu.engine import EmuError, open_slice
 @click.option("--stubs", type=click.Path(exists=True, dir_okay=False),
               default=None, help="Load analyst-edited syscall/API stubs "
               "(merged on top of --stublib if both are given).")
+@click.option("--memory/--no-memory", "memory", default=True,
+              help="Annotate memory writes (RWX, self-modifying code, region "
+              "type). [default: on]")
+@click.option("--call-graph", is_flag=True, default=False,
+              help="Overlay a dynamic call graph (function nodes + call/ret).")
 @click.option("--emit-stubs", type=click.Path(dir_okay=False), default=None,
               help="After the run, write an editable stub skeleton here.")
 @click.option("-o", "--output", type=click.Path(dir_okay=False), default=None,
               help="Write the graph to FILE (.json or .dot by extension).")
 @click.option("-f", "--format", "fmt", type=click.Choice(["json", "dot"]),
               default=None, help="Output format (else inferred from -o).")
-def main(dump, granularity, max_steps, start, backend, stublib, stubs,
-         emit_stubs, output, fmt):
+def main(dump, granularity, max_steps, start, backend, memory, call_graph,
+         stublib, stubs, emit_stubs, output, fmt):
     """Extract the behavior graph of the MSL slice DUMP."""
     if backend == "speakeasy":
         graph = _run_speakeasy(dump, granularity)
@@ -60,7 +65,8 @@ def main(dump, granularity, max_steps, start, backend, stublib, stubs,
     except EmuError as exc:
         raise click.ClickException(str(exc))
 
-    tracer = BehaviorTracer(emu, granularity=granularity, registry=registry)
+    tracer = BehaviorTracer(emu, granularity=granularity, registry=registry,
+                            memory=memory, call_graph=call_graph)
     start_addr = int(start, 0) if start is not None else None
     graph = tracer.run(start=start_addr, max_steps=max_steps)
 

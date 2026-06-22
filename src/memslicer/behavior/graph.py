@@ -95,14 +95,20 @@ class BehaviorGraph:
             "insn": ("box", "white"),
             "syscall": ("ellipse", "khaki"),
             "api": ("ellipse", "lightblue"),
+            "func": ("component", "lightyellow"),
         }
         lines = ["digraph behavior {", "  rankdir=LR;",
                  '  node [fontname="monospace"];']
         for node in self.nodes.values():
             shape, color = styles.get(node["kind"], ("box", "white"))
+            # a block that wrote to executable memory (self-modifying) stands out
+            if node["attrs"].get("writes_exec"):
+                color = "tomato"
             label = _dot_escape(node["label"])
             if node["hits"] > 1:
                 label += f"\\n(x{node['hits']})"
+            if node["attrs"].get("writes_exec"):
+                label += f"\\n[writes exec x{node['attrs']['writes_exec']}]"
             lines.append(
                 f'  "{node["id"]}" [label="{label}", shape={shape}, '
                 f'style=filled, fillcolor={color}];'
