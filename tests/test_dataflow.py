@@ -83,6 +83,51 @@ def test_min_taint_value_default():
     assert MIN_TAINT_VALUE == 0x100
 
 
+def _buf(graph):
+    return {k: v for k, v in graph.edges.items() if v["type"] == "buffer"}
+
+
+def test_shared_buffer_links_two_consumers():
+    # ReadFile fills buf 0x90000; send ships the same buf -- neither returns it
+    g = _graph([
+        _ev("ReadFile", [0x140, 0x90000, 0x10], 0),
+        _ev("send", [0x200, 0x90000, 0x10], 0x10),
+    ])
+    link_dataflow(g)
+    edge = _buf(g)[("api:ReadFile", "api:send", "buffer")]
+    assert edge["value"] == "0x90000" and edge["arg"] == 1
+
+
+def test_buffer_use_is_chained():
+    g = _graph([
+        _ev("A", [0xAAAA], 0),
+        _ev("B", [0xAAAA], 0),
+        _ev("C", [0xAAAA], 0),
+    ])
+    link_dataflow(g)
+    assert ("api:A", "api:B", "buffer") in g.edges
+    assert ("api:B", "api:C", "buffer") in g.edges
+    assert ("api:A", "api:C", "buffer") not in g.edges   # consecutive, not all-pairs
+
+
+def test_buffers_can_be_disabled():
+    g = _graph([_ev("A", [0xAAAA], 0), _ev("B", [0xAAAA], 0)])
+    assert link_dataflow(g, buffers=False) == 0
+
+
+def test_dataflow_and_buffer_coexist():
+    # VirtualAlloc returns P (provenance); ReadFile then send co-use P (buffer)
+    g = _graph([
+        _ev("VirtualAlloc", [], 0x7F0000000000),
+        _ev("ReadFile", [0x140, 0x7F0000000000, 0x10], 0),
+        _ev("send", [0x200, 0x7F0000000000, 0x10], 0x10),
+    ])
+    link_dataflow(g)
+    assert ("api:VirtualAlloc", "api:ReadFile", "dataflow") in g.edges
+    assert ("api:VirtualAlloc", "api:send", "dataflow") in g.edges
+    assert ("api:ReadFile", "api:send", "buffer") in g.edges
+
+
 def _write_linux_code_slice(path, code):
     """A minimal Linux x86-64 slice running *code* from 0x401000."""
     from memslicer.msl.writer import MSLWriter

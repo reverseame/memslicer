@@ -28,6 +28,7 @@ class EdgeType:
     SEQ = "seq"          # temporal ordering between consecutive system events
     INVOKE = "invoke"    # from a code node to the syscall/api node it triggered
     DATAFLOW = "dataflow"  # a value produced by one call is consumed by another
+    BUFFER = "buffer"    # two calls share the same pointer/handle (co-use)
 
 
 @dataclass

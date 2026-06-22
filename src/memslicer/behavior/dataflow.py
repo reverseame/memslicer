@@ -8,11 +8,19 @@ and ``WriteFile`` later consumes, the address ``VirtualAlloc`` returns and
 uses.
 
 So we approximate taint by *value equality*: a call "produces" its return value
-and "consumes" its integer arguments. When a later call consumes a value an
-earlier call produced, we add a ``dataflow`` edge from producer to consumer.
-This is cheap (one linear pass over the ordered event trace), backend-agnostic
-(it reads only ``graph.events``, which both the Unicorn and Speakeasy backends
-fill the same way), and surprisingly informative for malware triage.
+and "consumes" its integer arguments. Two relationships fall out of one linear
+pass over the ordered event trace:
+
+* ``dataflow`` -- a later call consumes a value an earlier call *returned*
+  (provenance: the handle ``CreateFile`` returns, used by ``WriteFile``).
+* ``buffer`` -- two calls pass the *same pointer/handle as an argument*, neither
+  having produced it (co-use: ``ReadFile`` fills ``buf``, ``send`` ships it;
+  ``sprintf`` formats ``buf``, ``CreateProcess`` runs it). Consecutive users of
+  the same value are chained, so the buffer's life shows as a path.
+
+This is cheap, backend-agnostic (it reads only ``graph.events``, which both the
+Unicorn and Speakeasy backends fill the same way), and surprisingly informative
+for malware triage.
 
 Trivial values (0, 1, -1, small integers) are ignored: they collide constantly
 (every other argument is 0) and carry no provenance. Handles, file descriptors,
@@ -44,29 +52,35 @@ def _is_taintable(value) -> bool:
             and value >= MIN_TAINT_VALUE)
 
 
-def link_dataflow(graph: BehaviorGraph, *,
-                  min_value: int = MIN_TAINT_VALUE) -> int:
-    """Add ``dataflow`` edges to *graph* by value-equality taint.
+def link_dataflow(graph: BehaviorGraph, *, min_value: int = MIN_TAINT_VALUE,
+                  buffers: bool = True) -> int:
+    """Add ``dataflow`` (and, when *buffers*, ``buffer``) edges to *graph*.
 
-    Walks ``graph.events`` in order. Each event's return value (if distinctive)
-    is registered as produced by that call's node; each event's integer
-    arguments are matched against everything produced so far, and a match adds a
-    ``producer -> consumer`` dataflow edge annotated with the value and argument
-    index. Returns the number of distinct edges created.
+    Walks ``graph.events`` in order. A distinctive return value is registered as
+    produced by that call's node; a matching argument in a later call adds a
+    ``dataflow`` edge (producer -> consumer). When *buffers* is set, a pointer or
+    handle passed as an argument by two different calls links the earlier user to
+    the later one with a ``buffer`` edge, chaining consecutive users. Edges carry
+    the shared value and the consuming argument index. Returns the number of
+    edges created.
     """
-    produced: dict[int, str] = {}   # value -> producer node id
+    produced: dict[int, str] = {}     # value -> producer node id (returned it)
+    arg_users: dict[int, str] = {}    # value -> last node that used it as an arg
     before = len(graph.edges)
 
     for ev in graph.events:
         nid = f"{ev['kind']}:{ev['name']}"
-        # consume: any argument equal to a previously produced value
         for idx, arg in enumerate(ev.get("args", []) or []):
             if not isinstance(arg, int) or arg < min_value or arg in SENTINELS:
                 continue
             src = produced.get(arg)
             if src is not None and src != nid:
-                _add_dataflow(graph, src, nid, arg, idx)
-        # produce: register this call's return value
+                _add_edge(graph, src, nid, EdgeType.DATAFLOW, arg, idx)
+            if buffers:
+                prev = arg_users.get(arg)
+                if prev is not None and prev != nid:
+                    _add_edge(graph, prev, nid, EdgeType.BUFFER, arg, idx)
+                arg_users[arg] = nid
         ret = ev.get("ret")
         if isinstance(ret, int) and ret not in SENTINELS and ret >= min_value:
             produced[ret] = nid
@@ -74,13 +88,13 @@ def link_dataflow(graph: BehaviorGraph, *,
     return len(graph.edges) - before
 
 
-def _add_dataflow(graph: BehaviorGraph, src: str, dst: str, value: int,
-                  arg_index: int) -> None:
-    key = (src, dst, EdgeType.DATAFLOW)
+def _add_edge(graph: BehaviorGraph, src: str, dst: str, etype: str, value: int,
+              arg_index: int) -> None:
+    key = (src, dst, etype)
     edge = graph.edges.get(key)
     if edge is None:
         graph.edges[key] = {
-            "source": src, "target": dst, "type": EdgeType.DATAFLOW,
+            "source": src, "target": dst, "type": etype,
             "count": 1, "value": hex(value), "arg": arg_index,
         }
     else:

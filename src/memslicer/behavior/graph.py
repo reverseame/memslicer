@@ -118,6 +118,10 @@ class BehaviorGraph:
             if etype == "dataflow":
                 lbl = f'{etype} {edge["value"]}' if edge.get("value") else etype
                 attrs = f'label="{lbl}", color=red, style=bold, constraint=false'
+            elif etype == "buffer":
+                lbl = f'{etype} {edge["value"]}' if edge.get("value") else etype
+                attrs = (f'label="{lbl}", color=orange, style=dashed, '
+                         'constraint=false')
             elif etype == EventKind.SYSCALL or etype == "invoke":
                 attrs = f'label="{etype}", style=dashed'
             else:
@@ -250,7 +254,7 @@ class BehaviorGraph:
                           "library", "crypto", "system", "other")
     FEATURE_NODE_KINDS = ("block", "insn", "syscall", "api", "func")
     FEATURE_EDGE_TYPES = ("fallthrough", "jump", "call", "ret", "seq",
-                          "invoke", "dataflow")
+                          "invoke", "dataflow", "buffer")
 
     def feature_vector(self) -> dict:
         """A flat, fixed-key numeric summary for graph-based ML / triage.
