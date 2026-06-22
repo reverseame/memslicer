@@ -43,6 +43,12 @@ emu = [
 symbex = [
     "angr>=9.2",
 ]
+speakeasy = [
+    # High-fidelity Windows API emulation. The PyPI release pins unicorn 1.x
+    # (incompatible with the emu extra and Python 3.12); the git head supports
+    # unicorn>=2.1 and Python>=3.10.
+    "speakeasy-emulator @ git+https://github.com/mandiant/speakeasy.git",
+]
 
 [tool.pytest.ini_options]
 markers = [

@@ -28,6 +28,10 @@ from memslicer.emu.engine import EmuError, open_slice
 @click.option("-n", "--max-steps", type=int, default=100000,
               help="Maximum instructions to emulate. [default: 100000]")
 @click.option("--start", default=None, help="Override start address (hex/dec).")
+@click.option("--backend", type=click.Choice(["unicorn", "speakeasy"]),
+              default="unicorn",
+              help="Emulation backend. 'speakeasy' gives high-fidelity Windows "
+              "API emulation (needs the speakeasy extra). [default: unicorn]")
 @click.option("--stublib", is_flag=True, default=False,
               help="Start from the bundled, categorized stub library.")
 @click.option("--stubs", type=click.Path(exists=True, dir_okay=False),
@@ -39,9 +43,14 @@ from memslicer.emu.engine import EmuError, open_slice
               help="Write the graph to FILE (.json or .dot by extension).")
 @click.option("-f", "--format", "fmt", type=click.Choice(["json", "dot"]),
               default=None, help="Output format (else inferred from -o).")
-def main(dump, granularity, max_steps, start, stublib, stubs, emit_stubs,
-         output, fmt):
+def main(dump, granularity, max_steps, start, backend, stublib, stubs,
+         emit_stubs, output, fmt):
     """Extract the behavior graph of the MSL slice DUMP."""
+    if backend == "speakeasy":
+        graph = _run_speakeasy(dump, granularity)
+        _write_graph(graph, output, fmt)
+        return
+
     registry = build_default_registry() if stublib else None
     if stubs:
         edited = load_stubs(stubs)
@@ -59,6 +68,22 @@ def main(dump, granularity, max_steps, start, stublib, stubs, emit_stubs,
         emit_skeleton(tracer.registry, emit_stubs)
         click.echo(f"wrote stub skeleton: {emit_stubs}")
 
+    _write_graph(graph, output, fmt)
+
+
+def _run_speakeasy(dump, granularity):
+    """Drive the Speakeasy backend over the slice's main PE image."""
+    from memslicer.behavior.speakeasy_backend import (
+        SpeakeasyUnavailable, trace_slice_speakeasy,
+    )
+    gran = granularity if granularity == "instruction" else None
+    try:
+        return trace_slice_speakeasy(dump, granularity=gran)
+    except SpeakeasyUnavailable as exc:
+        raise click.ClickException(str(exc))
+
+
+def _write_graph(graph, output, fmt):
     if fmt is None and output:
         fmt = "dot" if output.lower().endswith(".dot") else "json"
     text = graph.to_dot() if fmt == "dot" else graph.to_json()
@@ -73,7 +98,7 @@ def main(dump, granularity, max_steps, start, stublib, stubs, emit_stubs,
     m = graph.meta
     click.echo(
         f"arch={m.get('arch')} entry={m.get('entry')} "
-        f"steps={m.get('steps')} nodes={len(graph.nodes)} "
+        f"steps={m.get('steps', m.get('api_calls'))} nodes={len(graph.nodes)} "
         f"edges={len(graph.edges)} syscalls={len(graph.events)} "
         f"stop={m.get('stop_reason')!r}"
     )

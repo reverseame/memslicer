@@ -34,6 +34,10 @@ from memslicer.behavior.stubs import (
     StubRegistry, StubContext, categorize, emit_skeleton, load_stubs,
 )
 from memslicer.behavior.stublib import build_default_registry
+from memslicer.behavior.speakeasy_backend import (
+    SpeakeasyBackend, SpeakeasyUnavailable, speakeasy_available,
+    trace_pe_speakeasy, trace_slice_speakeasy,
+)
 from memslicer.behavior.tracer import BehaviorTracer, trace_slice
 
 __all__ = [
@@ -41,5 +45,7 @@ __all__ = [
     "BehaviorGraph", "AddressResolver",
     "StubRegistry", "StubContext", "categorize", "emit_skeleton", "load_stubs",
     "build_default_registry",
+    "SpeakeasyBackend", "SpeakeasyUnavailable", "speakeasy_available",
+    "trace_pe_speakeasy", "trace_slice_speakeasy",
     "BehaviorTracer", "trace_slice",
 ]
