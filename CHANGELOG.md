@@ -3,6 +3,24 @@
 All notable changes to this project will be documented in this file.
 
 
+## [Unreleased]
+
+### Features
+
+- Capture per-thread CPU register state into Thread Context blocks
+  (0x0011, spec Section 5.7) so a slice can be emulated/stepped by a
+  consumer. Supported on the Frida, GDB and LLDB backends; the
+  `ThreadContexts` capability bit is set when registers are captured.
+  Disable with `--no-registers`. Bumps the MSL format version to 1.1.
+
+### Bug Fixes
+
+- Investigation mode: the `SystemProcessTable` / `SystemNetworkTable` /
+  `SystemHandleTable` capability bits are now written to the on-disk file
+  header. They were previously set on the header object only after it had
+  already been serialized into the BLAKE3 chain, so they never reached disk
+  and consumers under-reported the captured system tables. The tables are now
+  collected before the header is built.
 
 
 ## [0.2.7] - 2026-04-20

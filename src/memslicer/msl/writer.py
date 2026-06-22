@@ -16,7 +16,7 @@ from memslicer.msl.types import (
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
     RelatedDump, KernelSymbolBundle, PhysicalMemoryMap, ConnectivityTable,
     KernelModuleList, ModuleBuildIdManifest, TargetIntrospection,
-    PersistenceManifest,
+    PersistenceManifest, ThreadContext,
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
@@ -382,6 +382,51 @@ class MSLWriter:
         return self._write_block(
             BlockType.ModuleEntry, b"".join(parts), parent_uuid=parent_uuid,
             block_uuid=block_uuid,
+        )
+
+    # ------------------------------------------------------------------
+    # Thread Context (Block 0x0011, spec Section 5.7)
+    # ------------------------------------------------------------------
+
+    def write_thread_context(
+        self, thread: ThreadContext, parent_uuid: bytes | None = None
+    ) -> bytes:
+        """Write a ThreadContext block. Returns block UUID.
+
+        One block per captured thread. Carries the thread's register file
+        so a consumer can reconstruct CPU state for emulation/stepping.
+        """
+        name_raw = thread.name.encode("utf-8") + b"\x00" if thread.name else b""
+        name_encoded = encode_string(thread.name) if thread.name else b""
+
+        payload = struct.pack(
+            "<QQHBBIH6s",
+            thread.thread_id,        # 8B ThreadID
+            thread.start_time_ns,    # 8B StartTime
+            thread.flags,            # 2B Flags (Current/Crashed)
+            int(thread.state),       # 1B ThreadState
+            0,                       # 1B Reserved
+            len(thread.registers),   # 4B RegCount
+            len(name_raw),           # 2B NameLen (incl. null), 0 if absent
+            b"\x00" * 6,             # 6B Reserved2
+        )
+        payload += name_encoded
+
+        for reg in thread.registers:
+            reg_name_raw = reg.name.encode("utf-8") + b"\x00"
+            entry = struct.pack(
+                "<BBHI",
+                len(reg_name_raw),   # 1B NameLen (incl. null)
+                len(reg.value),      # 1B Width (value width in bytes)
+                reg.flags,           # 2B Flags (PC/SP/FP/FLAGS)
+                0,                    # 4B Reserved
+            )
+            entry += encode_string(reg.name)   # Name, UTF-8, pad8
+            entry += pad_bytes(reg.value)      # Value, pad8
+            payload += entry
+
+        return self._write_block(
+            BlockType.ThreadContext, payload, parent_uuid=parent_uuid,
         )
 
     # ------------------------------------------------------------------

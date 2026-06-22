@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
     OSType, ArchType, CompAlgo, PageState, RegionType, BlockType,
-    Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo,
+    Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo, ThreadState,
 )
 
 
@@ -48,6 +48,30 @@ class ModuleEntry:
     version: str = ""
     disk_hash: bytes = field(default_factory=lambda: b'\x00' * HASH_SIZE)
     native_blob: bytes = b""
+
+
+@dataclass
+class ThreadRegister:
+    """A single CPU register within a :class:`ThreadContext`.
+
+    Spec Section 5.7, Table 19b. ``Width`` on disk equals ``len(value)``;
+    integer registers store little-endian bytes, vector registers store
+    native byte order.
+    """
+    name: str = ""               # lowercase canonical mnemonic, e.g. "rip"
+    value: bytes = b""           # raw value bytes (width = len(value))
+    flags: int = 0               # REG_FLAG_PC / REG_FLAG_SP / REG_FLAG_FP / REG_FLAG_FLAGS
+
+
+@dataclass
+class ThreadContext:
+    """Execution state of a single thread (Block 0x0011, spec Section 5.7)."""
+    thread_id: int = 0
+    start_time_ns: int = 0
+    flags: int = 0               # THREAD_FLAG_CURRENT / THREAD_FLAG_CRASHED
+    state: ThreadState = ThreadState.Unknown
+    name: str = ""
+    registers: list[ThreadRegister] = field(default_factory=list)
 
 
 @dataclass

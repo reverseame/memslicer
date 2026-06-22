@@ -17,6 +17,10 @@ from memslicer.acquirer.bridge import (
     MemoryRange,
     ModuleInfo,
     PlatformInfo,
+    RegisterValue,
+    ThreadInfo,
+    register_role,
+    register_width_bytes,
 )
 from memslicer.acquirer.platform_detect import (
     parse_gdb_architecture,
@@ -306,6 +310,83 @@ class GDBBridge:
             name = os.path.basename(path)
             modules.append(ModuleInfo(name, path, base, end - base))
         return modules
+
+    # GDB thread state strings -> MSL ThreadState codes (spec Table 19a).
+    _STATE_MAP = {"running": 1, "stopped": 3}
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Enumerate threads with register state via GDB/MI.
+
+        Uses ``-data-list-register-names`` to resolve register numbers to
+        names and ``-data-list-register-values`` per thread. The OS thread
+        id (LWP) is extracted from each thread's ``target-id``; GDB's own
+        thread numbers are used to address the register queries.
+        """
+        try:
+            names_out = self._send_mi_command("-data-list-register-names")
+        except (RuntimeError, TimeoutError):
+            return []
+        names_match = re.search(r"register-names=\[(.*?)\]", names_out)
+        if names_match is None:
+            return []
+        reg_names = re.findall(r'"([^"]*)"', names_match.group(1))
+        if not reg_names:
+            return []
+
+        try:
+            ids_out = self._send_mi_command("-thread-list-ids")
+            info_out = self._send_mi_command("-thread-info")
+        except (RuntimeError, TimeoutError):
+            return []
+
+        gids = [int(x) for x in re.findall(r'thread-id="(\d+)"', ids_out)]
+        cur = re.search(r'current-thread-id="(\d+)"', ids_out)
+        current_gid = int(cur.group(1)) if cur else (gids[0] if gids else None)
+
+        # Map GDB thread number -> (OS TID, state) via target-id / state.
+        tid_map: dict[int, int] = {}
+        state_map: dict[int, str] = {}
+        for gid_s, target in re.findall(r'id="(\d+)",target-id="([^"]*)"', info_out):
+            lwp = re.search(r"LWP\s+(\d+)", target)
+            tid_map[int(gid_s)] = int(lwp.group(1)) if lwp else int(gid_s)
+        for gid_s, st in re.findall(r'id="(\d+)"[^{]*?state="([^"]*)"', info_out):
+            state_map[int(gid_s)] = st
+
+        width = register_width_bytes(self.get_platform_info().arch)
+
+        threads: list[ThreadInfo] = []
+        for gid in gids:
+            try:
+                vals_out = self._send_mi_command(
+                    f"-data-list-register-values --thread {gid} --frame 0 x"
+                )
+            except (RuntimeError, TimeoutError):
+                continue
+            regs: list[RegisterValue] = []
+            for num_s, val_s in re.findall(
+                r'\{number="(\d+)",value="([^"]*)"\}', vals_out
+            ):
+                idx = int(num_s)
+                if idx >= len(reg_names):
+                    continue
+                name = reg_names[idx]
+                if not name:
+                    continue
+                try:
+                    ival = int(val_s, 16) if val_s.startswith("0x") else int(val_s)
+                except ValueError:
+                    continue
+                regs.append(RegisterValue(
+                    name=name.lower(), value=ival, size=width,
+                    role=register_role(name),
+                ))
+            threads.append(ThreadInfo(
+                tid=tid_map.get(gid, gid),
+                registers=regs,
+                is_current=(gid == current_gid),
+                state=self._STATE_MAP.get(state_map.get(gid, ""), 0),
+            ))
+        return threads
 
     def read_memory(self, address: int, size: int) -> bytes | None:
         """Read *size* bytes at *address* via ``-data-read-memory-bytes``."""
