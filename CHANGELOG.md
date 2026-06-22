@@ -43,6 +43,27 @@ All notable changes to this project will be documented in this file.
   hand-off: it builds an angr `Project`/`SimState` from a *live* emulator's
   current registers and memory, so you can emulate concretely up to a point of
   interest and then continue symbolically with angr's SimOS modelling the OS.
+- `memslicer-behavior` analysis suite on top of the behavior graph:
+  - A bundled, categorized stub library (`--stublib`) covering common
+    file/network/registry/process/memory/library/crypto/system APIs, with
+    argument decoders, so emulation advances without hand-writing stubs; every
+    syscall/API node is tagged with a behavior category. Analyst stubs merge on
+    top with `--stubs`.
+  - A Speakeasy backend (`--backend speakeasy`) for high-fidelity Windows API
+    emulation (hundreds of real handlers, PEB/TEB, object manager, fake
+    fs/registry/network), projected onto the same behavior graph; analyst/stub
+    library stubs can override individual Speakeasy handlers. Behind the
+    optional `speakeasy` extra (`pip install memslicer[speakeasy]`, installed
+    from git head — the PyPI release pins an incompatible unicorn).
+  - Inter-call data-flow edges by value-equality taint: `dataflow` edges when a
+    call's return value is later passed as an argument (handle/pointer/fd
+    provenance) and `buffer` edges when two calls share the same pointer/handle.
+  - Memory-write annotations (writes into executable memory / self-modifying
+    code, write-target region-type buckets, statically-RWX regions) and an
+    optional dynamic call graph (`--call-graph`).
+  - Graph export to GraphML and GEXF (dependency-free) and to a `networkx`
+    `MultiDiGraph` (optional `graph` extra), plus a fixed-key per-graph feature
+    vector (`--features`) for ML/triage pipelines.
 
 ### Bug Fixes
 
