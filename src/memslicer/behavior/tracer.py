@@ -13,6 +13,7 @@ SimOS hand-off.
 """
 from __future__ import annotations
 
+from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.graph import BehaviorGraph
 from memslicer.behavior.probes import ControlFlowProbe, SyscallProbe
@@ -161,6 +162,7 @@ class BehaviorTracer:
             break
         self.graph.meta["steps"] = self._steps
         self.graph.meta["last_pc"] = f"0x{self.emu.pc:x}"
+        self.graph.meta["dataflow_edges"] = link_dataflow(self.graph)
         return self.graph
 
 

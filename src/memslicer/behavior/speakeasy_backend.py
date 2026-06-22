@@ -25,6 +25,7 @@ it with the ``speakeasy`` extra. Every public entry point raises a clear
 """
 from __future__ import annotations
 
+from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EdgeType, EventKind
 from memslicer.behavior.graph import BehaviorGraph
 from memslicer.behavior.stubs import categorize
@@ -199,6 +200,7 @@ class SpeakeasyBackend:
                 "api_calls": self._api_calls,
             })
             self.graph.meta.setdefault("stop_reason", "run complete")
+            self.graph.meta["dataflow_edges"] = link_dataflow(self.graph)
         return self.graph
 
 

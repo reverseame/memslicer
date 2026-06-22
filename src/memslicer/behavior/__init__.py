@@ -27,6 +27,7 @@ no OS). Three interchangeable *handler strategies* model them:
 * **angr SimOS** (future): hand the state to angr, whose SimOS/SimProcedures
   model real OS/libc semantics.
 """
+from memslicer.behavior.dataflow import link_dataflow
 from memslicer.behavior.events import BehaviorEvent, EventKind, EdgeType
 from memslicer.behavior.graph import BehaviorGraph
 from memslicer.behavior.resolver import AddressResolver
@@ -42,7 +43,7 @@ from memslicer.behavior.tracer import BehaviorTracer, trace_slice
 
 __all__ = [
     "BehaviorEvent", "EventKind", "EdgeType",
-    "BehaviorGraph", "AddressResolver",
+    "BehaviorGraph", "AddressResolver", "link_dataflow",
     "StubRegistry", "StubContext", "categorize", "emit_skeleton", "load_stubs",
     "build_default_registry",
     "SpeakeasyBackend", "SpeakeasyUnavailable", "speakeasy_available",

@@ -108,9 +108,14 @@ class BehaviorGraph:
                 f'style=filled, fillcolor={color}];'
             )
         for edge in self.edges.values():
-            attrs = f'label="{edge["type"]}"'
-            if edge["type"] == EventKind.SYSCALL or edge["type"] == "invoke":
-                attrs += ", style=dashed"
+            etype = edge["type"]
+            if etype == "dataflow":
+                lbl = f'{etype} {edge["value"]}' if edge.get("value") else etype
+                attrs = f'label="{lbl}", color=red, style=bold, constraint=false'
+            elif etype == EventKind.SYSCALL or etype == "invoke":
+                attrs = f'label="{etype}", style=dashed'
+            else:
+                attrs = f'label="{etype}"'
             lines.append(
                 f'  "{edge["source"]}" -> "{edge["target"]}" [{attrs}];'
             )
