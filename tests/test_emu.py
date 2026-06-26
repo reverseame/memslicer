@@ -175,6 +175,118 @@ def test_emulator_step_back_registers(tmp_path):
     assert not emu.step_back()                        # no more history
 
 
+SECOND_VA = CODE_VA + 7   # 'mov rbx, 2' (second instruction)
+
+
+def _write_multithread_slice(path):
+    """A slice with two captured threads: tid 100 (Current) parked at CODE_VA
+    with rax=0xaaaa, and tid 200 parked at the second instruction with
+    rax=0xbbbb."""
+    page = CODE + b"\x90" * (PS - len(CODE))
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
+           | (1 << CapBit.ThreadContexts))
+    hdr = FileHeader(os_type=OSType.Linux, arch_type=ArchType.x86_64,
+                     pid=100, cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="/bin/demo"))
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[page]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
+        w.write_thread_context(ThreadContext(
+            thread_id=100, flags=THREAD_FLAG_CURRENT,
+            state=ThreadState.Running, name="main", registers=[
+                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rax", (0xaaaa).to_bytes(8, "little"), 0),
+            ]))
+        w.write_thread_context(ThreadContext(
+            thread_id=200, flags=0,
+            state=ThreadState.Stopped, name="worker", registers=[
+                ThreadRegister("rip", SECOND_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", (STACK_VA + 0xe00).to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rax", (0xbbbb).to_bytes(8, "little"), 0),
+            ]))
+        w.finalize()
+
+
+def test_loader_select_thread(tmp_path):
+    p = tmp_path / "mt.msl"
+    _write_multithread_slice(p)
+    img = load_slice(str(p))
+    assert [t.tid for t in img.threads] == [100, 200]
+    assert img.current_thread.tid == 100          # flagged Current
+    assert img.select_thread(None).tid == 100     # default -> Current
+    assert img.select_thread(200).tid == 200      # by tid
+    assert img.thread_by_tid(200).pc == SECOND_VA
+    assert img.thread_by_tid(999) is None
+    with pytest.raises(KeyError):
+        img.select_thread(999)
+
+
+def test_emulator_seeds_selected_thread(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator, EmuError
+
+    p = tmp_path / "mt.msl"
+    _write_multithread_slice(p)
+    img = load_slice(str(p))
+
+    # Default: Current thread (tid 100).
+    emu = MSLEmulator(img)
+    assert emu.thread.tid == 100
+    assert emu.pc == CODE_VA and emu.read_reg("rax") == 0xaaaa
+
+    # Pick the non-Current thread by tid.
+    emu2 = MSLEmulator(img, thread=200)
+    assert emu2.thread.tid == 200
+    assert emu2.pc == SECOND_VA and emu2.read_reg("rax") == 0xbbbb
+
+    # Unknown tid is a clean error.
+    with pytest.raises(EmuError):
+        MSLEmulator(img, thread=999)
+
+
+def test_emulator_switch_thread(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "mt.msl"
+    _write_multithread_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))         # starts on tid 100
+    emu.step()                                    # mov rax, 1
+    assert emu.read_reg("rax") == 1
+
+    t = emu.switch_thread(200)                    # re-seed from the worker thread
+    assert t.tid == 200
+    assert emu.thread.tid == 200
+    assert emu.pc == SECOND_VA                     # reset to its captured PC
+    assert emu.read_reg("rax") == 0xbbbb           # reset to its captured regs
+    assert not emu.can_step_back()                 # history dropped on switch
+
+    emu.step()                                     # mov rbx, 2
+    assert emu.read_reg("rbx") == 2
+
+
+def test_cli_list_threads(tmp_path):
+    from click.testing import CliRunner
+    from memslicer.cli_emu import main
+
+    p = tmp_path / "mt.msl"
+    _write_multithread_slice(p)
+    res = CliRunner().invoke(main, [str(p), "--list-threads"])
+    assert res.exit_code == 0
+    assert "tid=100" in res.output and "tid=200" in res.output
+    assert "*" in res.output                       # Current thread marked
+
+
 def test_emulator_step_back_memory(tmp_path):
     pytest.importorskip("unicorn")
     pytest.importorskip("capstone")

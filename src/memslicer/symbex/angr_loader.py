@@ -38,13 +38,15 @@ def _contiguous(region) -> bytes:
     return bytes(buf)
 
 
-def load_angr(path: str, image: SliceImage | None = None):
+def load_angr(path: str, image: SliceImage | None = None, thread=None):
     """Return ``(project, state)`` for the slice at *path*.
 
     The project is backed by the region holding the captured program counter;
-    every captured page is mapped into the state's memory and the Current
-    thread's registers are seeded, so the state sits exactly where the slice
-    was taken — ready for ``project.factory.simgr(state)``.
+    every captured page is mapped into the state's memory and a thread's
+    registers are seeded, so the state sits exactly where the slice was taken —
+    ready for ``project.factory.simgr(state)``. *thread* selects which captured
+    thread to seed from (its tid or an :class:`EmuThread`); the default is the
+    Current thread.
     """
     try:
         import angr
@@ -60,7 +62,11 @@ def load_angr(path: str, image: SliceImage | None = None):
     if not image.regions:
         raise SymbexError("slice has no memory regions")
 
-    entry = image.entry
+    try:
+        sel = image.select_thread(thread)
+    except KeyError as exc:
+        raise SymbexError(str(exc)) from exc
+    entry = sel.pc if sel is not None and sel.pc is not None else image.entry
     code = _region_at(image, entry) if entry is not None else None
     if code is None:
         code = image.regions[0]
@@ -82,9 +88,8 @@ def load_angr(path: str, image: SliceImage | None = None):
             state.memory.store(paddr, data, disable_actions=True, inspect=False)
 
     # Seed the captured registers by name (skip names angr doesn't know).
-    thread = image.current_thread
-    if thread is not None:
-        for reg in thread.registers:
+    if sel is not None:
+        for reg in sel.registers:
             try:
                 setattr(state.regs, reg.name, reg.value)
             except Exception:  # noqa: BLE001 - unknown/aliased register name

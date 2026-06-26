@@ -310,11 +310,25 @@ It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
 CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
 instructions, reverting both registers and memory.
 
+A slice can capture **more than one thread** (one Thread Context block each).
+By default the emulator seeds from the Current thread, but any captured thread
+can be selected:
+
+```bash
+memslicer-emu dump.msl --list-threads   # list captured threads (Current = '*')
+memslicer-emu dump.msl --thread 200 -s 5 -r   # emulate thread tid=200 instead
+```
+
+```python
+emu = open_slice("dump.msl", thread=200)   # seed from tid 200
+emu.switch_thread(100)                      # re-seed from another thread later
+```
+
 ### Symbolic execution (angr)
 
 Load a slice into [angr](https://angr.io) for symbolic execution from the exact
-captured point — the memory and the Current thread's registers become an angr
-`SimState`:
+captured point — the memory and a thread's registers become an angr `SimState`
+(the Current thread by default; `load_angr(..., thread=tid)` selects another):
 
 ```bash
 pip install memslicer[symbex]

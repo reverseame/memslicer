@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from memslicer.msl.constants import ArchType
-from memslicer.emu.loader import SliceImage, load_slice
+from memslicer.emu.loader import EmuThread, SliceImage, load_slice
 
 _UC_PAGE = 0x1000
 
@@ -73,7 +73,14 @@ def _coalesce(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 class MSLEmulator:
     """Emulate an :class:`SliceImage` with Unicorn."""
 
-    def __init__(self, image: SliceImage):
+    def __init__(self, image: SliceImage, thread: "int | EmuThread | None" = None):
+        """Build an emulator for *image*.
+
+        *thread* selects which captured thread to seed the CPU from: ``None``
+        uses the Current thread (the default), otherwise pass a captured thread
+        id or an :class:`EmuThread`. Use :meth:`switch_thread` to re-seed from
+        another thread later.
+        """
         try:
             import unicorn  # noqa: F401
             import capstone  # noqa: F401
@@ -83,6 +90,7 @@ class MSLEmulator:
             ) from exc
 
         self.image = image
+        self.thread = self._resolve_thread(thread)
         table = _arch_table()
         if image.arch not in table:
             raise EmuError(f"unsupported architecture for emulation: {image.arch.name}")
@@ -137,8 +145,14 @@ class MSLEmulator:
         mod = getattr(self._U, self._const_mod)
         return getattr(mod, self._reg_prefix + name.upper(), None)
 
+    def _resolve_thread(self, spec) -> "EmuThread | None":
+        try:
+            return self.image.select_thread(spec)
+        except KeyError as exc:
+            raise EmuError(str(exc)) from exc
+
     def _seed_registers(self) -> None:
-        thread = self.image.current_thread
+        thread = self.thread
         if thread is None:
             return
         for reg in thread.registers:
@@ -147,6 +161,24 @@ class MSLEmulator:
             const = self._reg_const(reg.name)
             if const is not None:
                 self.uc.reg_write(const, reg.value)
+
+    def switch_thread(self, thread: "int | EmuThread | None") -> "EmuThread | None":
+        """Re-seed the CPU from another captured thread (by tid or EmuThread).
+
+        Registers are reset to that thread's captured Thread Context and the PC
+        to its captured PC; residual register state from the previous thread is
+        cleared first. Mapped memory is shared, so any writes made so far
+        persist. The reverse-execution history is dropped (it belonged to the
+        previous thread). Returns the newly selected thread.
+        """
+        self.thread = self._resolve_thread(thread)
+        for name in self._gpr_names:        # clear residual state from prior thread
+            const = self._reg_const(name)
+            if const is not None:
+                self.uc.reg_write(const, 0)
+        self._seed_registers()
+        self._history = []
+        return self.thread
 
     # -- registers / memory --------------------------------------------------
 
@@ -234,6 +266,10 @@ class MSLEmulator:
                 return
 
 
-def open_slice(path: str) -> MSLEmulator:
-    """Convenience: load *path* and build a ready-to-step emulator."""
-    return MSLEmulator(load_slice(path))
+def open_slice(path: str, thread: "int | EmuThread | None" = None) -> MSLEmulator:
+    """Convenience: load *path* and build a ready-to-step emulator.
+
+    *thread* selects the captured thread to seed from (default: the Current
+    thread); see :class:`MSLEmulator`.
+    """
+    return MSLEmulator(load_slice(path), thread=thread)
