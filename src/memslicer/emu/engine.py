@@ -59,6 +59,23 @@ def _arch_table():
     }
 
 
+def _gdt_descriptor(base: int, limit: int, access: int, gran: int) -> bytes:
+    """Pack an 8-byte legacy GDT segment descriptor.
+
+    *access* is the access byte (e.g. ``0xf2`` = present, ring-3, data RW) and
+    *gran* the 4-bit granularity/flags nibble (e.g. ``0xc`` = page-granular,
+    32-bit). Used to give 32-bit ``fs``/``gs`` a base Unicorn won't accept via
+    ``UC_X86_REG_*_BASE``.
+    """
+    desc = limit & 0xffff
+    desc |= (base & 0xffffff) << 16
+    desc |= (access & 0xff) << 40
+    desc |= ((limit >> 16) & 0xf) << 48
+    desc |= (gran & 0xf) << 52
+    desc |= ((base >> 24) & 0xff) << 56
+    return desc.to_bytes(8, "little")
+
+
 def _coalesce(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge [start, end) spans (already page-aligned) that touch or overlap."""
     out: list[tuple[int, int]] = []
@@ -105,6 +122,8 @@ class MSLEmulator:
         self.cs = capstone.Cs(cs_arch, cs_mode)
         self._until = (1 << self.bits) - 1
 
+        self._mapped: list[tuple[int, int]] = []  # coalesced mapped spans
+        self._seg_bases: dict[str, int] = {}       # x86 fs/gs base (GDT-seeded)
         self._map_memory()
         self._seed_registers()
 
@@ -143,11 +162,25 @@ class MSLEmulator:
             lo = r.base & ~(_UC_PAGE - 1)
             hi = (r.base + r.size + _UC_PAGE - 1) & ~(_UC_PAGE - 1)
             spans.append((lo, hi))
-        for lo, hi in _coalesce(spans):
+        self._mapped = _coalesce(spans)
+        for lo, hi in self._mapped:
             self.uc.mem_map(lo, hi - lo)
         for r in self.image.regions:
             for paddr, data in r.pages.items():
                 self.uc.mem_write(paddr, data)
+
+    def _find_free_page(self, size: int) -> int:
+        """Return a page-aligned address with *size* bytes free of mapped spans."""
+        size = (size + _UC_PAGE - 1) & ~(_UC_PAGE - 1)
+        limit = 1 << self.bits
+        candidates = [(hi + _UC_PAGE - 1) & ~(_UC_PAGE - 1) for _, hi in self._mapped]
+        candidates.append(_UC_PAGE)
+        for c in sorted(candidates):
+            if c + size > limit:
+                continue
+            if not any(c < hi and c + size > lo for lo, hi in self._mapped):
+                return c
+        raise EmuError("no free address space for synthetic GDT")
 
     def _reg_const(self, name: str):
         mod = getattr(self._U, self._const_mod)
@@ -162,8 +195,14 @@ class MSLEmulator:
     def _seed_registers(self) -> None:
         thread = self.thread
         if thread is None:
+            self._seg_bases = {}
             return
+        is_x86 = self.image.arch == ArchType.x86
         for reg in thread.registers:
+            # In 32-bit mode Unicorn ignores UC_X86_REG_FS_BASE/GS_BASE (no-op);
+            # those bases are installed via a synthetic GDT in _seed_x86_segments.
+            if is_x86 and reg.name.lower().endswith("_base"):
+                continue
             const = self._reg_const(reg.name)
             if const is None:
                 continue
@@ -173,6 +212,43 @@ class MSLEmulator:
                 self.uc.reg_write(const, reg.value)
             except (self._U.UcError, OverflowError, TypeError):
                 continue  # a register width this engine build can't accept
+        if is_x86:
+            self._seed_x86_segments()
+
+    def _seed_x86_segments(self) -> None:
+        """Install a synthetic GDT so 32-bit ``fs:``/``gs:`` accesses resolve.
+
+        In 32-bit mode the segment base lives in a descriptor, not a register
+        Unicorn will honor. For each captured ``fs_base``/``gs_base`` we add a
+        flat ring-3 data descriptor and load the matching selector, so TEB/PEB-
+        and TLS-relative reads (e.g. the CRT SEH prologue's ``mov eax, fs:[0]``)
+        work during emulation. No-op when the slice carried no segment base.
+        """
+        bases: dict[str, int] = {}
+        for reg in (self.thread.registers if self.thread else []):
+            n = reg.name.lower()
+            if n in ("fs_base", "gs_base") and reg.value:
+                bases[n[:2]] = reg.value
+        self._seg_bases = bases
+        if not bases:
+            return
+        order = [s for s in ("fs", "gs") if s in bases]
+        descriptors = [b"\x00" * 8]                     # mandatory null descriptor
+        selectors: dict[str, int] = {}
+        for idx, seg in enumerate(order, start=1):
+            descriptors.append(
+                _gdt_descriptor(bases[seg], 0xfffff, access=0xf2, gran=0xc)
+            )
+            selectors[seg] = (idx << 3) | 3             # GDT index, TI=0, RPL=3
+        gdt = b"".join(descriptors)
+        gdt_base = self._find_free_page(len(gdt))
+        self.uc.mem_map(gdt_base, _UC_PAGE)
+        self.uc.mem_write(gdt_base, gdt)
+        self._mapped = _coalesce(self._mapped + [(gdt_base, gdt_base + _UC_PAGE)])
+        xc = getattr(self._U, self._const_mod)
+        self.uc.reg_write(xc.UC_X86_REG_GDTR, (0, gdt_base, len(gdt) - 1, 0))
+        for seg, sel in selectors.items():
+            self.uc.reg_write(self._reg_const(seg), sel)
 
     def switch_thread(self, thread: "int | EmuThread | None") -> "EmuThread | None":
         """Re-seed the CPU from another captured thread (by tid or EmuThread).
@@ -226,9 +302,13 @@ class MSLEmulator:
         return bytes(self.uc.mem_read(addr, size))
 
     def segment_base(self, seg: str) -> int | None:
-        """Return the captured ``fs_base`` / ``gs_base`` (x86), or None if the
-        slice didn't capture it. These anchor TEB/PEB and TLS access."""
-        const = self._reg_const(f"{seg.lower()}_base")
+        """Return the captured ``fs_base`` / ``gs_base``, or None if the slice
+        didn't capture it. These anchor TEB/PEB and TLS access."""
+        seg = seg.lower()
+        if self.image.arch == ArchType.x86:
+            # 32-bit base lives in the synthetic GDT, not a readable MSR.
+            return self._seg_bases.get(seg)
+        const = self._reg_const(f"{seg}_base")
         if const is None:
             return None
         return self.uc.reg_read(const)

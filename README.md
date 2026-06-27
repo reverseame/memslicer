@@ -366,6 +366,12 @@ emu.segment_base("gs")      # captured GS base (TEB on Windows x64)
 emu.peb_address()           # follow gs:[0x60] / fs:[0x30] to the Windows PEB
 ```
 
+On Windows the Frida backend recovers each thread's TEB (via
+`NtQueryInformationThread`) and records it as `gs_base` (x64) / `fs_base` (x86),
+since the CPU context alone carries no segment base. On x86 the emulator installs
+a synthetic GDT for the captured base (32-bit `FS`/`GS` can't be set as a
+register), so SEH prologues that read `fs:[0]` emulate correctly.
+
 ### Symbolic execution (angr)
 
 Load a slice into [angr](https://angr.io) for symbolic execution from the exact

@@ -462,3 +462,74 @@ def test_emulator_peb_address(tmp_path):
     assert emu.peb_address() == peb                    # resolved gs:[0x60]
 
 
+# ---- x86 (32-bit) segment base via synthetic GDT ----
+
+def _write_x86_slice(path, code, regs, *, extra_regions=()):
+    """Write a minimal 32-bit Windows slice: code + stack + thread context,
+    plus any *extra_regions* as (base, page_bytes) pairs (e.g. a TEB page)."""
+    page = code + b"\x90" * (PS - len(code))
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
+           | (1 << CapBit.ThreadContexts))
+    hdr = FileHeader(os_type=OSType.Windows, arch_type=ArchType.x86,
+                     pid=1, cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="C:\\a.exe"))
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[page]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
+        for base, data in extra_regions:
+            w.write_memory_region(MemoryRegion(
+                base_addr=base, region_size=PS, protection=0b011,
+                region_type=RegionType.Stack, page_size=PS,
+                page_states=[PageState.CAPTURED], page_data_chunks=[data]))
+        w.write_thread_context(ThreadContext(
+            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=regs))
+        w.finalize()
+
+
+def test_emulator_seeds_x86_fs_base_via_gdt(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    TEB = 0x60000000
+    peb = 0x001a0000
+    teb = bytearray(b"\x00" * PS)
+    teb[0x30:0x34] = peb.to_bytes(4, "little")          # PEB pointer at fs:[0x30]
+    code = bytes.fromhex("64a130000000")                # mov eax, fs:[0x30]
+    p = tmp_path / "x86fs.msl"
+    _write_x86_slice(p, code, [
+        ThreadRegister("eip", CODE_VA.to_bytes(4, "little"), REG_FLAG_PC),
+        ThreadRegister("esp", (STACK_VA + 0xf00).to_bytes(4, "little"), REG_FLAG_SP),
+        ThreadRegister("fs_base", TEB.to_bytes(4, "little"), 0),
+    ], extra_regions=[(TEB, bytes(teb))])
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.segment_base("fs") == TEB               # GDT-seeded base
+    assert emu.peb_address() == peb                    # fs:[0x30] resolved
+    emu.step()                                         # mov eax, fs:[0x30]
+    assert emu.read_reg("eax") == peb                  # segment-relative read worked
+
+
+def test_emulator_x86_without_fs_base_still_runs(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "x86plain.msl"
+    _write_x86_slice(p, b"\x90", [                      # nop
+        ThreadRegister("eip", CODE_VA.to_bytes(4, "little"), REG_FLAG_PC),
+        ThreadRegister("esp", (STACK_VA + 0xf00).to_bytes(4, "little"), REG_FLAG_SP),
+    ])
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.segment_base("fs") is None              # no GDT installed
+    assert emu.peb_address() is None
+    assert emu.step().ok                               # no regression
+
+

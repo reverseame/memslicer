@@ -185,6 +185,37 @@ class TestFridaBridgeEnumerateModules:
         assert modules[1].size == 0x1000
 
 
+class TestFridaBridgeEnumerateThreads:
+    """Tests for FridaBridge.enumerate_threads()."""
+
+    def test_enumerate_threads_surfaces_segment_base(self):
+        """A segment base injected by the JS agent (gs_base/fs_base, from the
+        Windows TEB) flows through to a RegisterValue with the arch width."""
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+
+        api.enumerate_threads.return_value = [
+            {
+                "id": 7,
+                "state": "stopped",
+                "context": {
+                    "rip": "0x401000",
+                    "rsp": "0x7fff0000",
+                    "gs_base": "0x7ff7fffdb000",
+                },
+            },
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        regs = {r.name: r for r in threads[0].registers}
+        assert "gs_base" in regs
+        assert regs["gs_base"].value == 0x7ff7fffdb000
+        assert regs["gs_base"].size == 8          # x64 GPR width
+        assert regs["gs_base"].role == ""         # not pc/sp/fp/flags
+
+
 class TestFridaBridgeReadMemory:
     """Tests for FridaBridge.read_memory()."""
 
