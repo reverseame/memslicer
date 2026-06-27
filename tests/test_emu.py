@@ -311,3 +311,60 @@ def test_emulator_step_back_memory(tmp_path):
     assert emu.read_mem(rsp, 8) == before             # memory reverted
     assert emu.step_back()                            # undo mov rax
     assert emu.read_reg("rax") != 0x4142
+
+
+# ---- self-modifying code / unpacking (requires the emu extra) ----
+
+def test_emulator_detects_self_modifying_code(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    target = CODE_VA + 0x20
+    # movabs rbx, target ; mov byte [rbx], 0x90 ; jmp rbx ; (executes the NOP
+    # written at +0x20 -> write-then-execute)
+    code = bytes.fromhex("48bb" + target.to_bytes(8, "little").hex()
+                         + "c60390" + "ffe3")
+    p = tmp_path / "smc.msl"
+    _write_code(p, code, [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
+    ])
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.self_modified_exec() == []              # nothing executed yet
+    for _ in range(4):                                 # movabs ; mov ; jmp ; nop
+        emu.step()
+
+    assert emu.self_modified_exec() == [target]        # W->X at the written byte
+    assert any(lo <= target < hi for lo, hi in emu.written_ranges())
+
+    dumped = emu.dump_written(str(tmp_path / "out"))
+    assert dumped
+    assert any(executed for _path, _lo, _hi, executed in dumped)
+    # the dumped range covering the written byte exists on disk
+    hit = next(d for d in dumped if d[1] <= target < d[2])
+    import os
+    assert os.path.getsize(hit[0]) == hit[2] - hit[1]
+
+
+def test_cli_dump_written(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from click.testing import CliRunner
+    from memslicer.cli_emu import main
+
+    target = CODE_VA + 0x20
+    code = bytes.fromhex("48bb" + target.to_bytes(8, "little").hex()
+                         + "c60390" + "ffe3")
+    p = tmp_path / "smc.msl"
+    _write_code(p, code, [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
+    ])
+    outdir = tmp_path / "written"
+    res = CliRunner().invoke(
+        main, [str(p), "-s", "4", "--dump-written", str(outdir)])
+    assert res.exit_code == 0, res.output
+    assert "self-modifying code" in res.output
+    assert "(executed)" in res.output
+    assert list(outdir.glob("*.bin"))

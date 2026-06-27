@@ -310,6 +310,25 @@ It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
 CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
 instructions, reverting both registers and memory.
 
+**Self-modifying code / unpacking.** The emulator tracks every byte the code
+writes and flags when execution enters previously-written memory — the moment a
+packer jumps into its decoded payload. Recover that payload to disk:
+
+```bash
+memslicer-emu packed.msl -u 0x401000 --dump-written ./unpacked
+#   [self-modifying code: 1 write-then-execute site(s)]
+#     W->X @ 0x000000401020
+#   [wrote 1 dirtied range(s) to ./unpacked]
+#     0x000000401020-0x000000402000  0xfe0 bytes (executed)  -> ./unpacked/written_0x401020_0x402000.bin
+```
+
+```python
+emu.step_until(0x401000)
+emu.self_modified_exec()    # [0x401020] — addresses run from written memory
+emu.written_ranges()        # coalesced dirtied byte ranges
+emu.dump_written("out/")    # write each range out (executed ones = the payload)
+```
+
 A slice can capture **more than one thread** (one Thread Context block each).
 By default the emulator seeds from the Current thread, but any captured thread
 can be selected:

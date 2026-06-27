@@ -80,8 +80,12 @@ def _trace(emu: MSLEmulator, results) -> None:
               help="List captured threads and exit")
 @click.option("-r", "--registers", "show_regs", is_flag=True,
               help="Dump registers after stepping")
+@click.option("--dump-written", "dump_written_dir", default=None,
+              type=click.Path(file_okay=False),
+              help="After stepping, write dirtied memory ranges to this dir "
+                   "(recovers unpacked/decoded payloads)")
 def main(dump, steps, until_addr, pc_override, show_regs, max_steps, back,
-         thread_id, list_threads):
+         thread_id, list_threads, dump_written_dir):
     """Emulate the MSL slice DUMP."""
     image = load_slice(dump)
     _print_summary(image)
@@ -130,6 +134,26 @@ def main(dump, steps, until_addr, pc_override, show_regs, max_steps, back,
             )
             click.echo(f"  <- {emu.pc:#012x}" + (f"    [{changed}]" if changed else ""))
             prev = now
+
+    wx = emu.self_modified_exec()
+    if wx:
+        click.echo("")
+        click.echo(f"[self-modifying code: {len(wx)} write-then-execute site(s)]")
+        for addr in wx[:8]:
+            click.echo(f"  W->X @ {addr:#012x}")
+        if len(wx) > 8:
+            click.echo(f"  ... and {len(wx) - 8} more")
+
+    if dump_written_dir is not None:
+        dumped = emu.dump_written(dump_written_dir)
+        click.echo("")
+        if not dumped:
+            click.echo("[no memory was written during emulation]")
+        else:
+            click.echo(f"[wrote {len(dumped)} dirtied range(s) to {dump_written_dir}]")
+            for path, lo, hi, executed in dumped:
+                tag = " (executed)" if executed else ""
+                click.echo(f"  {lo:#012x}-{hi:#012x}  {hi - lo:#x} bytes{tag}  -> {path}")
 
     if show_regs:
         click.echo("")

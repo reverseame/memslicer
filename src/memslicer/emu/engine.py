@@ -115,10 +115,18 @@ class MSLEmulator:
         self._history = []        # list of (UcContext, [(addr, old_bytes), ...])
         self._max_back = 4096
         self._pending = None      # write log of the in-progress step
+        # Self-modifying-code tracking: every [addr, addr+size) the emulated code
+        # writes is recorded, and executing an address that was previously written
+        # is flagged as a write-then-execute (W->X) event -- the moment a packer
+        # jumps into its freshly decoded payload.
+        self._written = []        # list of [start, end) byte ranges written
+        self._wx_events = []      # PCs where execution entered written memory
+        self._wx_seen = set()
         self.uc.hook_add (self._U.UC_HOOK_MEM_WRITE, self._on_mem_write)
 
     def _on_mem_write(self, uc, access, address, size, value, user):
         # Called before the write is applied, so mem_read returns the old bytes.
+        self._written.append ((address, address + size))
         if self._pending is None:
             return
         try:
@@ -228,6 +236,12 @@ class MSLEmulator:
     def step(self) -> StepResult:
         """Emulate a single instruction at the current PC."""
         pc = self.pc
+        # Write-then-execute detection: if the instruction about to run lives in
+        # memory that earlier instructions wrote, record it once (self-modifying
+        # / unpacked code).
+        if pc not in self._wx_seen and self._is_written(pc):
+            self._wx_seen.add(pc)
+            self._wx_events.append(pc)
         size, mnemonic, op_str = self._disasm_at(pc)
         ctx = self.uc.context_save()       # CPU state before the step
         self._pending = []                 # collect this step's memory writes
@@ -264,6 +278,42 @@ class MSLEmulator:
             yield res
             if not res.ok or self.pc == addr:
                 return
+
+    # -- self-modifying code / unpacking ------------------------------------
+
+    def written_ranges(self) -> list[tuple[int, int]]:
+        """Coalesced ``[start, end)`` byte ranges the emulated code has written
+        so far (its dirtied memory)."""
+        return _coalesce(self._written)
+
+    def _is_written(self, addr: int) -> bool:
+        return any(lo <= addr < hi for lo, hi in self._written)
+
+    def self_modified_exec(self) -> list[int]:
+        """Addresses where execution entered memory that was written during
+        emulation (write-then-execute). A non-empty list is a strong unpacking /
+        self-modifying-code signal; the first entry is the unpack tail-jump."""
+        return list(self._wx_events)
+
+    def dump_written(self, outdir: str) -> list[tuple[str, int, int, bool]]:
+        """Write each coalesced dirtied range to ``outdir`` as a ``.bin`` file
+        (current, post-execution bytes). Returns ``(path, start, end, executed)``
+        per range, where *executed* marks ranges that were also run (the unpacked
+        payload). Useful for recovering decoded/unpacked code from a slice."""
+        import os
+        os.makedirs(outdir, exist_ok=True)
+        out: list[tuple[str, int, int, bool]] = []
+        for lo, hi in self.written_ranges():
+            try:
+                data = bytes(self.uc.mem_read(lo, hi - lo))
+            except self._U.UcError:
+                continue
+            executed = any(lo <= pc < hi for pc in self._wx_events)
+            path = os.path.join(outdir, f"written_{lo:#x}_{hi:#x}.bin")
+            with open(path, "wb") as f:
+                f.write(data)
+            out.append((path, lo, hi, executed))
+        return out
 
 
 def open_slice(path: str, thread: "int | EmuThread | None" = None) -> MSLEmulator:
