@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MemSlicer · Behavior Graph Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- D3 v7 from CDN (needs internet once; cache it or vendor d3.min.js for offline). -->
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<style>
+  :root{ --bg:#1116; --panel:#0f1115; --ink:#e8eaed; --mut:#9aa0a6; --line:#2a2d34; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+             background:#0b0c0f; color:var(--ink); overflow:hidden; }
+  #app{ display:flex; height:100%; }
+  #side{ width:300px; flex:0 0 300px; background:var(--panel); border-right:1px solid var(--line);
+         padding:14px; overflow:auto; }
+  #stage{ flex:1; position:relative; }
+  svg{ width:100%; height:100%; display:block; cursor:grab; }
+  svg:active{ cursor:grabbing; }
+  h1{ font-size:15px; margin:0 0 2px; }
+  .sub{ color:var(--mut); font-size:11px; margin-bottom:12px; }
+  .drop{ border:2px dashed #3a3f48; border-radius:10px; padding:18px 10px; text-align:center;
+         color:var(--mut); font-size:12px; cursor:pointer; transition:.15s; }
+  .drop.hot{ border-color:#6ea8fe; color:#cfe0ff; background:#16203a; }
+  .drop b{ color:var(--ink); }
+  input[type=file]{ display:none; }
+  .sec{ margin-top:16px; }
+  .sec h2{ font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut);
+           margin:0 0 6px; }
+  .row{ display:flex; align-items:center; gap:8px; font-size:12px; padding:2px 0; cursor:pointer; }
+  .row input{ accent-color:#6ea8fe; }
+  .swatch{ width:14px; height:14px; border-radius:3px; flex:0 0 14px; border:1px solid #0006; }
+  .pill{ display:inline-block; min-width:26px; text-align:center; background:#1c1f26;
+         border-radius:10px; padding:1px 7px; font-size:11px; color:var(--mut); }
+  #search{ width:100%; background:#15171c; border:1px solid var(--line); color:var(--ink);
+           border-radius:7px; padding:7px 9px; font-size:12px; }
+  .stat{ display:flex; justify-content:space-between; font-size:12px; padding:2px 0; color:var(--mut); }
+  .stat b{ color:var(--ink); font-variant-numeric:tabular-nums; }
+  label.tg{ display:flex; align-items:center; gap:8px; font-size:12px; padding:3px 0; cursor:pointer; }
+  .btns{ display:flex; gap:6px; margin-top:8px; }
+  button{ flex:1; background:#1b1e25; color:var(--ink); border:1px solid var(--line);
+          border-radius:7px; padding:6px; font-size:12px; cursor:pointer; }
+  button:hover{ background:#242833; }
+  #tip{ position:absolute; pointer-events:none; background:#0d0f13ee; border:1px solid #353a44;
+        border-radius:8px; padding:8px 10px; font-size:11.5px; max-width:340px; line-height:1.45;
+        box-shadow:0 6px 20px #000a; opacity:0; transition:opacity .08s; z-index:9; }
+  #tip .k{ color:var(--mut); } #tip b{ color:#cfe0ff; }
+  #meta{ font-size:11px; color:var(--mut); white-space:pre-wrap; word-break:break-word; }
+  text.node-label{ font:11px monospace; fill:#0a0c10; pointer-events:none; }
+  .edge-label{ font:9px monospace; fill:#8a90a0; pointer-events:none; }
+  .hint{ position:absolute; bottom:10px; left:12px; font-size:11px; color:#5b616c; }
+  a{ color:#6ea8fe; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <h1>Behavior Graph Viewer</h1>
+    <div class="sub">MemSlicer node-link JSON</div>
+
+    <label class="drop" id="drop" for="file">
+      <b>Drop the .json here</b><br>or click to choose a file
+    </label>
+    <input type="file" id="file" accept=".json,application/json">
+
+    <div class="sec" id="statsBox" style="display:none">
+      <h2>Summary</h2>
+      <div class="stat"><span>Nodes</span><b id="nNodes">0</b></div>
+      <div class="stat"><span>Edges</span><b id="nEdges">0</b></div>
+      <div class="stat"><span>writes&nbsp;exec</span><b id="nExec">0</b></div>
+      <div id="meta"></div>
+    </div>
+
+    <div class="sec" id="searchBox" style="display:none">
+      <h2>Search</h2>
+      <input id="search" placeholder="label / id / api…">
+    </div>
+
+    <div class="sec" id="kindsBox" style="display:none">
+      <h2>Node kinds</h2>
+      <div id="kinds"></div>
+    </div>
+
+    <div class="sec" id="edgesBox" style="display:none">
+      <h2>Edge types</h2>
+      <div id="edgeKinds"></div>
+    </div>
+
+    <div class="sec" id="optsBox" style="display:none">
+      <h2>Options</h2>
+      <label class="tg"><input type="checkbox" id="optNodeLabels" checked> Node labels</label>
+      <label class="tg"><input type="checkbox" id="optEdgeLabels"> Edge labels</label>
+      <label class="tg"><input type="checkbox" id="optExecOnly"> Only writes&nbsp;exec paths</label>
+      <div class="btns">
+        <button id="btnFit">Fit</button>
+        <button id="btnFreeze">Freeze</button>
+      </div>
+    </div>
+  </aside>
+
+  <main id="stage">
+    <svg id="svg"></svg>
+    <div id="tip"></div>
+    <div class="hint">wheel = zoom · drag background = pan · drag node = pin · double-click node = release</div>
+  </main>
+</div>
+
+<script>
+"use strict";
+// ---- styling that mirrors graph.py to_dot() --------------------------------
+const NODE_STYLE = {
+  block:   { fill:"#d3d3d3", shape:"rect"    },  // lightgray
+  insn:    { fill:"#ffffff", shape:"rect"    },  // white
+  syscall: { fill:"#f0e68c", shape:"ellipse" },  // khaki
+  api:     { fill:"#add8e6", shape:"ellipse" },  // lightblue
+  func:    { fill:"#fafad2", shape:"rect"    },  // lightyellow
+};
+const EXEC_FILL = "#ff6347";                      // tomato (writes_exec)
+const EDGE_STYLE = {
+  dataflow:    { stroke:"#e5484d", width:2.2, dash:null,    label:true  },
+  buffer:      { stroke:"#f5a524", width:1.6, dash:"5,4",   label:true  },
+  syscall:     { stroke:"#8a90a0", width:1.2, dash:"4,4",   label:false },
+  invoke:      { stroke:"#8a90a0", width:1.2, dash:"4,4",   label:false },
+  call:        { stroke:"#6ea8fe", width:1.5, dash:null,    label:false },
+  ret:         { stroke:"#7d8694", width:1.2, dash:"2,3",   label:false },
+  jump:        { stroke:"#b0b6c0", width:1.2, dash:null,    label:false },
+  fallthrough: { stroke:"#5b616c", width:1.1, dash:null,    label:false },
+  seq:         { stroke:"#444b57", width:1.0, dash:"1,3",   label:false },
+};
+const edgeStyle = t => EDGE_STYLE[t] || { stroke:"#666", width:1.1, dash:null, label:false };
+const nodeStyle = n => (n.attrs && n.attrs.writes_exec)
+  ? { fill:EXEC_FILL, shape:(NODE_STYLE[n.kind]||{}).shape||"rect", exec:true }
+  : (NODE_STYLE[n.kind] || { fill:"#ffffff", shape:"rect" });
+
+const svg = d3.select("#svg");
+const tip = d3.select("#tip");
+let root, linkSel, nodeSel, sim, DATA = null, frozen = false;
+
+const W = () => document.getElementById("stage").clientWidth;
+const H = () => document.getElementById("stage").clientHeight;
+
+// ---- file loading ----------------------------------------------------------
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+fileInput.addEventListener("change", e => { if (e.target.files[0]) readFile(e.target.files[0]); });
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e=>{e.preventDefault();drop.classList.add("hot");}));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e=>{e.preventDefault();drop.classList.remove("hot");}));
+drop.addEventListener("drop", e => { const f=e.dataTransfer.files[0]; if(f) readFile(f); });
+// also accept a file dropped anywhere on the stage
+document.getElementById("stage").addEventListener("dragover", e=>e.preventDefault());
+document.getElementById("stage").addEventListener("drop", e=>{e.preventDefault(); const f=e.dataTransfer.files[0]; if(f) readFile(f);});
+
+function readFile(file){
+  const r = new FileReader();
+  r.onload = () => { try { render(JSON.parse(r.result)); }
+                     catch(err){ alert("Invalid JSON: "+err.message); } };
+  r.readAsText(file);
+}
+
+// ---- render ----------------------------------------------------------------
+function render(data){
+  DATA = data;
+  const nodes = (data.nodes||[]).map(d => Object.assign({}, d));
+  const idset = new Set(nodes.map(d=>d.id));
+  const links = (data.links||data.edges||[])
+        .filter(e => idset.has(e.source) && idset.has(e.target))
+        .map(e => Object.assign({}, e));
+
+  // sidebar stats
+  document.getElementById("statsBox").style.display="";
+  document.getElementById("searchBox").style.display="";
+  document.getElementById("kindsBox").style.display="";
+  document.getElementById("edgesBox").style.display="";
+  document.getElementById("optsBox").style.display="";
+  document.getElementById("nNodes").textContent = nodes.length;
+  document.getElementById("nEdges").textContent = links.length;
+  document.getElementById("nExec").textContent =
+        nodes.filter(n=>n.attrs && n.attrs.writes_exec).length;
+  document.getElementById("meta").textContent =
+        data.meta ? Object.entries(data.meta)
+          .filter(([,v])=>typeof v!=="object")
+          .map(([k,v])=>`${k}: ${v}`).join("\n") : "";
+
+  buildKindFilters(nodes);
+  buildEdgeFilters(links);
+
+  // reset svg
+  svg.selectAll("*").remove();
+  const defs = svg.append("defs");
+  // one arrowhead per edge color
+  const colors = new Set(links.map(l=>edgeStyle(l.type).stroke));
+  colors.forEach(c=>{
+    defs.append("marker").attr("id","arr-"+cssId(c)).attr("viewBox","0 -5 10 10")
+      .attr("refX",18).attr("refY",0).attr("markerWidth",6).attr("markerHeight",6)
+      .attr("orient","auto").append("path").attr("d","M0,-5L10,0L0,5").attr("fill",c);
+  });
+
+  root = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.05,8]).on("zoom", e=>root.attr("transform", e.transform)));
+
+  const linkG = root.append("g").attr("fill","none");
+  linkSel = linkG.selectAll("g").data(links).join("g");
+  linkSel.append("path").attr("class","edge")
+    .attr("stroke", d=>edgeStyle(d.type).stroke)
+    .attr("stroke-width", d=>edgeStyle(d.type).width)
+    .attr("stroke-dasharray", d=>edgeStyle(d.type).dash)
+    .attr("marker-end", d=>`url(#arr-${cssId(edgeStyle(d.type).stroke)})`);
+  linkSel.append("text").attr("class","edge-label")
+    .text(d=> (d.type) + (d.value!=null?` ${d.value}`:"") + (d.count>1?` ×${d.count}`:""));
+
+  nodeSel = root.append("g").selectAll("g").data(nodes).join("g")
+    .call(d3.drag()
+      .on("start",(e,d)=>{ if(!e.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on("drag",(e,d)=>{ d.fx=e.x; d.fy=e.y; })
+      .on("end",(e,d)=>{ if(!e.active) sim.alphaTarget(0); }))   // keep pinned (fx/fy)
+    .on("dblclick",(e,d)=>{ d.fx=null; d.fy=null; sim.alpha(.3).restart(); })
+    .on("mousemove", showTip).on("mouseleave", hideTip);
+
+  nodeSel.each(function(d){
+    const g=d3.select(this), st=nodeStyle(d);
+    const label = nodeLabel(d);
+    const w = Math.max(26, label.length*7+14), h=22;
+    d._w=w; d._h=h;
+    if (st.shape==="ellipse")
+      g.append("ellipse").attr("rx",w/2).attr("ry",h/2);
+    else
+      g.append("rect").attr("x",-w/2).attr("y",-h/2).attr("width",w).attr("height",h).attr("rx",4);
+    g.select("ellipse,rect").attr("fill",st.fill)
+      .attr("stroke", st.exec?"#7a0000":"#2c2c2c").attr("stroke-width", st.exec?2.5:1);
+    g.append("text").attr("class","node-label").attr("text-anchor","middle").attr("dy","0.32em")
+      .text(label);
+  });
+
+  sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d=>d.id).distance(70).strength(.5))
+    .force("charge", d3.forceManyBody().strength(-300))
+    .force("center", d3.forceCenter(W()/2, H()/2))
+    .force("collide", d3.forceCollide(d=>Math.max(d._w,d._h)/1.6))
+    .on("tick", ticked);
+
+  applyFilters();
+  setTimeout(fit, 400);
+}
+
+function ticked(){
+  linkSel.select("path").attr("d", d=>{
+    const s=d.source, t=d.target;
+    return `M${s.x},${s.y}L${t.x},${t.y}`;
+  });
+  linkSel.select("text")
+    .attr("x", d=>(d.source.x+d.target.x)/2)
+    .attr("y", d=>(d.source.y+d.target.y)/2);
+  nodeSel.attr("transform", d=>`translate(${d.x},${d.y})`);
+}
+
+// ---- labels & tooltip ------------------------------------------------------
+function nodeLabel(d){
+  let l = (d.label||d.id||"").split("\n")[0];
+  if (l.length>40) l = l.slice(0,38)+"…";
+  if (d.hits>1) l += ` ×${d.hits}`;
+  return l;
+}
+function showTip(e,d){
+  const a=d.attrs||{};
+  const rows = [
+    `<b>${esc(d.label||d.id)}</b>`,
+    `<span class="k">kind</span> ${d.kind}`,
+    d.addr?`<span class="k">addr</span> 0x${(+d.addr).toString(16)}`:"",
+    `<span class="k">hits</span> ${d.hits||1}`,
+    a.category?`<span class="k">category</span> ${a.category}`:"",
+    a.writes_exec?`<b style="color:#ff8a72">writes exec ×${a.writes_exec}</b>`:"",
+  ].filter(Boolean);
+  for (const [k,v] of Object.entries(a))
+    if (!["category","writes_exec"].includes(k)) rows.push(`<span class="k">${esc(k)}</span> ${esc(String(v))}`);
+  tip.html(rows.join("<br>")).style("opacity",1)
+     .style("left",(e.offsetX+18)+"px").style("top",(e.offsetY+12)+"px");
+}
+function hideTip(){ tip.style("opacity",0); }
+
+// ---- filters ---------------------------------------------------------------
+let activeKinds=new Set(), activeEdges=new Set();
+function buildKindFilters(nodes){
+  const counts={}; nodes.forEach(n=>counts[n.kind]=(counts[n.kind]||0)+1);
+  activeKinds=new Set(Object.keys(counts));
+  const box=d3.select("#kinds").html("");
+  Object.keys(NODE_STYLE).concat(Object.keys(counts).filter(k=>!NODE_STYLE[k]))
+    .filter(k=>counts[k]).forEach(k=>{
+    const row=box.append("label").attr("class","row");
+    row.append("input").attr("type","checkbox").property("checked",true)
+       .on("change",function(){ this.checked?activeKinds.add(k):activeKinds.delete(k); applyFilters(); });
+    row.append("span").attr("class","swatch")
+       .style("background",(NODE_STYLE[k]||{fill:"#fff"}).fill);
+    row.append("span").text(k);
+    row.append("span").attr("class","pill").style("margin-left","auto").text(counts[k]);
+  });
+}
+function buildEdgeFilters(links){
+  const counts={}; links.forEach(l=>counts[l.type]=(counts[l.type]||0)+1);
+  activeEdges=new Set(Object.keys(counts));
+  const box=d3.select("#edgeKinds").html("");
+  Object.keys(counts).sort().forEach(t=>{
+    const row=box.append("label").attr("class","row");
+    row.append("input").attr("type","checkbox").property("checked",true)
+       .on("change",function(){ this.checked?activeEdges.add(t):activeEdges.delete(t); applyFilters(); });
+    row.append("span").attr("class","swatch").style("background",edgeStyle(t).stroke);
+    row.append("span").text(t);
+    row.append("span").attr("class","pill").style("margin-left","auto").text(counts[t]);
+  });
+}
+function applyFilters(){
+  const q=(document.getElementById("search").value||"").toLowerCase();
+  const execOnly=document.getElementById("optExecOnly").checked;
+  const showNL=document.getElementById("optNodeLabels").checked;
+  const showEL=document.getElementById("optEdgeLabels").checked;
+  const nodeVisible=d=>{
+    if(!activeKinds.has(d.kind)) return false;
+    if(execOnly && !(d.attrs&&d.attrs.writes_exec)) return false;
+    if(q && !((d.label||"")+" "+(d.id||"")).toLowerCase().includes(q)) return false;
+    return true;
+  };
+  nodeSel.style("display",d=>nodeVisible(d)?null:"none")
+         .attr("opacity",d=> (q && nodeVisible(d) && ((d.label||"")+(d.id||"")).toLowerCase().includes(q))?1:(q?0.25:1))
+         .style("display",d=>nodeVisible(d)?null:"none");
+  nodeSel.selectAll("text.node-label").style("display",showNL?null:"none");
+  linkSel.style("display",d=>{
+    const ok=activeEdges.has(d.type) && nodeVisible(d.source) && nodeVisible(d.target);
+    return ok?null:"none";
+  });
+  linkSel.selectAll("text.edge-label").style("display",d=>showEL?null:"none");
+}
+["optNodeLabels","optEdgeLabels","optExecOnly"].forEach(id=>
+  document.getElementById(id).addEventListener("change",applyFilters));
+document.getElementById("search").addEventListener("input",applyFilters);
+
+// ---- buttons ---------------------------------------------------------------
+document.getElementById("btnFit").addEventListener("click",fit);
+document.getElementById("btnFreeze").addEventListener("click",function(){
+  frozen=!frozen; this.textContent=frozen?"Unfreeze":"Freeze";
+  if(frozen){ sim.stop(); } else { sim.alpha(.3).restart(); }
+});
+function fit(){
+  if(!nodeSel) return;
+  const xs=[],ys=[]; nodeSel.each(d=>{ if(d.x!=null){xs.push(d.x);ys.push(d.y);} });
+  if(!xs.length) return;
+  const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+  const gw=maxX-minX||1, gh=maxY-minY||1, pad=60;
+  const k=Math.min((W()-pad*2)/gw,(H()-pad*2)/gh,2);
+  const tx=W()/2-k*(minX+maxX)/2, ty=H()/2-k*(minY+maxY)/2;
+  svg.transition().duration(400)
+     .call(d3.zoom().on("zoom",e=>root.attr("transform",e.transform)).transform,
+           d3.zoomIdentity.translate(tx,ty).scale(k));
+}
+
+// ---- utils -----------------------------------------------------------------
+function cssId(s){ return s.replace(/[^a-z0-9]/gi,""); }
+function esc(s){ return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+</script>
+</body>
+</html>
