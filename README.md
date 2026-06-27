@@ -22,6 +22,16 @@ A memory acquisition tool that captures process memory snapshots into the MSL (M
 - Companion log file captures all debug output regardless of verbosity flag
 - Cross-platform OS information collection for forensic context
 
+**Analyzing slices** (see [Emulating & analyzing slices](#emulating--analyzing-slices)):
+
+- **Emulator** (`memslicer-emu`, Unicorn + Capstone): single-step and **reverse execution**, multi-arch
+- **Per-thread emulation**: list captured threads and seed from any of them
+- **Vector/FP registers** (XMM/YMM) seeded at full width for SIMD/crypto code
+- **fs/gs base & Windows TEB/PEB** resolution for TLS / PEB-relative accesses
+- **Self-modifying-code / unpacking** detection — flags write-then-execute and dumps the recovered payload
+- **Symbolic execution** (angr) and a **behavior graph** (control flow + syscalls/APIs)
+- **radare2 plugins** to open, inspect (maps, symbols, PE exports) and emulated-debug a slice
+
 ---
 
 ## Installation
@@ -347,6 +357,15 @@ emu = open_slice("dump.msl", thread=200)   # seed from tid 200
 emu.switch_thread(100)                      # re-seed from another thread later
 ```
 
+**Segment bases & Windows TEB/PEB.** Captured `fs_base` / `gs_base` are seeded,
+so TEB/PEB- and TLS-relative accesses (`gs:[...]` on x64, `fs:[...]` on x86)
+resolve during emulation:
+
+```python
+emu.segment_base("gs")      # captured GS base (TEB on Windows x64)
+emu.peb_address()           # follow gs:[0x60] / fs:[0x30] to the Windows PEB
+```
+
 ### Symbolic execution (angr)
 
 Load a slice into [angr](https://angr.io) for symbolic execution from the exact
@@ -474,14 +493,19 @@ open("graph.dot", "w").write(graph.to_dot())
 ### radare2 plugins
 
 A slice can also be opened in [radare2](https://github.com/radareorg/radare2)
-via the `io.msl` / `bin.msl` / `debug.msl` plugins:
+via the `io.msl` / `bin.msl` / `debug.msl` / `core.msl` plugins:
 
 ```bash
 r2 dump.msl                          # static analysis: maps, arch, entrypoint
+r2 -qc 'il; is' dump.msl             # modules (libraries) and symbols / PE exports
 r2 -D msl -d msl://dump.msl          # emulated debugging: ds / dr step via ESIL
+#   > dpt        list captured threads     > dpt=<tid>   switch the seeded thread
 ```
 
-See `doc/msl.md` in the radare2 tree. The `msl://` io plugin decodes lz4
+The plugins live in [radareorg/radare2-extras](https://github.com/radareorg/radare2-extras)
+under `msl/` (see its `README.md`). `bin.msl` exposes captured modules as
+libraries and symbols, including PE export tables so call targets are named;
+`debug.msl` lists/selects threads (`dpt`). The `msl://` io plugin decodes lz4
 slices; zstd slices are not decodable by radare2 (no zstd) — use `-c lz4`/
 `-c none` or `memslicer-emu`. Encrypted slices are not supported by the
 plugins. `memslicer-emu` handles both zstd and lz4.
