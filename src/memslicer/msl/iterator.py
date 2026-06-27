@@ -186,7 +186,8 @@ def iterate_blocks(f: BinaryIO) -> Iterator[BlockRecord]:
             # padding on decompress.
             compressed_data = on_disk_payload[8:]
             try:
-                payload = decompress(compressed_data, comp_algo)
+                payload = decompress(compressed_data, comp_algo,
+                                     uncompressed_size=uncompressed_size)
             except Exception as exc:
                 raise ValueError(
                     f"decompression failed at offset {start}: {exc}"
