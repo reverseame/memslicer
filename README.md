@@ -303,8 +303,12 @@ from memslicer.emu import open_slice
 emu = open_slice("dump.msl")        # registers seeded from the Thread Context
 emu.step()
 print(hex(emu.read_reg("rax")))
+print(hex(emu.read_reg("xmm0")))    # vector/FP registers (XMM/YMM) too
 emu.step_back()                     # reverse execution (undo the last step)
 ```
+
+Captured **vector/FP registers** (XMM/YMM/...) are seeded at full width when the
+slice carries them, so SIMD/crypto code emulates from the real CPU state.
 
 It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
 CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo

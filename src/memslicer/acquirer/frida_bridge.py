@@ -7,6 +7,7 @@ from typing import Any
 from memslicer.acquirer.bridge import (
     MemoryRange, ModuleInfo, PlatformInfo,
     RegisterValue, ThreadInfo, register_role, register_width_bytes,
+    vector_register_width,
 )
 from memslicer.acquirer.platform_detect import detect_platform
 
@@ -250,7 +251,9 @@ class FridaBridge:
                 except (TypeError, ValueError):
                     continue
                 regs.append(RegisterValue(
-                    name=name, value=ival, size=width, role=register_role(name),
+                    name=name, value=ival,
+                    size=vector_register_width(name) or width,
+                    role=register_role(name),
                 ))
             threads.append(ThreadInfo(
                 tid=t.get("id", 0),

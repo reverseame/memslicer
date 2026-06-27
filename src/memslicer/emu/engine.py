@@ -164,11 +164,15 @@ class MSLEmulator:
         if thread is None:
             return
         for reg in thread.registers:
-            if reg.width > 8:
-                continue  # vector/extended registers not seeded in MVP
             const = self._reg_const(reg.name)
-            if const is not None:
+            if const is None:
+                continue
+            try:
+                # Unicorn accepts a Python int for GPRs and for vector/FP
+                # registers alike (XMM=128-bit, YMM=256-bit, ...).
                 self.uc.reg_write(const, reg.value)
+            except (self._U.UcError, OverflowError, TypeError):
+                continue  # a register width this engine build can't accept
 
     def switch_thread(self, thread: "int | EmuThread | None") -> "EmuThread | None":
         """Re-seed the CPU from another captured thread (by tid or EmuThread).

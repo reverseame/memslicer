@@ -4,6 +4,7 @@ import struct
 
 from memslicer.acquirer.bridge import (
     RegisterValue, ThreadInfo, register_role, register_width_bytes,
+    vector_register_width,
 )
 from memslicer.acquirer.engine import _build_thread_contexts
 from memslicer.msl.constants import (
@@ -76,6 +77,35 @@ def test_thread_context_roundtrip():
         ("rsp", 8, REG_FLAG_SP, 0x7fff1234),
         ("rax", 8, 0, 1),
     ]
+
+
+def test_vector_register_width():
+    assert vector_register_width("xmm0") == 16
+    assert vector_register_width("YMM3") == 32
+    assert vector_register_width("zmm15") == 64
+    assert vector_register_width("rax") == 0
+    assert vector_register_width("rip") == 0
+
+
+def test_thread_context_wide_register_roundtrip():
+    val = 0x0123456789abcdef_fedcba9876543210          # 128-bit
+    tc = ThreadContext(thread_id=1, registers=[
+        ThreadRegister("rip", (0x1000).to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("xmm0", val.to_bytes(16, "little"), 0),
+    ])
+    regs = _decode_thread_context(_write_one(tc))["regs"]
+    assert ("xmm0", 16, 0, val) in regs               # full 128-bit preserved
+
+
+def test_build_thread_contexts_keeps_vector_width():
+    t = ThreadInfo(tid=1, is_current=True, registers=[
+        RegisterValue(name="rip", value=0x1000, size=8, role="pc"),
+        RegisterValue(name="xmm0", value=(1 << 120) | 7, size=16, role=""),
+    ])
+    tc = _build_thread_contexts([t])[0]
+    xmm = next(r for r in tc.registers if r.name == "xmm0")
+    assert len(xmm.value) == 16                        # not truncated to 8
+    assert int.from_bytes(xmm.value, "little") == (1 << 120) | 7
 
 
 def test_thread_context_no_name():

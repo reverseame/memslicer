@@ -368,3 +368,37 @@ def test_cli_dump_written(tmp_path):
     assert "self-modifying code" in res.output
     assert "(executed)" in res.output
     assert list(outdir.glob("*.bin"))
+
+# ---- vector / FP registers ----
+
+XMM_VAL = 0x0123456789abcdef_fedcba9876543210  # 128-bit
+
+
+def test_loader_parses_vector_register(tmp_path):
+    p = tmp_path / "v.msl"
+    _write_code(p, b"\x90", [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("xmm0", XMM_VAL.to_bytes(16, "little"), 0),
+    ])
+    img = load_slice(str(p))
+    xmm = next(r for r in img.current_thread.registers if r.name == "xmm0")
+    assert xmm.width == 16
+    assert xmm.value == XMM_VAL                      # full 128-bit round-trip
+
+
+def test_emulator_seeds_vector_register(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "v.msl"
+    _write_code(p, b"\x90", [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
+        ThreadRegister("xmm0", XMM_VAL.to_bytes(16, "little"), 0),
+    ])
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.read_reg("xmm0") == XMM_VAL           # 128-bit reg seeded
+    assert emu.read_reg("rip") == CODE_VA            # GPRs unaffected
+
+

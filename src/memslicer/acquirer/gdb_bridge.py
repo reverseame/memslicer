@@ -21,6 +21,7 @@ from memslicer.acquirer.bridge import (
     ThreadInfo,
     register_role,
     register_width_bytes,
+    vector_register_width,
 )
 from memslicer.acquirer.platform_detect import (
     parse_gdb_architecture,
@@ -377,7 +378,8 @@ class GDBBridge:
                 except ValueError:
                     continue
                 regs.append(RegisterValue(
-                    name=name.lower(), value=ival, size=width,
+                    name=name.lower(), value=ival,
+                    size=vector_register_width(name) or width,
                     role=register_role(name),
                 ))
             threads.append(ThreadInfo(
