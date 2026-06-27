@@ -429,6 +429,17 @@ class AcquisitionEngine(BaseAcquirer):
                     threads_raw = []
                 thread_contexts = _build_thread_contexts(threads_raw)
                 self._log.debug("threads: %d", len(thread_contexts))
+                if thread_contexts and not any(
+                    tc.registers for tc in thread_contexts
+                ):
+                    self._log.warning(
+                        "%d threads enumerated but NONE carried register "
+                        "state -- the slice will have no ThreadContext blocks "
+                        "(emulation / PC-seeding will be unavailable). With the "
+                        "Frida backend this usually means the CpuContext "
+                        "registers were not read.",
+                        len(thread_contexts),
+                    )
 
             # Build CapBitmap dynamically based on what will be emitted
             cap_bitmap = (1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)

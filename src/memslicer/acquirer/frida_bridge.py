@@ -7,6 +7,7 @@ from typing import Any
 from memslicer.acquirer.bridge import (
     MemoryRange, ModuleInfo, PlatformInfo,
     RegisterValue, ThreadInfo, register_role, register_width_bytes,
+    vector_register_width,
 )
 from memslicer.acquirer.platform_detect import detect_platform
 
@@ -32,12 +33,42 @@ rpc.exports = {
         return Process.enumerateModules();
     },
     enumerateThreads: function() {
+        // Frida exposes CpuContext registers as NON-enumerable accessor
+        // properties, so `for..in` / Object.keys yield nothing even though the
+        // context is populated (read by name, e.g. raw.eip, works). Iterate an
+        // explicit per-arch register-name list; keep a `for..in` pass as a
+        // fallback for builds that DO expose them enumerably.
+        var REG_NAMES = {
+            ia32: ["pc","sp","eax","ecx","edx","ebx","esp","ebp","esi","edi","eip"],
+            x64:  ["pc","sp","rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","rip",
+                   "r8","r9","r10","r11","r12","r13","r14","r15"],
+            arm:  ["pc","sp","lr","cpsr","r0","r1","r2","r3","r4","r5","r6","r7",
+                   "r8","r9","r10","r11","r12"],
+            arm64:["pc","sp","fp","lr","nzcv",
+                   "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11",
+                   "x12","x13","x14","x15","x16","x17","x18","x19","x20","x21",
+                   "x22","x23","x24","x25","x26","x27","x28"]
+        };
+        var names = REG_NAMES[Process.arch] || [];
         return Process.enumerateThreads().map(function(t) {
             var ctx = {};
             var raw = t.context || {};
-            for (var k in raw) {
-                try { ctx[k] = raw[k].toString(); }
-                catch (e) { ctx[k] = String(raw[k]); }
+            // Primary: CpuContext serializes its registers via toJSON, which
+            // for..in / Object.keys miss; JSON captures them all (any arch).
+            try {
+                var j = JSON.parse(JSON.stringify(raw));
+                for (var jk in j) {
+                    var jv = j[jk];
+                    ctx[jk] = (jv && jv.toString) ? jv.toString() : String(jv);
+                }
+            } catch (e) {}
+            // Fallback: explicit per-arch names by direct (by-name) access.
+            for (var i = 0; i < names.length; i++) {
+                var k = names[i];
+                if (ctx[k] !== undefined) continue;
+                var v = raw[k];
+                if (v === undefined || v === null) continue;
+                try { ctx[k] = v.toString(); } catch (e) { ctx[k] = String(v); }
             }
             return {id: t.id, state: t.state, context: ctx};
         });
@@ -250,7 +281,9 @@ class FridaBridge:
                 except (TypeError, ValueError):
                     continue
                 regs.append(RegisterValue(
-                    name=name, value=ival, size=width, role=register_role(name),
+                    name=name, value=ival,
+                    size=vector_register_width(name) or width,
+                    role=register_role(name),
                 ))
             threads.append(ThreadInfo(
                 tid=t.get("id", 0),
