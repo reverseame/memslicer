@@ -392,9 +392,9 @@ class LLDBBridge:
     def enumerate_threads(self) -> list[ThreadInfo]:
         """Enumerate threads with register state via the LLDB Python API.
 
-        Reads the frame-0 register file for every thread. Vector/extended
-        registers wider than 8 bytes are skipped (the value pipeline carries
-        integer registers); GPRs and the program counter are preserved.
+        Reads the frame-0 register file for every thread. Vector/FP registers
+        wider than 8 bytes are captured at full width via the raw register data
+        (best effort); GPRs and the program counter are always preserved.
         """
         _lldb = self._lldb
         process = self._process
@@ -423,7 +423,24 @@ class LLDBBridge:
                             continue
                         byte_size = reg.GetByteSize() or width
                         if byte_size > 8:
-                            continue  # vector/extended register; skip
+                            # Vector/FP register: GetValueAsUnsigned only returns
+                            # up to 64 bits, so read the full raw bytes. Best
+                            # effort -- if the SBData API can't provide them, skip
+                            # (as before) rather than truncate.
+                            try:
+                                data = reg.GetData()
+                                derr = _lldb.SBError()
+                                raw = data.ReadRawData(derr, 0, byte_size)
+                                if derr.Fail() or not raw or len(raw) < byte_size:
+                                    continue
+                                regs.append(RegisterValue(
+                                    name=name.lower(),
+                                    value=int.from_bytes(raw[:byte_size], "little"),
+                                    size=byte_size, role=register_role(name),
+                                ))
+                            except Exception:  # noqa: BLE001 - SBData API varies
+                                pass
+                            continue
                         value = reg.GetValueAsUnsigned(error, 0)
                         if error.Fail():
                             continue

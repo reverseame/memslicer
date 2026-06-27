@@ -97,6 +97,21 @@ def register_width_bytes(arch: ArchType) -> int:
     return _REG_WIDTH.get(arch, 8)
 
 
+# Vector register byte widths, longest prefix first.
+_VECTOR_WIDTHS = (("zmm", 64), ("ymm", 32), ("xmm", 16))
+
+
+def vector_register_width(name: str) -> int:
+    """Byte width of a vector register (``xmm``=16, ``ymm``=32, ``zmm``=64), or
+    0 if *name* is not a recognized vector register. Lets a bridge capture wide
+    registers at full width instead of truncating them to the GPR width."""
+    n = name.lower()
+    for prefix, width in _VECTOR_WIDTHS:
+        if n.startswith(prefix):
+            return width
+    return 0
+
+
 @runtime_checkable
 class DebuggerBridge(Protocol):
     """Protocol for debugger backends.

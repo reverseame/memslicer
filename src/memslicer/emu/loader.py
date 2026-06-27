@@ -94,6 +94,29 @@ class SliceImage:
                 return t
         return self.threads[0] if self.threads else None
 
+    def thread_by_tid(self, tid: int) -> EmuThread | None:
+        for t in self.threads:
+            if t.tid == tid:
+                return t
+        return None
+
+    def select_thread(self, spec: "int | EmuThread | None" = None) -> EmuThread | None:
+        """Resolve a thread selector to an :class:`EmuThread`.
+
+        *spec* may be ``None`` (the Current thread, i.e. the default seed), an
+        :class:`EmuThread`, or a captured thread id. Raises ``KeyError`` if a
+        given tid is not present in the slice.
+        """
+        if spec is None:
+            return self.current_thread
+        if isinstance(spec, EmuThread):
+            return spec
+        t = self.thread_by_tid(int(spec))
+        if t is None:
+            avail = ", ".join(str(x.tid) for x in self.threads) or "none"
+            raise KeyError(f"no thread with tid {spec} in slice (available: {avail})")
+        return t
+
     @property
     def entry(self) -> int | None:
         t = self.current_thread

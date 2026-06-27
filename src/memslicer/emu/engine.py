@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memslicer.msl.constants import ArchType
-from memslicer.emu.loader import SliceImage, load_slice
+from memslicer.msl.constants import ArchType, OSType
+from memslicer.emu.loader import EmuThread, SliceImage, load_slice
 
 _UC_PAGE = 0x1000
 
@@ -73,7 +73,14 @@ def _coalesce(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 class MSLEmulator:
     """Emulate an :class:`SliceImage` with Unicorn."""
 
-    def __init__(self, image: SliceImage):
+    def __init__(self, image: SliceImage, thread: "int | EmuThread | None" = None):
+        """Build an emulator for *image*.
+
+        *thread* selects which captured thread to seed the CPU from: ``None``
+        uses the Current thread (the default), otherwise pass a captured thread
+        id or an :class:`EmuThread`. Use :meth:`switch_thread` to re-seed from
+        another thread later.
+        """
         try:
             import unicorn  # noqa: F401
             import capstone  # noqa: F401
@@ -83,6 +90,7 @@ class MSLEmulator:
             ) from exc
 
         self.image = image
+        self.thread = self._resolve_thread(thread)
         table = _arch_table()
         if image.arch not in table:
             raise EmuError(f"unsupported architecture for emulation: {image.arch.name}")
@@ -107,10 +115,18 @@ class MSLEmulator:
         self._history = []        # list of (UcContext, [(addr, old_bytes), ...])
         self._max_back = 4096
         self._pending = None      # write log of the in-progress step
+        # Self-modifying-code tracking: every [addr, addr+size) the emulated code
+        # writes is recorded, and executing an address that was previously written
+        # is flagged as a write-then-execute (W->X) event -- the moment a packer
+        # jumps into its freshly decoded payload.
+        self._written = []        # list of [start, end) byte ranges written
+        self._wx_events = []      # PCs where execution entered written memory
+        self._wx_seen = set()
         self.uc.hook_add (self._U.UC_HOOK_MEM_WRITE, self._on_mem_write)
 
     def _on_mem_write(self, uc, access, address, size, value, user):
         # Called before the write is applied, so mem_read returns the old bytes.
+        self._written.append ((address, address + size))
         if self._pending is None:
             return
         try:
@@ -137,16 +153,44 @@ class MSLEmulator:
         mod = getattr(self._U, self._const_mod)
         return getattr(mod, self._reg_prefix + name.upper(), None)
 
+    def _resolve_thread(self, spec) -> "EmuThread | None":
+        try:
+            return self.image.select_thread(spec)
+        except KeyError as exc:
+            raise EmuError(str(exc)) from exc
+
     def _seed_registers(self) -> None:
-        thread = self.image.current_thread
+        thread = self.thread
         if thread is None:
             return
         for reg in thread.registers:
-            if reg.width > 8:
-                continue  # vector/extended registers not seeded in MVP
             const = self._reg_const(reg.name)
-            if const is not None:
+            if const is None:
+                continue
+            try:
+                # Unicorn accepts a Python int for GPRs and for vector/FP
+                # registers alike (XMM=128-bit, YMM=256-bit, ...).
                 self.uc.reg_write(const, reg.value)
+            except (self._U.UcError, OverflowError, TypeError):
+                continue  # a register width this engine build can't accept
+
+    def switch_thread(self, thread: "int | EmuThread | None") -> "EmuThread | None":
+        """Re-seed the CPU from another captured thread (by tid or EmuThread).
+
+        Registers are reset to that thread's captured Thread Context and the PC
+        to its captured PC; residual register state from the previous thread is
+        cleared first. Mapped memory is shared, so any writes made so far
+        persist. The reverse-execution history is dropped (it belonged to the
+        previous thread). Returns the newly selected thread.
+        """
+        self.thread = self._resolve_thread(thread)
+        for name in self._gpr_names:        # clear residual state from prior thread
+            const = self._reg_const(name)
+            if const is not None:
+                self.uc.reg_write(const, 0)
+        self._seed_registers()
+        self._history = []
+        return self.thread
 
     # -- registers / memory --------------------------------------------------
 
@@ -181,6 +225,33 @@ class MSLEmulator:
     def read_mem(self, addr: int, size: int) -> bytes:
         return bytes(self.uc.mem_read(addr, size))
 
+    def segment_base(self, seg: str) -> int | None:
+        """Return the captured ``fs_base`` / ``gs_base`` (x86), or None if the
+        slice didn't capture it. These anchor TEB/PEB and TLS access."""
+        const = self._reg_const(f"{seg.lower()}_base")
+        if const is None:
+            return None
+        return self.uc.reg_read(const)
+
+    def peb_address(self) -> int | None:
+        """Resolve the Windows PEB pointer from the captured segment base:
+        ``gs:[0x60]`` on x64, ``fs:[0x30]`` on x86. Requires that the slice
+        captured fs/gs base and the TEB page. Returns None otherwise."""
+        if self.image.os != OSType.Windows:
+            return None
+        if self.image.arch == ArchType.x86_64:
+            base, off, psize = self.segment_base("gs"), 0x60, 8
+        elif self.image.arch == ArchType.x86:
+            base, off, psize = self.segment_base("fs"), 0x30, 4
+        else:
+            return None
+        if not base:
+            return None
+        try:
+            return int.from_bytes(self.read_mem(base + off, psize), "little")
+        except self._U.UcError:
+            return None
+
     # -- execution -----------------------------------------------------------
 
     def _disasm_at(self, pc: int) -> tuple[int, str, str]:
@@ -196,6 +267,12 @@ class MSLEmulator:
     def step(self) -> StepResult:
         """Emulate a single instruction at the current PC."""
         pc = self.pc
+        # Write-then-execute detection: if the instruction about to run lives in
+        # memory that earlier instructions wrote, record it once (self-modifying
+        # / unpacked code).
+        if pc not in self._wx_seen and self._is_written(pc):
+            self._wx_seen.add(pc)
+            self._wx_events.append(pc)
         size, mnemonic, op_str = self._disasm_at(pc)
         ctx = self.uc.context_save()       # CPU state before the step
         self._pending = []                 # collect this step's memory writes
@@ -233,7 +310,47 @@ class MSLEmulator:
             if not res.ok or self.pc == addr:
                 return
 
+    # -- self-modifying code / unpacking ------------------------------------
 
-def open_slice(path: str) -> MSLEmulator:
-    """Convenience: load *path* and build a ready-to-step emulator."""
-    return MSLEmulator(load_slice(path))
+    def written_ranges(self) -> list[tuple[int, int]]:
+        """Coalesced ``[start, end)`` byte ranges the emulated code has written
+        so far (its dirtied memory)."""
+        return _coalesce(self._written)
+
+    def _is_written(self, addr: int) -> bool:
+        return any(lo <= addr < hi for lo, hi in self._written)
+
+    def self_modified_exec(self) -> list[int]:
+        """Addresses where execution entered memory that was written during
+        emulation (write-then-execute). A non-empty list is a strong unpacking /
+        self-modifying-code signal; the first entry is the unpack tail-jump."""
+        return list(self._wx_events)
+
+    def dump_written(self, outdir: str) -> list[tuple[str, int, int, bool]]:
+        """Write each coalesced dirtied range to ``outdir`` as a ``.bin`` file
+        (current, post-execution bytes). Returns ``(path, start, end, executed)``
+        per range, where *executed* marks ranges that were also run (the unpacked
+        payload). Useful for recovering decoded/unpacked code from a slice."""
+        import os
+        os.makedirs(outdir, exist_ok=True)
+        out: list[tuple[str, int, int, bool]] = []
+        for lo, hi in self.written_ranges():
+            try:
+                data = bytes(self.uc.mem_read(lo, hi - lo))
+            except self._U.UcError:
+                continue
+            executed = any(lo <= pc < hi for pc in self._wx_events)
+            path = os.path.join(outdir, f"written_{lo:#x}_{hi:#x}.bin")
+            with open(path, "wb") as f:
+                f.write(data)
+            out.append((path, lo, hi, executed))
+        return out
+
+
+def open_slice(path: str, thread: "int | EmuThread | None" = None) -> MSLEmulator:
+    """Convenience: load *path* and build a ready-to-step emulator.
+
+    *thread* selects the captured thread to seed from (default: the Current
+    thread); see :class:`MSLEmulator`.
+    """
+    return MSLEmulator(load_slice(path), thread=thread)
