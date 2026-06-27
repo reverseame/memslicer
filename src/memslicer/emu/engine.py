@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memslicer.msl.constants import ArchType
+from memslicer.msl.constants import ArchType, OSType
 from memslicer.emu.loader import EmuThread, SliceImage, load_slice
 
 _UC_PAGE = 0x1000
@@ -224,6 +224,33 @@ class MSLEmulator:
 
     def read_mem(self, addr: int, size: int) -> bytes:
         return bytes(self.uc.mem_read(addr, size))
+
+    def segment_base(self, seg: str) -> int | None:
+        """Return the captured ``fs_base`` / ``gs_base`` (x86), or None if the
+        slice didn't capture it. These anchor TEB/PEB and TLS access."""
+        const = self._reg_const(f"{seg.lower()}_base")
+        if const is None:
+            return None
+        return self.uc.reg_read(const)
+
+    def peb_address(self) -> int | None:
+        """Resolve the Windows PEB pointer from the captured segment base:
+        ``gs:[0x60]`` on x64, ``fs:[0x30]`` on x86. Requires that the slice
+        captured fs/gs base and the TEB page. Returns None otherwise."""
+        if self.image.os != OSType.Windows:
+            return None
+        if self.image.arch == ArchType.x86_64:
+            base, off, psize = self.segment_base("gs"), 0x60, 8
+        elif self.image.arch == ArchType.x86:
+            base, off, psize = self.segment_base("fs"), 0x30, 4
+        else:
+            return None
+        if not base:
+            return None
+        try:
+            return int.from_bytes(self.read_mem(base + off, psize), "little")
+        except self._U.UcError:
+            return None
 
     # -- execution -----------------------------------------------------------
 

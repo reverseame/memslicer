@@ -402,3 +402,63 @@ def test_emulator_seeds_vector_register(tmp_path):
     assert emu.read_reg("rip") == CODE_VA            # GPRs unaffected
 
 
+
+# ---- segment base / TEB / PEB ----
+
+def test_emulator_honors_gs_base(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    # movabs rbx, 0xCAFEBABE ; mov gs:[0x60], rbx ; mov rax, gs:[0x60]
+    code = bytes.fromhex("48bbbebafeca00000000"
+                         "6548891c2560000000"
+                         "65488b042560000000")
+    p = tmp_path / "gs.msl"
+    _write_code(p, code, [
+        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+        ThreadRegister("rsp", (STACK_VA + 0x200).to_bytes(8, "little"), REG_FLAG_SP),
+        ThreadRegister("gs_base", STACK_VA.to_bytes(8, "little"), 0),
+    ])
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.segment_base("gs") == STACK_VA          # fs/gs base seeded
+    for _ in range(3):
+        emu.step()
+    assert emu.read_reg("rax") == 0xCAFEBABE           # gs:[0x60] resolved
+
+
+def test_emulator_peb_address(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    peb = 0x7ff50000
+    teb = bytearray(b"\x00" * PS)
+    teb[0x60:0x68] = peb.to_bytes(8, "little")         # PEB pointer at gs:[0x60]
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
+           | (1 << CapBit.ThreadContexts))
+    hdr = FileHeader(os_type=OSType.Windows, arch_type=ArchType.x86_64,
+                     pid=1, cap_bitmap=cap)
+    p = tmp_path / "peb.msl"
+    with open(p, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="C:\\a.exe"))
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x90" * PS]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[bytes(teb)]))
+        w.write_thread_context(ThreadContext(
+            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=[
+                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("gs_base", STACK_VA.to_bytes(8, "little"), 0),
+            ]))
+        w.finalize()
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.peb_address() == peb                    # resolved gs:[0x60]
+
+
