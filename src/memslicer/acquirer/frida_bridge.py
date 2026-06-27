@@ -14,6 +14,69 @@ from memslicer.acquirer.platform_detect import detect_platform
 
 # Frida JS script for RPC exports
 _FRIDA_SCRIPT = """\
+// Resolve an export across Frida API generations (instance vs. legacy static).
+function _resolveExport(mod, name) {
+    try {
+        var m = Process.findModuleByName(mod);
+        if (m) {
+            if (typeof m.findExportByName === 'function') {
+                var p = m.findExportByName(name);
+                if (p) return p;
+            }
+            if (typeof m.getExportByName === 'function') {
+                try { return m.getExportByName(name); } catch (e) {}
+            }
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.findExportByName === 'function') {
+            var p2 = Module.findExportByName(mod, name);
+            if (p2) return p2;
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.getExportByName === 'function') {
+            return Module.getExportByName(mod, name);
+        }
+    } catch (e) {}
+    return null;
+}
+
+// Build a per-thread TEB resolver on Windows. Frida's CpuContext carries no
+// segment base, so the TEB/PEB and TLS anchor is otherwise lost; we recover it
+// via NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress. Returns
+// null on non-Windows or when the needed exports are unavailable.
+function _makeTebResolver() {
+    if (Process.platform !== 'windows') return null;
+    var pOpen = _resolveExport('kernel32.dll', 'OpenThread');
+    var pQuery = _resolveExport('ntdll.dll', 'NtQueryInformationThread');
+    var pClose = _resolveExport('kernel32.dll', 'CloseHandle');
+    if (!pOpen || !pQuery || !pClose) return null;
+    var OpenThread = new NativeFunction(pOpen, 'pointer', ['uint32', 'int', 'uint32']);
+    var NtQueryInformationThread = new NativeFunction(
+        pQuery, 'int', ['pointer', 'int', 'pointer', 'uint32', 'pointer']);
+    var CloseHandle = new NativeFunction(pClose, 'int', ['pointer']);
+    var THREAD_QUERY_INFORMATION = 0x0040;
+    var ThreadBasicInformation = 0;
+    var psize = Process.pointerSize;
+    // THREAD_BASIC_INFORMATION: NTSTATUS ExitStatus; PVOID TebBaseAddress; ...
+    // TebBaseAddress sits at offset == pointerSize (NTSTATUS padded to align).
+    var bufLen = (psize === 8) ? 48 : 28;
+    return function (tid) {
+        var h = OpenThread(THREAD_QUERY_INFORMATION, 0, tid);
+        if (h.isNull()) return null;
+        try {
+            var buf = Memory.alloc(bufLen);
+            var status = NtQueryInformationThread(
+                h, ThreadBasicInformation, buf, bufLen, NULL);
+            if (status !== 0) return null;
+            return buf.add(psize).readPointer();
+        } finally {
+            CloseHandle(h);
+        }
+    };
+}
+
 rpc.exports = {
     enumerateRanges: function(prot) {
         return Process.enumerateRanges(prot);
@@ -50,6 +113,11 @@ rpc.exports = {
                    "x22","x23","x24","x25","x26","x27","x28"]
         };
         var names = REG_NAMES[Process.arch] || [];
+        // CpuContext exposes no segment base; recover the TEB on Windows and
+        // surface it as gs_base (x64) / fs_base (ia32) so the emulator can seed
+        // segment-relative (TEB/PEB, TLS) access.
+        var tebResolver = _makeTebResolver();
+        var segBaseReg = (Process.arch === 'x64') ? 'gs_base' : 'fs_base';
         return Process.enumerateThreads().map(function(t) {
             var ctx = {};
             var raw = t.context || {};
@@ -69,6 +137,12 @@ rpc.exports = {
                 var v = raw[k];
                 if (v === undefined || v === null) continue;
                 try { ctx[k] = v.toString(); } catch (e) { ctx[k] = String(v); }
+            }
+            if (tebResolver && ctx[segBaseReg] === undefined) {
+                try {
+                    var teb = tebResolver(t.id);
+                    if (teb && !teb.isNull()) ctx[segBaseReg] = teb.toString();
+                } catch (e) {}
             }
             return {id: t.id, state: t.state, context: ctx};
         });
