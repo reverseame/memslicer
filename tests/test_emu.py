@@ -4,7 +4,8 @@ import pytest
 from memslicer.emu.loader import load_slice
 from memslicer.msl.writer import MSLWriter
 from memslicer.msl.types import (
-    FileHeader, ProcessIdentity, MemoryRegion, ThreadContext, ThreadRegister,
+    FileHeader, ModuleEntry, ProcessIdentity, MemoryRegion, ThreadContext,
+    ThreadRegister,
 )
 from memslicer.msl.constants import (
     ArchType, CapBit, CompAlgo, OSType, PageState, RegionType,
@@ -533,3 +534,167 @@ def test_emulator_x86_without_fs_base_still_runs(tmp_path):
     assert emu.step().ok                               # no regression
 
 
+# ---- resume from a library/syscall the slice is parked in --------------------
+
+SYS_VA = 0x70000000   # stand-in for ntdll.dll (where the parked PC sits)
+
+
+def _write_parked_slice(path, *, rsp=STACK_VA + 0x100, stack_layout=None):
+    """A slice captured 'parked in a system call': the Current thread's PC is
+    inside a system module (SYS_VA, ~ntdll), and the stack carries a system
+    return address, some junk, then a real return address into the program
+    image (``demo.exe`` at CODE_VA). *stack_layout* maps a stack offset (from
+    STACK_VA) to an 8-byte value; defaults to that 3-slot layout."""
+    if stack_layout is None:
+        stack_layout = {
+            0x100: SYS_VA + 4,      # nested system frame -> skipped (not image)
+            0x108: 0x12345,         # junk, not executable -> skipped
+            0x110: CODE_VA,         # return into the image -> the caller
+        }
+    stack = bytearray(b"\x00" * PS)
+    for off, val in stack_layout.items():
+        stack[off:off + 8] = val.to_bytes(8, "little")
+    code_page = CODE + b"\x90" * (PS - len(CODE))
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
+           | (1 << CapBit.ThreadContexts))
+    hdr = FileHeader(os_type=OSType.Windows, arch_type=ArchType.x86_64,
+                     pid=964, cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="C:\\demo.exe"))  # block 0
+        w.write_module_list([                            # block 1 (per spec)
+            ModuleEntry(base_addr=CODE_VA, module_size=PS, path="C:\\demo.exe"),
+            ModuleEntry(base_addr=SYS_VA, module_size=PS,
+                        path="C:\\Windows\\System32\\ntdll.dll"),
+        ])
+        w.write_memory_region(MemoryRegion(                # program image (r-x)
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[code_page]))
+        w.write_memory_region(MemoryRegion(                # ntdll (r-x), parked PC
+            base_addr=SYS_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x90" * PS]))
+        w.write_memory_region(MemoryRegion(                # stack (rw-)
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[bytes(stack)]))
+        w.write_thread_context(ThreadContext(
+            thread_id=964, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=[
+                ThreadRegister("rip", SYS_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", rsp.to_bytes(8, "little"), REG_FLAG_SP),
+            ]))
+        w.finalize()
+
+
+def test_emulator_identifies_image_and_system_call(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    assert emu.main_image().name == "demo.exe"         # the .exe, not ntdll
+    assert emu.module_at(SYS_VA).name == "ntdll.dll"
+    assert emu.pc == SYS_VA
+    assert emu.in_system_call() is True                # parked outside the image
+
+
+def test_emulator_find_caller_frame_skips_system_and_junk(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    frame = emu.find_caller_frame()
+    assert frame is not None
+    assert frame.return_addr == CODE_VA                # skipped ntdll + junk
+    assert frame.sp_slot == STACK_VA + 0x110
+    assert frame.depth == 2
+    assert frame.module == "demo.exe"
+
+
+def test_emulator_resume_from_syscall(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    frame = emu.resume_from_syscall()
+    assert frame is not None
+    assert emu.pc == CODE_VA                            # back in the image
+    assert emu.in_system_call() is False
+    # plain 'ret': SP moved just past the return-address slot
+    assert emu.read_reg("rsp") == STACK_VA + 0x110 + 8
+    assert not emu.can_step_back()                      # unwind dropped history
+
+    emu.step()                                          # mov rax, 1 (really runs)
+    assert emu.read_reg("rax") == 1
+
+
+def test_emulator_resume_from_syscall_pops_stdcall_args(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    emu.resume_from_syscall(pop_bytes=4)                # e.g. Sleep's 'ret 4'
+    assert emu.pc == CODE_VA
+    assert emu.read_reg("rsp") == STACK_VA + 0x110 + 8 + 4
+
+
+def test_emulator_resume_from_syscall_no_caller(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    # A stack with no return address into the image -> nothing to resume to.
+    p = tmp_path / "noframe.msl"
+    _write_parked_slice(p, stack_layout={0x100: SYS_VA + 4, 0x108: 0x12345})
+    emu = MSLEmulator(load_slice(str(p)))
+    assert emu.find_caller_frame() is None
+    assert emu.resume_from_syscall() is None
+
+
+def test_cli_resume_from_syscall(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from click.testing import CliRunner
+    from memslicer.cli_emu import main
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    res = CliRunner().invoke(main, [str(p), "-R", "-s", "1", "-r"])
+    assert res.exit_code == 0, res.output
+    assert "resume-from-syscall" in res.output
+    assert "ntdll.dll" in res.output                   # reports where it was parked
+    assert f"caller return @ {CODE_VA:#x}" in res.output
+    assert "demo.exe" in res.output
+    assert "rsp" in res.output
+
+
+def test_cli_resume_from_syscall_image_range(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from click.testing import CliRunner
+    from memslicer.cli_emu import main
+
+    p = tmp_path / "parked.msl"
+    _write_parked_slice(p)
+    # Explicit image range instead of auto-detection.
+    res = CliRunner().invoke(
+        main, [str(p), "-R", "--image-range", f"{CODE_VA:#x}:{CODE_VA + PS:#x}"])
+    assert res.exit_code == 0, res.output
+    assert f"caller return @ {CODE_VA:#x}" in res.output

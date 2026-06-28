@@ -6,6 +6,12 @@ thread's Thread Context (the Current thread by default, or ``--thread TID``),
 then execution is stepped forward. Use ``--list-threads`` to see what was
 captured.
 
+A slice is often captured parked in a blocking library/syscall (e.g. a Sleep),
+so its PC sits in ntdll/kernel and stepping forward would hit a syscall the
+emulator can't service. ``--resume-from-syscall`` unwinds that: it finds the
+caller's return address on the stack and continues in the program image as if
+the call had returned.
+
 Requires the ``emu`` extra::  pip install memslicer[emu]
 """
 from __future__ import annotations
@@ -20,6 +26,25 @@ def _parse_addr(value: str | None) -> int | None:
     if value is None:
         return None
     return int(value, 0)
+
+
+def _parse_range(value: str | None) -> "tuple[int, int] | None":
+    if not value:
+        return None
+    lo, sep, hi = value.partition(":")
+    if not sep or not hi:
+        raise click.ClickException(
+            "--image-range expects LO:HI (e.g. 0xb0000:0xd5000)")
+    return int(lo, 0), int(hi, 0)
+
+
+def _module_loc(image, addr: int) -> str | None:
+    """Format ``addr`` as ``module+offset`` if it falls inside a captured
+    module, else None."""
+    for m in image.modules:
+        if m.base <= addr < m.base + m.size:
+            return f"{m.name}+{addr - m.base:#x}"
+    return None
 
 
 def _print_summary(image) -> None:
@@ -70,6 +95,18 @@ def _trace(emu: MSLEmulator, results) -> None:
               help="Step until this address (hex or decimal)")
 @click.option("--pc", "pc_override", default=None,
               help="Override the start program counter")
+@click.option("-R", "--resume-from-syscall", "resume_syscall", is_flag=True,
+              help="Unwind out of the library/syscall the slice is parked in: "
+                   "find the caller's return address on the stack and continue "
+                   "in the program image as if the call had returned")
+@click.option("--pop-bytes", type=int, default=0,
+              help="With -R, also discard this many stdcall argument bytes "
+                   "(the callee's 'ret N' cleanup, e.g. 4 for Sleep)")
+@click.option("--image-range", default=None,
+              help="With -R, target return addresses in LO:HI instead of the "
+                   "auto-detected program image (e.g. 0xb0000:0xd5000)")
+@click.option("--unwind-depth", type=int, default=256,
+              help="With -R, max stack slots to scan for the return address")
 @click.option("--max-steps", type=int, default=100000,
               help="Safety cap when using --until")
 @click.option("-b", "--back", type=int, default=0,
@@ -84,7 +121,8 @@ def _trace(emu: MSLEmulator, results) -> None:
               type=click.Path(file_okay=False),
               help="After stepping, write dirtied memory ranges to this dir "
                    "(recovers unpacked/decoded payloads)")
-def main(dump, steps, until_addr, pc_override, show_regs, max_steps, back,
+def main(dump, steps, until_addr, pc_override, resume_syscall, pop_bytes,
+         image_range, unwind_depth, show_regs, max_steps, back,
          thread_id, list_threads, dump_written_dir):
     """Emulate the MSL slice DUMP."""
     image = load_slice(dump)
@@ -104,6 +142,24 @@ def main(dump, steps, until_addr, pc_override, show_regs, max_steps, back,
     pc = _parse_addr(pc_override)
     if pc is not None:
         emu.pc = pc
+
+    if resume_syscall:
+        click.echo("")
+        here = _module_loc(image, emu.pc)
+        click.echo(f"[resume-from-syscall] pc = {emu.pc:#x}"
+                   + (f"  ({here})" if here else ""))
+        frame = emu.resume_from_syscall(
+            image_range=_parse_range(image_range),
+            max_depth=unwind_depth, pop_bytes=pop_bytes)
+        if frame is None:
+            raise click.ClickException(
+                "no return address into the program image found on the stack "
+                "(try --image-range LO:HI or a larger --unwind-depth)")
+        where = f"  ({frame.module})" if frame.module else ""
+        click.echo(f"  caller return @ {frame.return_addr:#x}{where}"
+                   f"  [stack {frame.sp_slot:#x}, depth {frame.depth}]")
+        click.echo(f"  resumed: pc -> {emu.pc:#x}, "
+                   f"{emu.sp_name} -> {emu.read_reg(emu.sp_name):#x}")
 
     if steps > 0 or until_addr is not None:
         click.echo("")

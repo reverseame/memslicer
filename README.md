@@ -343,6 +343,30 @@ emu.written_ranges()        # coalesced dirtied byte ranges
 emu.dump_written("out/")    # write each range out (executed ones = the payload)
 ```
 
+**Parked in a syscall.** A process is often captured blocked in a library/kernel
+call (a `Sleep`, a wait, a `recv`), so the captured PC sits in `ntdll`/`kernel`
+and stepping forward would hit a syscall the emulator can't service. Unwind back
+to your own code with `--resume-from-syscall` (`-R`): it scans the stack for the
+caller's return address into the program image and continues there as if the
+call had returned.
+
+```bash
+memslicer-emu parked.msl -R --until 0xb1070 -r
+#   [resume-from-syscall] pc = 0x7c90e514  (ntdll.dll+0x...)
+#     caller return @ 0xb3275  (sample.exe)  [stack 0x..., depth 3]
+#     resumed: pc -> 0xb3275, esp -> 0x...
+```
+
+For a stdcall API that cleans up its own arguments (e.g. `Sleep`'s `ret 4`), add
+`--pop-bytes N` so the caller's stack is left balanced. Override the auto-detected
+image with `--image-range LO:HI`. As a library:
+
+```python
+emu.in_system_call()        # True — PC is outside the program image
+frame = emu.resume_from_syscall(pop_bytes=4)   # find caller, reposition pc/sp
+emu.pc == frame.return_addr  # now back in the image; keep stepping
+```
+
 A slice can capture **more than one thread** (one Thread Context block each).
 By default the emulator seeds from the Current thread, but any captured thread
 can be selected:
