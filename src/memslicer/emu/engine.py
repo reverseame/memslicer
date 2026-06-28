@@ -8,7 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from memslicer.msl.constants import ArchType, OSType
-from memslicer.emu.loader import EmuThread, SliceImage, load_slice
+from memslicer.emu.loader import EmuModule, EmuThread, SliceImage, load_slice
+from memslicer.utils.protection import PROT_X
 
 _UC_PAGE = 0x1000
 
@@ -30,6 +31,19 @@ class StepResult:
     def __str__(self) -> str:
         text = f"{self.addr:#012x}  {self.mnemonic} {self.op_str}".rstrip()
         return text if self.ok else f"{text}    ! {self.error}"
+
+
+@dataclass
+class CallerFrame:
+    """A return address recovered from the stack.
+
+    ``sp_slot`` is the stack address that holds it, ``return_addr`` the caller's
+    next instruction, ``depth`` how many pointer-sized slots above SP it was
+    found, and ``module`` the owning module's name (if known)."""
+    sp_slot: int
+    return_addr: int
+    depth: int
+    module: str | None = None
 
 
 # arch -> (uc_arch, uc_mode, cs_arch, cs_mode, bits, const_module, reg_prefix,
@@ -271,6 +285,12 @@ class MSLEmulator:
     # -- registers / memory --------------------------------------------------
 
     @property
+    def sp_name(self) -> str:
+        """Name of this architecture's stack-pointer register (``esp``/``rsp``/
+        ``sp``)."""
+        return self._sp_name
+
+    @property
     def pc(self) -> int:
         return self.uc.reg_read(self._reg_const(self._pc_name))
 
@@ -331,6 +351,98 @@ class MSLEmulator:
             return int.from_bytes(self.read_mem(base + off, psize), "little")
         except self._U.UcError:
             return None
+
+    # -- modules / call frames ----------------------------------------------
+
+    def module_at(self, addr: int) -> "EmuModule | None":
+        """Return the loaded module whose image range covers *addr*, or None."""
+        for m in self.image.modules:
+            if m.base <= addr < m.base + m.size:
+                return m
+        return None
+
+    def main_image(self) -> "EmuModule | None":
+        """Best guess at the analyzed program's own image: the ``.exe`` module
+        (lowest base if several), else the lowest-based module. None when the
+        slice captured no module list."""
+        mods = self.image.modules
+        if not mods:
+            return None
+        exes = [m for m in mods if m.name.lower().endswith(".exe")]
+        return min(exes or mods, key=lambda m: m.base)
+
+    def _addr_executable(self, addr: int) -> bool:
+        """True if *addr* lies in a captured, execute-protected region, i.e. a
+        plausible return address we could actually resume into."""
+        for r in self.image.regions:
+            if r.contains(addr):
+                if not (r.protection & PROT_X):
+                    return False
+                return (addr & ~(r.page_size - 1)) in r.pages
+        return False
+
+    def in_system_call(self) -> bool | None:
+        """True if PC sits outside the program image (in a system DLL / kernel
+        thunk) -- the slice is parked in a library call. None when the image
+        can't be identified (no module list)."""
+        m = self.main_image()
+        if m is None:
+            return None
+        return not (m.base <= self.pc < m.base + m.size)
+
+    def find_caller_frame(self, image_range: "tuple[int, int] | None" = None,
+                          max_depth: int = 256) -> "CallerFrame | None":
+        """Walk the stack upward from SP and return the nearest return address
+        that points into the program image (executable, captured memory).
+
+        When a slice is captured parked in a blocking call (e.g. a Sleep), the
+        library/kernel frames sit on top of the stack and the first stack slot
+        pointing back into the analyzed image is the instruction right after the
+        ``call`` that entered the library. *image_range* overrides the
+        ``(lo, hi)`` target range (default: :meth:`main_image`'s range). Returns
+        None if no such slot is found within *max_depth* pointer-sized slots."""
+        if image_range is not None:
+            lo, hi = image_range
+        else:
+            m = self.main_image()
+            if m is None:
+                return None
+            lo, hi = m.base, m.base + m.size
+        sp = self.read_reg(self._sp_name)
+        ptr = self.bits // 8
+        for depth in range(max_depth):
+            slot = sp + depth * ptr
+            try:
+                val = int.from_bytes(self.read_mem(slot, ptr), "little")
+            except self._U.UcError:
+                break
+            if lo <= val < hi and self._addr_executable(val):
+                mod = self.module_at(val)
+                return CallerFrame(sp_slot=slot, return_addr=val, depth=depth,
+                                   module=mod.name if mod else None)
+        return None
+
+    def resume_from_syscall(self, image_range: "tuple[int, int] | None" = None,
+                            max_depth: int = 256, pop_bytes: int = 0
+                            ) -> "CallerFrame | None":
+        """Unwind out of a library/syscall the slice is parked in: find the
+        caller's return address on the stack (:meth:`find_caller_frame`) and set
+        PC/SP so emulation continues in the program image as if the call had
+        returned.
+
+        SP is moved just past the return-address slot (a plain ``ret``); pass
+        *pop_bytes* to additionally discard the stdcall argument bytes the
+        callee's ``ret N`` would have cleaned up (e.g. 4 for ``Sleep``). Returns
+        the :class:`CallerFrame` used, or None if no caller return address into
+        the image was found. The reverse-execution history is dropped: the
+        unwind is not a reversible single step."""
+        frame = self.find_caller_frame(image_range=image_range, max_depth=max_depth)
+        if frame is None:
+            return None
+        self.pc = frame.return_addr
+        self.write_reg(self._sp_name, frame.sp_slot + self.bits // 8 + pop_bytes)
+        self._history = []
+        return frame
 
     # -- execution -----------------------------------------------------------
 

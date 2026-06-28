@@ -17,6 +17,14 @@ All notable changes to this project will be documented in this file.
   from the Thread Context, and single-steps execution. Install with the
   `emu` extra (`pip install memslicer[emu]`). Supports x86/x86_64/ARM/ARM64,
   and reverse execution (step back) via a CPU-context + memory-write journal.
+- `memslicer-emu --resume-from-syscall` (`-R`): when a slice is captured
+  parked in a blocking library/syscall (e.g. a `Sleep`), unwind out of it by
+  finding the caller's return address into the program image on the stack and
+  continuing there as if the call had returned — stepping forward would
+  otherwise hit a syscall the emulator can't service. `--pop-bytes` discards
+  stdcall argument cleanup and `--image-range` overrides image auto-detection.
+  Exposed in the library as `MSLEmulator.resume_from_syscall()` /
+  `find_caller_frame()` / `in_system_call()` / `main_image()`.
 - New `memslicer-symbex` tool (and `memslicer.symbex` library) that loads a
   slice into [angr](https://angr.io) — captured memory and registers become a
   `SimState` at the captured PC — for symbolic execution / exploration. Behind
