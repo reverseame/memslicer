@@ -49,6 +49,12 @@
   text.node-label{ font:11px monospace; fill:#0a0c10; pointer-events:none; }
   .edge-label{ font:9px monospace; fill:#8a90a0; pointer-events:none; }
   .hint{ position:absolute; bottom:10px; left:12px; font-size:11px; color:#5b616c; }
+  #apiLog{ max-height:260px; overflow:auto; }
+  .apiRow{ font:10.5px monospace; padding:3px 5px; border-radius:5px; cursor:pointer;
+           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .apiRow:hover, .apiRow.hot{ background:#1b2330; }
+  .apiRow .seq{ color:#5b616c; } .apiRow .nm{ color:#cfe0ff; }
+  .apiRow .cat{ color:#7a90b8; } .apiRow .args{ color:#8fbf9f; }
   a{ color:#6ea8fe; }
 </style>
 </head>
@@ -84,6 +90,11 @@
     <div class="sec" id="edgesBox" style="display:none">
       <h2>Edge types</h2>
       <div id="edgeKinds"></div>
+    </div>
+
+    <div class="sec" id="apiBox" style="display:none">
+      <h2>API calls (<span id="nApi">0</span>)</h2>
+      <div id="apiLog"></div>
     </div>
 
     <div class="sec" id="optsBox" style="display:none">
@@ -134,7 +145,7 @@ const nodeStyle = n => (n.attrs && n.attrs.writes_exec)
 
 const svg = d3.select("#svg");
 const tip = d3.select("#tip");
-let root, linkSel, nodeSel, sim, DATA = null, frozen = false;
+let root, linkSel, nodeSel, sim, DATA = null, frozen = false, EVENTS_BY_NAME = {};
 
 const W = () => document.getElementById("stage").clientWidth;
 const H = () => document.getElementById("stage").clientHeight;
@@ -183,6 +194,7 @@ function render(data){
 
   buildKindFilters(nodes);
   buildEdgeFilters(links);
+  buildApiLog(data.events||[]);
 
   // reset svg
   svg.selectAll("*").remove();
@@ -272,6 +284,16 @@ function showTip(e,d){
   ].filter(Boolean);
   for (const [k,v] of Object.entries(a))
     if (!["category","writes_exec"].includes(k)) rows.push(`<span class="k">${esc(k)}</span> ${esc(String(v))}`);
+  // for API/syscall nodes, append the decoded call(s) with args + return value
+  const evs = EVENTS_BY_NAME[d.label] || EVENTS_BY_NAME[(d.id||"").replace(/^api:/,"")] || [];
+  if (evs.length){
+    rows.push(`<span class="k">calls</span> ${evs.length}`);
+    evs.slice(0,8).forEach(ev=>{
+      const log = ev.log || `${ev.name}(${(ev.args||[]).map(x=>typeof x==="number"?"0x"+(x>>>0).toString(16):x).join(", ")})`;
+      rows.push(`<span style="color:#8fbf9f">${esc(log)}</span>` + (ev.ret!=null?` <span class="k">-></span> 0x${(ev.ret>>>0).toString(16)}`:""));
+    });
+    if (evs.length>8) rows.push(`<span class="k">…+${evs.length-8} more</span>`);
+  }
   tip.html(rows.join("<br>")).style("opacity",1)
      .style("left",(e.offsetX+18)+"px").style("top",(e.offsetY+12)+"px");
 }
@@ -307,6 +329,40 @@ function buildEdgeFilters(links){
     row.append("span").attr("class","pill").style("margin-left","auto").text(counts[t]);
   });
 }
+function buildApiLog(events){
+  EVENTS_BY_NAME = {};
+  const apis = events.filter(e=>e && (e.kind==="api"||e.kind==="syscall"||e.log||e.name));
+  apis.forEach(e=>{ (EVENTS_BY_NAME[e.name]=EVENTS_BY_NAME[e.name]||[]).push(e); });
+  document.getElementById("apiBox").style.display = apis.length ? "" : "none";
+  document.getElementById("nApi").textContent = apis.length;
+  const box=d3.select("#apiLog").html("");
+  apis.forEach(e=>{
+    // prefer the decoded one-line log; else synthesize name(args)
+    const args = Array.isArray(e.args)
+      ? e.args.map(a=>typeof a==="number"?("0x"+(a>>>0).toString(16)):esc(String(a))).join(", ") : "";
+    const text = e.log || `${e.name}(${args})`;
+    const row=box.append("div").attr("class","apiRow")
+       .attr("title", text + (e.ret!=null?`  -> 0x${(e.ret>>>0).toString(16)}`:""))
+       .attr("data-name", e.name||"");
+    if(e.seq!=null) row.append("span").attr("class","seq").text(`#${e.seq} `);
+    row.append("span").attr("class","nm").text(e.name||"");
+    if(e.category && e.category!=="other") row.append("span").attr("class","cat").text(` [${e.category}]`);
+    row.append("span").attr("class","args").text(e.log ? ` ${e.log.replace(e.name,"").trim()}` : (args?` (${args})`:""));
+    // click row -> center & highlight the matching api/syscall node
+    row.on("click",()=>focusNodeById((e.kind||"api")+":"+(e.name||""))
+                    || focusNodeById("api:"+(e.name||""))
+                    || focusNodeById(e.name||""));
+  });
+}
+function focusNodeById(id){
+  if(!nodeSel) return false;
+  let hit=null; nodeSel.each(function(d){ if(d.id===id) hit=d; });
+  if(!hit) return false;
+  centerOn(hit);
+  nodeSel.select("ellipse,rect").attr("stroke-width", d=> d===hit?3.5:(nodeStyle(d).exec?2.5:1))
+         .attr("stroke", d=> d===hit?"#ffd166":(nodeStyle(d).exec?"#7a0000":"#2c2c2c"));
+  return true;
+}
 function applyFilters(){
   const q=(document.getElementById("search").value||"").toLowerCase();
   const execOnly=document.getElementById("optExecOnly").checked;
@@ -338,6 +394,13 @@ document.getElementById("btnFreeze").addEventListener("click",function(){
   frozen=!frozen; this.textContent=frozen?"Unfreeze":"Freeze";
   if(frozen){ sim.stop(); } else { sim.alpha(.3).restart(); }
 });
+function centerOn(d){
+  if(d.x==null) return;
+  const k=1.5, tx=W()/2-k*d.x, ty=H()/2-k*d.y;
+  svg.transition().duration(400)
+     .call(d3.zoom().on("zoom",e=>root.attr("transform",e.transform)).transform,
+           d3.zoomIdentity.translate(tx,ty).scale(k));
+}
 function fit(){
   if(!nodeSel) return;
   const xs=[],ys=[]; nodeSel.each(d=>{ if(d.x!=null){xs.push(d.x);ys.push(d.y);} });
