@@ -39,14 +39,14 @@ from memslicer.msl.types import (
     KernelSymbolBundle,
     ModuleBuildIdManifest,
     ModuleBuildIdRow,
-    PersistenceManifest,
-    PersistenceRow,
-    TargetIntrospection,
     NetdevStatsRow,
     PacketSocketRow,
+    PersistenceManifest,
+    PersistenceRow,
     PhysicalMemoryMap,
     SnmpCounterRow,
     SockstatFamilyRow,
+    TargetIntrospection,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.timestamps import now_ns

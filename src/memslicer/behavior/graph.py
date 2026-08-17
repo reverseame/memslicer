@@ -64,6 +64,23 @@ class BehaviorGraph:
         site of a syscall) without going through an event."""
         return self._touch_node(nid, kind, label=label, addr=addr)
 
+    def _get_cluster_name(self, node: dict) -> str | None:
+        """Determina el nombre del módulo/clúster al que pertenece un nodo."""
+        label = node.get("label", "")
+        clean = label.lstrip("; ").strip()
+        
+        # Ejemplo: "notepad.exe+0xb035" -> "notepad.exe"
+        if "+" in clean:
+            mod = clean.split("+")[0].strip()
+            if mod:
+                return mod
+        # Ejemplo: "USER32.dll!GetMessageW" -> "USER32.dll"
+        if "!" in clean:
+            mod = clean.split("!")[0].strip()
+            if mod:
+                return mod
+        return None    
+
     def _touch_edge(self, src: str, dst: str, etype: str) -> None:
         if not src or not dst:
             return
@@ -89,7 +106,17 @@ class BehaviorGraph:
             "events": self.events,
         }, indent=indent)
 
-    def to_dot(self) -> str:
+    def to_dot(self, *, style: str = "ida") -> str:
+        """Export graph to Graphviz DOT.
+        
+        Supports ``style="ida"`` (disassembly tables & colored jumps like IDA Pro / Cutter)
+        or ``style="basic"`` (simple node box rendering).
+        """
+        if style == "basic":
+            return self._to_dot_basic()
+        return self._to_dot_ida()
+
+    def _to_dot_basic(self) -> str:
         styles = {
             "block": ("box", "lightgray"),
             "insn": ("box", "white"),
@@ -101,7 +128,6 @@ class BehaviorGraph:
                  '  node [fontname="monospace"];']
         for node in self.nodes.values():
             shape, color = styles.get(node["kind"], ("box", "white"))
-            # a block that wrote to executable memory (self-modifying) stands out
             if node["attrs"].get("writes_exec"):
                 color = "tomato"
             label = _dot_escape(node["label"])
@@ -131,6 +157,96 @@ class BehaviorGraph:
             )
         lines.append("}")
         return "\n".join(lines)
+
+    def _to_dot_ida(self) -> str:
+        lines = [
+            'digraph behavior {',
+            '  compound=true;',
+            '  node [shape=box, fontname="Consolas, Monospace", fontsize=10];',
+            '  edge [fontname="Consolas, Monospace", fontsize=9];',
+        ]
+        
+        clusters: dict[str, list[str]] = {}
+        free_nodes: list[str] = []
+
+        for node in self.nodes.values():
+            cluster_name = self._get_cluster_name(node)
+            
+            if node["kind"] in ("block", "insn") and node["attrs"].get("instructions"):
+                label_html = _build_ida_html_table(node)
+                node_line = f'"{node["id"]}" [shape=none, label={label_html}];'
+            elif node["kind"] == "func":
+                # Renderizado elegante para nodos de función completa (Call Graph)
+                label = _dot_escape(node["label"])
+                if node["hits"] > 1:
+                    label += f" (x{node['hits']})"
+                node_line = (
+                    f'"{node["id"]}" [label="{label}", shape=box, style="filled,rounded", '
+                    f'fillcolor="#fff9c4", color="#fbc02d", penwidth=1.5];'
+                )
+            else:
+                color = "khaki" if node["kind"] == "syscall" else "lightblue"
+                label = _dot_escape(node["label"])
+                if node["hits"] > 1:
+                    label += f" (x{node['hits']})"
+                node_line = (
+                    f'"{node["id"]}" [label="{label}", shape=ellipse, '
+                    f'style=filled, fillcolor={color}];'
+                )
+
+            if cluster_name:
+                clusters.setdefault(cluster_name, []).append(node_line)
+            else:
+                free_nodes.append(f'  {node_line}')
+
+        # Emitir subgrafos delimitados por módulo (subgraph cluster_*)
+        for idx, (cname, clines) in enumerate(clusters.items()):
+            lines.append(f'  subgraph "cluster_{idx}" {{')
+            lines.append(f'    label="{_dot_escape(cname)}";')
+            lines.append('    style=dashed;')
+            lines.append('    color="#546e7a";')
+            lines.append('    bgcolor="#f8f9fa";')
+            lines.append('    fontcolor="#263238";')
+            lines.append('    fontname="Consolas, Monospace";')
+            lines.append('    fontsize=11;')
+            for nline in clines:
+                lines.append(f'    {nline}')
+            lines.append('  }')
+
+        # Emitir nodos libres fuera de clústeres
+        for nline in free_nodes:
+            lines.append(nline)
+
+        # Emitir aristas (edges)
+        for edge in self.edges.values():
+            etype = edge["type"]
+            count = edge.get("count", 1)
+            label = edge.get("label") or (f"{etype} {edge['value']}" if etype in ("dataflow", "buffer") and "value" in edge else edge.get("value", ""))
+            if count > 1:
+                label = f"{label} (x{count})" if label else f"x{count}"
+
+            attrs = []
+            if label:
+                attrs.append(f'label="{_dot_escape(label)}"')
+
+            if etype == "jump_true":
+                attrs.extend(['color="#2e7d32"', 'fontcolor="#2e7d32"', 'penwidth=1.8'])
+            elif etype == "jump_false":
+                attrs.extend(['color="#c62828"', 'fontcolor="#c62828"', 'penwidth=1.8'])
+            elif etype == "dataflow":
+                attrs.extend(['color=red', 'fontcolor=red', 'penwidth=2.0'])
+            elif etype == "buffer":
+                attrs.extend(['color="#f57c00"', 'fontcolor="#f57c00"', 'style=dashed', 'penwidth=1.5', 'constraint=false'])
+            elif etype in ("invoke", "syscall"):
+                attrs.extend(['style=dashed', 'color="#757575"'])
+            else:
+                attrs.extend(['color="#424242"', 'penwidth=1.2'])
+
+            attr_str = f" [{', '.join(attrs)}]" if attrs else ""
+            lines.append(f'  "{edge["source"]}" -> "{edge["target"]}"{attr_str};')
+
+        lines.append('}')
+        return '\n'.join(lines)    
 
     # -- GraphML / GEXF (dependency-free XML) --------------------------------
 
@@ -295,6 +411,51 @@ class BehaviorGraph:
         feats["rwx_regions"] = len(mem.get("rwx_regions", []))
         feats["dataflow_edges"] = self.meta.get("dataflow_edges", 0)
         return feats
+
+
+def _build_ida_html_table(node: dict) -> str:
+    """Build a Graphviz HTML table label for a basic block in IDA Pro / Cutter style."""
+    addr = node.get("addr", 0)
+    label = _xml(node.get("label", f"0x{addr:x}"))
+    hits = node.get("hits", 1)
+    writes_exec = node.get("attrs", {}).get("writes_exec", 0)
+    insns = node.get("attrs", {}).get("instructions", [])
+
+    header_bg = "#e0e0e0"
+    if writes_exec:
+        header_bg = "#ff8a80"
+    elif node.get("attrs", {}).get("is_tainted"):
+        header_bg = "#80deea"
+
+    title = f"; {label}"
+    if hits > 1:
+        title += f" (x{hits})"
+    if writes_exec:
+        title += f" [writes exec x{writes_exec}]"
+
+    rows = []
+    if insns:
+        for insn in insns:
+            addr_hex = f"0x{insn['addr']:x}"
+            bytes_hex = _xml(insn.get("bytes", ""))
+            disasm_text = f"{insn.get('mnemonic', '')} {insn.get('op_str', '')}".strip()
+            disasm = _xml(disasm_text)
+            
+            bytes_td = f'<TD ALIGN="LEFT"><FONT COLOR="#888888" POINT-SIZE="8">{bytes_hex}</FONT></TD>' if bytes_hex else '<TD ALIGN="LEFT"></TD>'
+            disasm_td = f'<TD ALIGN="LEFT"><B>{disasm}</B></TD>' if disasm_text else '<TD ALIGN="LEFT"></TD>'
+            comment_td = f'<TD ALIGN="LEFT"><FONT COLOR="#00796b" POINT-SIZE="9">; {_xml(insn["comment"])}</FONT></TD>' if insn.get("comment") else '<TD ALIGN="LEFT"></TD>'
+
+            row = f'<TR><TD ALIGN="LEFT"><FONT COLOR="#555555" POINT-SIZE="9">{addr_hex}</FONT></TD>{bytes_td}{disasm_td}{comment_td}</TR>'
+            rows.append(row)
+    else:
+        rows.append(f'<TR><TD COLSPAN="4" ALIGN="LEFT">{label}</TD></TR>')
+
+    rows_html = "".join(rows)
+    table_html = (f'<<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="1" CELLPADDING="2" BGCOLOR="#ffffff">'
+                  f'<TR><TD COLSPAN="4" BGCOLOR="{header_bg}" ALIGN="LEFT"><B>{title}</B></TD></TR>'
+                  f'{rows_html}'
+                  f'</TABLE>>')
+    return table_html
 
 
 def _dot_escape(text: str) -> str:

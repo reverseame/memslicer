@@ -38,11 +38,17 @@ class BehaviorTracer:
         self.granularity = granularity
         self.intercept_apis = intercept_apis
         if probes is None:
-            probes = [ControlFlowProbe(granularity), SyscallProbe()]
-            if memory:
-                probes.append(MemProbe())
-            if call_graph:
-                probes.append(FunctionProbe())
+            if granularity == "function":
+                probes = [FunctionProbe(), SyscallProbe()]
+                if memory:
+                    probes.append(MemProbe())
+            else:
+                probes = [ControlFlowProbe(granularity), SyscallProbe()]
+
+                if memory:
+                                    probes.append(MemProbe())
+                if call_graph:
+                    probes.append(FunctionProbe())
         self.probes = probes
         self.seq = 0
         self._steps = 0
@@ -66,6 +72,14 @@ class BehaviorTracer:
         an API call (caller stays current, no plain code node is emitted)."""
         if self._maybe_intercept_api(addr):
             return True
+        # Filter out dummy stack return landings / unmapped memory addresses (e.g. 0x30000100)
+        if self.resolver.resolve(addr) is None:
+            try:
+                code = bytes(self.emu.uc.mem_read(addr, max(1, min(size, 16))))
+                if not code or all(b == 0 for b in code):
+                    return True
+            except Exception:
+                return True
         self.tick()
         self.emit(BehaviorEvent(
             kind=EventKind.NODE, seq=self.seq, addr=addr, size=size,

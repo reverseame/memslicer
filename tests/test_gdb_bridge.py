@@ -7,9 +7,10 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 
 from memslicer.acquirer.gdb_bridge import GDBBridge
-from memslicer.acquirer.platform_detect import parse_gdb_architecture as _parse_gdb_architecture
+from memslicer.acquirer.platform_detect import (
+    parse_gdb_architecture as _parse_gdb_architecture,
+)
 from memslicer.msl.constants import ArchType
-
 
 # ---------------------------------------------------------------------------
 # Tests -- construction
@@ -43,10 +44,8 @@ class TestGDBBridgeInit:
 
     def test_target_name_not_found_raises(self):
         """ValueError raised when process name cannot be resolved."""
-        with patch("os.path.isdir", return_value=False), \
-             patch("shutil.which", return_value=None):
-            with pytest.raises(ValueError, match="Could not resolve"):
-                GDBBridge(target="nonexistent_app", logger=MagicMock())
+        with patch("os.path.isdir", return_value=False), patch("shutil.which", return_value=None), pytest.raises(ValueError, match="Could not resolve"):
+            GDBBridge(target="nonexistent_app", logger=MagicMock())
 
 
 # ---------------------------------------------------------------------------

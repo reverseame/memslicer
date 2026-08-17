@@ -68,6 +68,36 @@ class ControlFlowProbe(Probe):
                 return etype
         return EdgeType.FALLTHROUGH
 
+    def _disassemble_block(self, addr: int, size: int) -> list[dict]:
+        """Disassemble instructions inside the block with symbol resolution."""
+        emu = self._tracer.emu
+        try:
+            code = bytes(emu.uc.mem_read(addr, size))
+        except emu._U.UcError:
+            return []
+
+        from capstone import CS_GRP_CALL, CS_GRP_JUMP
+        insns = []
+        for insn in emu.cs.disasm(code, addr):
+            comment = ""
+            if CS_GRP_CALL in insn.groups or CS_GRP_JUMP in insn.groups:
+                try:
+                    target = int(insn.op_str, 0)
+                    resolved = self._tracer.resolver.label(target)
+                    if resolved != f"0x{target:x}":
+                        comment = resolved
+                except (ValueError, TypeError):
+                    pass
+
+            insns.append({
+                "addr": insn.address,
+                "bytes": bytes(insn.bytes).hex(),
+                "mnemonic": insn.mnemonic,
+                "op_str": insn.op_str,
+                "comment": comment,
+            })
+        return insns
+
     def _on_node(self, uc, address, size, user):
         tracer = self._tracer
         # The tracer creates the node (and may intercept the address as an API
@@ -75,9 +105,24 @@ class ControlFlowProbe(Probe):
         # stays the current node).
         if tracer.on_code_node(address, size, self.granularity):
             return
+        node = tracer.graph.nodes.get(f"0x{address:x}")
+        if node:
+            if "instructions" not in node["attrs"]:
+                insns = self._disassemble_block(address, size)
+                node["attrs"]["instructions"] = insns
+                if insns:
+                    # Update label if resolving to a symbol
+                    lbl = tracer.resolver.label(address)
+                    if lbl != f"0x{address:x}":
+                        node["label"] = lbl
         if self._prev is not None:
             paddr, psize = self._prev
             etype = self._classify(paddr, psize)
+            if etype == EdgeType.JUMP:
+                if address == paddr + psize:
+                    etype = "jump_false"
+                else:
+                    etype = "jump_true"
             tracer.emit(BehaviorEvent(
                 kind=EventKind.EDGE, seq=tracer.seq,
                 src=f"0x{paddr:x}", dst=f"0x{address:x}", edge_type=etype,

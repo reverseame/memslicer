@@ -23,8 +23,9 @@ from memslicer.emu.engine import EmuError, open_slice
 
 @click.command()
 @click.argument("dump", type=click.Path(exists=True, dir_okay=False))
-@click.option("-g", "--granularity", type=click.Choice(["block", "instruction"]),
-              default="block", help="Graph node granularity. [default: block]")
+@click.option("-g", "--granularity", type=click.Choice(["block", "instruction", "function"]),
+              default="block",  help="Code unit granularity: 'block' (CFG), "
+              "'instruction' (single-step), or 'function' (call graph). [default: block]")
 @click.option("-n", "--max-steps", type=int, default=100000,
               help="Maximum instructions to emulate. [default: 100000]")
 @click.option("--start", default=None, help="Override start address (hex/dec).")
@@ -51,8 +52,12 @@ from memslicer.emu.engine import EmuError, open_slice
               default=None, help="Output format (else inferred from -o).")
 @click.option("--features", type=click.Path(dir_okay=False), default=None,
               help="Write a per-graph feature vector (JSON) to FILE.")
+@click.option("--style", type=click.Choice(["ida", "basic"]), default="ida",
+              help="DOT rendering style: 'ida' (disassembly tables) or 'basic'. [default: ida]")
+@click.option("--arg0", "--rcx", default=None,
+              help="Pass a string or address argument in RCX register (e.g. password string).")
 def main(dump, granularity, max_steps, start, backend, memory, call_graph,
-         stublib, stubs, emit_stubs, output, fmt, features):
+         stublib, stubs, emit_stubs, output, fmt, features, style, arg0):
     """Extract the behavior graph of the MSL slice DUMP."""
     registry = build_default_registry() if stublib else None
     if stubs:
@@ -61,7 +66,7 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
 
     if backend == "speakeasy":
         graph = _run_speakeasy(dump, granularity, registry)
-        _write_graph(graph, output, fmt)
+        _write_graph(graph, output, fmt, style=style)
         _write_features(graph, features)
         return
 
@@ -69,6 +74,17 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
         emu = open_slice(dump)
     except EmuError as exc:
         raise click.ClickException(str(exc))
+
+    if arg0 is not None:
+        import unicorn.x86_const as x86
+        buf_addr = 0x20000000
+        emu.uc.mem_map(buf_addr, 0x1000)
+        emu.uc.mem_write(buf_addr, arg0.encode('utf-8') + b'\x00')
+        emu.uc.reg_write(x86.UC_X86_REG_RCX, buf_addr)
+        ret_addr = 0x30000000
+        emu.uc.mem_map(ret_addr, 0x1000)
+        emu.uc.reg_write(x86.UC_X86_REG_RSP, 0x30000800)
+        emu.uc.mem_write(0x30000800, (0x30000100).to_bytes(8, 'little'))
 
     tracer = BehaviorTracer(emu, granularity=granularity, registry=registry,
                             memory=memory, call_graph=call_graph)
@@ -79,7 +95,7 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
         emit_skeleton(tracer.registry, emit_stubs)
         click.echo(f"wrote stub skeleton: {emit_stubs}")
 
-    _write_graph(graph, output, fmt)
+    _write_graph(graph, output, fmt, style=style)
     _write_features(graph, features)
 
 
@@ -98,10 +114,10 @@ def _run_speakeasy(dump, granularity, registry):
 _EXT_FMT = {".dot": "dot", ".graphml": "graphml", ".gexf": "gexf",
             ".json": "json"}
 _SERIALIZERS = {
-    "dot": lambda g: g.to_dot(),
-    "graphml": lambda g: g.to_graphml(),
-    "gexf": lambda g: g.to_gexf(),
-    "json": lambda g: g.to_json(),
+    "dot": lambda g, style="ida": g.to_dot(style=style),
+    "graphml": lambda g, style="ida": g.to_graphml(),
+    "gexf": lambda g, style="ida": g.to_gexf(),
+    "json": lambda g, style="ida": g.to_json(),
 }
 
 
@@ -114,11 +130,12 @@ def _write_features(graph, features):
     click.echo(f"wrote feature vector: {features}")
 
 
-def _write_graph(graph, output, fmt):
+def _write_graph(graph, output, fmt, style="ida"):
     if fmt is None and output:
         ext = output[output.rfind("."):].lower() if "." in output else ""
         fmt = _EXT_FMT.get(ext, "json")
-    text = _SERIALIZERS.get(fmt, _SERIALIZERS["json"])(graph)
+    serializer = _SERIALIZERS.get(fmt, _SERIALIZERS["json"])
+    text = serializer(graph, style=style) if fmt == "dot" or (fmt is None and (output and output.endswith(".dot"))) else serializer(graph)
 
     if output:
         with open(output, "w") as f:

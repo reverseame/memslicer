@@ -56,6 +56,42 @@
   .apiRow .seq{ color:#5b616c; } .apiRow .nm{ color:#cfe0ff; }
   .apiRow .cat{ color:#7a90b8; } .apiRow .args{ color:#8fbf9f; }
   a{ color:#6ea8fe; }
+  /* IDA Pro / Binary Ninja Disassembly Card styling */
+  .ida-card {
+    background: #ffffff;
+    border: 1px solid #37474f;
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+    font-family: 'Consolas', 'Fira Code', 'Courier New', monospace;
+    font-size: 11px;
+    box-sizing: border-box;
+    overflow: hidden;
+    color: #111;
+  }
+  .ida-header {
+    padding: 3px 8px;
+    font-weight: bold;
+    font-size: 11px;
+    border-bottom: 1px solid #b0bec5;
+    color: #0d47a1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ida-table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0;
+  }
+  .ida-table td {
+    padding: 1px 6px;
+    white-space: pre;
+    font-size: 10.5px;
+  }
+  .disasm-addr { color: #546e7a; font-size: 9.5px; }
+  .disasm-bytes { color: #90a4ae; font-size: 9px; }
+  .disasm-code { color: #000000; font-weight: bold; }
+  .disasm-comm { color: #2e7d32; font-style: italic; }
 </style>
 </head>
 <body>
@@ -130,6 +166,8 @@ const EXEC_FILL = "#ff6347";                      // tomato (writes_exec)
 const EDGE_STYLE = {
   dataflow:    { stroke:"#e5484d", width:2.2, dash:null,    label:true  },
   buffer:      { stroke:"#f5a524", width:1.6, dash:"5,4",   label:true  },
+  jump_true:   { stroke:"#2e7d32", width:2.0, dash:null,    label:true  },
+  jump_false:  { stroke:"#c62828", width:2.0, dash:null,    label:true  },
   syscall:     { stroke:"#8a90a0", width:1.2, dash:"4,4",   label:false },
   invoke:      { stroke:"#8a90a0", width:1.2, dash:"4,4",   label:false },
   call:        { stroke:"#6ea8fe", width:1.5, dash:null,    label:false },
@@ -230,17 +268,64 @@ function render(data){
 
   nodeSel.each(function(d){
     const g=d3.select(this), st=nodeStyle(d);
-    const label = nodeLabel(d);
-    const w = Math.max(26, label.length*7+14), h=22;
-    d._w=w; d._h=h;
-    if (st.shape==="ellipse")
-      g.append("ellipse").attr("rx",w/2).attr("ry",h/2);
-    else
-      g.append("rect").attr("x",-w/2).attr("y",-h/2).attr("width",w).attr("height",h).attr("rx",4);
-    g.select("ellipse,rect").attr("fill",st.fill)
-      .attr("stroke", st.exec?"#7a0000":"#2c2c2c").attr("stroke-width", st.exec?2.5:1);
-    g.append("text").attr("class","node-label").attr("text-anchor","middle").attr("dy","0.32em")
-      .text(label);
+    const insns = (d.attrs && d.attrs.instructions) || [];
+
+    if (insns.length > 0) {
+      const label = d.label || d.id || "";
+      const headerTitle = `; ${label}` + (d.hits > 1 ? ` (x${d.hits})` : "") + (d.attrs.writes_exec ? ` [writes exec x${d.attrs.writes_exec}]` : "");
+      
+      let maxLen = headerTitle.length;
+      const insnLines = insns.map(insn => {
+        const addrHex = `0x${(+insn.addr).toString(16)}`;
+        const bytesHex = insn.bytes || "";
+        const disasmText = `${insn.mnemonic || ""} ${insn.op_str || ""}`.trim();
+        const comment = insn.comment ? `; ${insn.comment}` : "";
+        const len = addrHex.length + bytesHex.length + disasmText.length + comment.length;
+        if (len > maxLen) maxLen = len;
+        return { addrHex, bytesHex, disasmText, comment };
+      });
+
+      const cardW = Math.min(Math.max(280, maxLen * 7 + 30), 650);
+      const cardH = 26 + insnLines.length * 17 + 6;
+      d._w = cardW;
+      d._h = cardH;
+
+      const headerBg = d.attrs.writes_exec ? "#ff8a80" : (d.attrs.is_tainted ? "#80deea" : "#cfd8dc");
+
+      const rowsHtml = insnLines.map(l => `
+        <tr>
+          <td class="disasm-addr">${l.addrHex}</td>
+          <td class="disasm-bytes">${l.bytesHex}</td>
+          <td class="disasm-code"><b>${esc(l.disasmText)}</b></td>
+          <td class="disasm-comm">${esc(l.comment)}</td>
+        </tr>
+      `).join("");
+
+      const fo = g.append("foreignObject")
+        .attr("x", -cardW / 2)
+        .attr("y", -cardH / 2)
+        .attr("width", cardW)
+        .attr("height", cardH);
+
+      fo.html(`
+        <div class="ida-card" style="width:100%; height:100%; box-sizing:border-box;">
+          <div class="ida-header" style="background:${headerBg}">${esc(headerTitle)}</div>
+          <table class="ida-table"><tbody>${rowsHtml}</tbody></table>
+        </div>
+      `);
+    } else {
+      const label = nodeLabel(d);
+      const w = Math.max(26, label.length*7+14), h=22;
+      d._w=w; d._h=h;
+      if (st.shape==="ellipse")
+        g.append("ellipse").attr("rx",w/2).attr("ry",h/2);
+      else
+        g.append("rect").attr("x",-w/2).attr("y",-h/2).attr("width",w).attr("height",h).attr("rx",4);
+      g.select("ellipse,rect").attr("fill",st.fill)
+        .attr("stroke", st.exec?"#7a0000":"#2c2c2c").attr("stroke-width", st.exec?2.5:1);
+      g.append("text").attr("class","node-label").attr("text-anchor","middle").attr("dy","0.32em")
+        .text(label);
+    }
   });
 
   sim = d3.forceSimulation(nodes)

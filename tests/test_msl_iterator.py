@@ -108,24 +108,21 @@ class TestIterator:
         # Corrupt the first block's magic (4 bytes right after the
         # 64-byte file header).
         data[HEADER_SIZE : HEADER_SIZE + 4] = b"XXXX"
-        with io.BytesIO(bytes(data)) as f:
-            with pytest.raises(ValueError, match="bad block magic"):
-                list(iterate_blocks(f))
+        with io.BytesIO(bytes(data)) as f, pytest.raises(ValueError, match="bad block magic"):
+            list(iterate_blocks(f))
 
     def test_bad_file_magic_raises(self):
         data = bytearray(_make_slice())
         data[0:8] = b"NOTMSL!!"
-        with io.BytesIO(bytes(data)) as f:
-            with pytest.raises(ValueError, match="bad MSL file magic"):
-                list(iterate_blocks(f))
+        with io.BytesIO(bytes(data)) as f, pytest.raises(ValueError, match="bad MSL file magic"):
+            list(iterate_blocks(f))
 
     def test_truncated_block_header_raises(self):
         data = _make_slice()
         # File header (64) + partial block header (6 of 80 bytes).
         truncated = data[: HEADER_SIZE + 6]
-        with io.BytesIO(truncated) as f:
-            with pytest.raises(ValueError, match="truncated block header"):
-                list(iterate_blocks(f))
+        with io.BytesIO(truncated) as f, pytest.raises(ValueError, match="truncated block header"):
+            list(iterate_blocks(f))
 
     def test_truncated_payload_raises(self):
         modules = [
@@ -134,9 +131,8 @@ class TestIterator:
         data = _make_slice(modules=modules)
         # Chop the tail — guarantees we amputate the middle of some
         # block's payload before its EoC.
-        with io.BytesIO(data[:-100]) as f:
-            with pytest.raises(ValueError):
-                list(iterate_blocks(f))
+        with io.BytesIO(data[:-100]) as f, pytest.raises(ValueError):
+            list(iterate_blocks(f))
 
     def test_start_offset_monotonic_and_past_header(self):
         modules = [
@@ -194,6 +190,5 @@ class TestIterator:
         flags = _struct.unpack("<I", data[12:16])[0]
         flags |= FLAG_ENCRYPTED
         data[12:16] = _struct.pack("<I", flags)
-        with io.BytesIO(bytes(data)) as f:
-            with pytest.raises(ValueError, match="encrypted slices"):
-                list(iterate_blocks(f))
+        with io.BytesIO(bytes(data)) as f, pytest.raises(ValueError, match="encrypted slices"):
+            list(iterate_blocks(f))
