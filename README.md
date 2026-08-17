@@ -235,6 +235,96 @@ Options:
 
 ---
 
+
+## Behavior Analysis & Graph Extraction (`memslicer-behavior`)
+
+MemSlicer includes a behavior graph engine that reconstructs execution traces, control flow, syscalls, and Windows API calls from MSL memory snapshots into Dynamic Control-Flow Graphs (DFCG).
+
+### Usage
+
+```bash
+# Extract basic-block CFG in IDA Pro disassembly style
+memslicer-behavior dump.msl --stublib -g block -o graph.dot
+memslicer-behavior dump.msl --stublib -o graph.json
+
+# Extract high-level function call graph
+memslicer-behavior dump.msl --stublib -g function -o callgraph.json
+
+# Pass an input argument (e.g., password string in RCX)
+memslicer-behavior dump.msl --arg0 "S3cr3tKey!" -g block -o graph.dot
+```
+
+### Key Features & Options
+
+- **`-g, --granularity [block|instruction|function]`**:
+  - `block` (default): Basic-block level Control Flow Graph (CFG).
+  - `instruction`: Single-step instruction execution trace.
+  - `function`: High-level **Call Graph** summarizing function-to-function calls and API interactions (collapses thousands of basic blocks for analyzing massive binaries without clutter).
+- **`--style [ida|basic]`**:
+  - `ida` (default): Renders IDA Pro / Binary Ninja style disassembly tables with memory addresses, hex opcodes, assembly mnemonics, and resolved symbol comments.
+  - `basic`: Simple node boxes for basic DOT renderers.
+- **`--arg0, --rcx TEXT`**: Pass an input string or memory argument in `RCX` register for analyzing functions that expect arguments.
+- **Sub-Graph Module Clustering (`subgraph cluster_*`)**: Automatically groups basic blocks and API call nodes by their owning module (`notepad.exe`, `USER32.dll`, `win32u.dll`, etc.) inside dashed bounding boxes.
+- **Color-Coded Branching**:
+  - **Green (`#2e7d32`)**: Conditional branch taken (`jump_true`).
+  - **Red (`#c62828`)**: Conditional branch not taken / fallthrough (`jump_false`).
+  - **Dashed Gray**: API and Syscall invocations.
+  - **Dashed Orange**: Dataflow / buffer pointer relationships.
+
+### Interactive Web Viewer (`tools/graph_viewer.html`)
+
+Open [`tools/graph_viewer.html`](tools/graph_viewer.html) in any web browser (`file://` supported) and drag & drop your generated `graph.json` file. It renders an interactive 2D D3.js visualization with HTML5 disassembly cards, color-coded branching, search, and filtering options.
+
+## 🧠 Symbolic Execution & Analysis (`memslicer-symbex`)
+
+`MemSlicerRev` integrates an advanced symbolic execution bridge powered by `angr` to explore execution paths, deobfuscate memory, and solve path constraints directly from `.msl` snapshot files.
+
+### 🚀 CLI Usage
+
+```powershell
+python -m memslicer.cli_symbex <dump.msl> --find <TARGET_ADDR> --avoid <FAIL_ADDR> [OPTIONS]
+```
+
+#### Available Options:
+- `-f, --find ADDR`: Target address(es) to reach (repeatable, hex/dec format).
+- `-a, --avoid ADDR`: Address(es) to bypass (repeatable, hex/dec format).
+- `-v, --veritesting`: Enables hybrid Static-Dynamic Symbolic Execution (Veritesting) to merge states and prevent path explosion in loops.
+- `-s, --steps N`: Step forward N symbolic instructions when no `--find` target is specified.
+
+---
+
+### 🔍 Key Features
+
+#### 1. Automatic Constraint Provenance & Pointer Mapping
+The CLI automatically inspects SMT solver constraints upon reaching target addresses and classifies input vectors by source:
+- **CPU Registers**: Formatted in canonical 64/32-bit hexadecimal notation (`0x...`).
+- **RAM Memory & Pointer Linkage**: Automatically maps CPU pointers to resolved memory buffers (e.g., `RCX (0xc000000000000000) ---> Points to text: 'S3cr3tKey!'`).
+- **Memory Region Classification**: Categorizes virtual addresses (Stack, Heap, Executable Image, or Symbolic Virtual Memory).
+- **Multi-Channel Detection**: Automatic tracking for STDIN, Disk Files, Network Sockets, CLI Arguments (`argv`), and Environment Variables.
+
+#### 2. Anti-State Explosion (Veritesting)
+Reduces $2^N$ exponential path branching by collapsing intermediate conditional decision diamonds (`if-else`) into unified boolean expressions inside the Z3 solver pool.
+
+#### 3. Anti-Analysis & Anti-Debugging Bypass Module (`memslicer.symbex.anti_analysis`)
+Includes dedicated SimProcedure stubs and PEB sanitization to bypass evasion checks in malware:
+- **API Stubs**: Intercepts `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, and `NtQueryInformationProcess` (`ProcessDebugPort`, `ProcessDebugFlags`).
+- **PEB Masking**: Sanitizes `BeingDebugged` (`0`) and `NtGlobalFlag` (`0`) in process memory.
+
+```python
+from memslicer.symbex.angr_loader import load_angr
+from memslicer.symbex.anti_analysis import apply_anti_analysis_bypass
+
+# Load MSL slice and apply anti-debugging bypass
+project, state = load_angr("snapshot.msl")
+apply_anti_analysis_bypass(project, state)
+
+# Explore symbolically
+simgr = project.factory.simgr(state, veritesting=True)
+simgr.explore(find=0x14000175e, avoid=0x140001765)
+```
+
+---
+
 ## Output Format
 
 MemSlicer writes memory snapshots to the MSL (Memory Slice) binary format. Each file contains:
