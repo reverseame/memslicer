@@ -21,7 +21,6 @@ from memslicer import cli_sysctx
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
 
-
 # ---------------------------------------------------------------------------
 # Fake collector with configurable richness
 # ---------------------------------------------------------------------------
@@ -107,7 +106,7 @@ class _EmptyCollector:
 # Shared patch context
 # ---------------------------------------------------------------------------
 
-def _run(args: list[str], *, collector=None) -> "tuple[int, str, str]":
+def _run(args: list[str], *, collector=None) -> tuple[int, str, str]:
     """Invoke the CLI via CliRunner with the collector factory patched."""
     if collector is None:
         collector = _FakeCollector()
@@ -298,6 +297,7 @@ class TestEntryPointWiring:
             text=True,
             cwd=PROJECT_ROOT,
             timeout=30,
+            check=False,
         )
         # Exit code may be 0 or 2 depending on whether the host collector
         # manages to populate the minimum set; both are valid behaviors

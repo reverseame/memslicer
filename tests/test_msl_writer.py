@@ -7,8 +7,15 @@ import blake3
 import pytest
 
 from memslicer.msl.constants import (
-    FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE,
-    BlockType, OSType, ArchType, PageState, RegionType,
+    BLOCK_HEADER_SIZE,
+    BLOCK_MAGIC,
+    FILE_MAGIC,
+    HEADER_SIZE,
+    ArchType,
+    BlockType,
+    OSType,
+    PageState,
+    RegionType,
 )
 from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry
 from memslicer.msl.writer import MSLWriter

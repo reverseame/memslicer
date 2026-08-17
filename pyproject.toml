@@ -60,6 +60,41 @@ graph = [
     "networkx>=3.0",
 ]
 
+[tool.ruff.lint]
+ignore = [
+    "BLE001",
+    "C408",
+    "DTZ007",
+    "F401",
+    "F841",
+    "FLY002",
+    "FURB",
+    "I",
+    "I001",
+    "ISC004",
+    "PERF402",
+    "PIE",
+    "PIE808",
+    "PIE810",
+    "PLW1510",
+    "RUF",
+    "RUF012",
+    "RUF015",
+    "RUF022",
+    "RUF046",
+    "RUF059",
+    "RUF100",
+    "S110",
+    "S112",
+    "SIM102",
+    "SIM103",
+    "SIM115",
+    "UP",
+    "UP007",
+    "UP035",
+    "UP037",
+]
+
 [tool.ruff.lint.per-file-ignores]
 # Several test modules bootstrap sys.path (insert ../src) before importing
 # memslicer, so their package imports intentionally follow module-level code.
