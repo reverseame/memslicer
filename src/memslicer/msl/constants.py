@@ -36,7 +36,20 @@ FLAG_REDACTED: int = 0x0008        # bit 3
 # ---------------------------------------------------------------------------
 # Format version
 # ---------------------------------------------------------------------------
-VERSION: tuple[int, int] = (1, 0)
+VERSION: tuple[int, int] = (1, 1)
+
+# ---------------------------------------------------------------------------
+# Thread Context flags (spec Section 5.7)
+# ---------------------------------------------------------------------------
+# Thread-level Flags field (Table 19a)
+THREAD_FLAG_CURRENT: int = 0x0001   # bit 0: resumption thread (PC of interest)
+THREAD_FLAG_CRASHED: int = 0x0002   # bit 1
+
+# Per-register Flags field (Table 19b)
+REG_FLAG_PC: int = 0x0001     # bit 0: program counter
+REG_FLAG_SP: int = 0x0002     # bit 1: stack pointer
+REG_FLAG_FP: int = 0x0004     # bit 2: frame pointer
+REG_FLAG_FLAGS: int = 0x0008  # bit 3: flags/status register
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +126,16 @@ class BlockType(IntEnum):
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
     PointerGraph = 0x1003
+
+
+class ThreadState(IntEnum):
+    """Scheduling state of a captured thread (spec Section 5.7, Table 19a)."""
+
+    Unknown = 0x00
+    Running = 0x01
+    Sleeping = 0x02
+    Stopped = 0x03
+    Waiting = 0x04
 
 
 class CompAlgo(IntEnum):

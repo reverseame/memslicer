@@ -2,9 +2,8 @@
 import struct
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -71,7 +70,6 @@ class TestDecodeProcNetAddr:
 
     def test_ipv4_matches_struct_chain(self):
         """Verify output matches the struct pack/unpack chain directly."""
-        import struct
         hex_addr = "0100007F"
         host_int = int(hex_addr, 16)
         expected = struct.pack(

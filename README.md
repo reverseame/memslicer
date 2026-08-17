@@ -22,6 +22,16 @@ A memory acquisition tool that captures process memory snapshots into the MSL (M
 - Companion log file captures all debug output regardless of verbosity flag
 - Cross-platform OS information collection for forensic context
 
+**Analyzing slices** (see [Emulating & analyzing slices](#emulating--analyzing-slices)):
+
+- **Emulator** (`memslicer-emu`, Unicorn + Capstone): single-step and **reverse execution**, multi-arch
+- **Per-thread emulation**: list captured threads and seed from any of them
+- **Vector/FP registers** (XMM/YMM) seeded at full width for SIMD/crypto code
+- **fs/gs base & Windows TEB/PEB** resolution for TLS / PEB-relative accesses
+- **Self-modifying-code / unpacking** detection — flags write-then-execute and dumps the recovered payload
+- **Symbolic execution** (angr) and a **behavior graph** (control flow + syscalls/APIs)
+- **radare2 plugins** to open, inspect (maps, symbols, PE exports) and emulated-debug a slice
+
 ---
 
 ## Installation
@@ -364,6 +374,264 @@ Progress: [##################################################] 100.00% Complete
 
 ---
 
+## Emulating & analyzing slices
+
+When a slice captures thread registers (the default; disable with
+`--no-registers`), its execution can be *advanced by emulation* — a slice is a
+static snapshot, so there is no live process to step.
+
+### Built-in emulator (`memslicer-emu`)
+
+A first-party emulator built on [Unicorn](https://www.unicorn-engine.org/) +
+[Capstone](https://www.capstone-engine.org/). Install the extra and step:
+
+```bash
+pip install memslicer[emu]
+
+memslicer-emu dump.msl --steps 5 -r
+#   arch    : x86_64
+#   entry   : 0x401000
+#   0x00401000  mov rax, 1    [rax=0x1 rip=0x401007]
+#   0x00401007  mov rbx, 2    [rbx=0x2 rip=0x40100e]
+#   ...
+```
+
+It is also usable as a library for programmatic / differential analysis:
+
+```python
+from memslicer.emu import open_slice
+emu = open_slice("dump.msl")        # registers seeded from the Thread Context
+emu.step()
+print(hex(emu.read_reg("rax")))
+print(hex(emu.read_reg("xmm0")))    # vector/FP registers (XMM/YMM) too
+emu.step_back()                     # reverse execution (undo the last step)
+```
+
+Captured **vector/FP registers** (XMM/YMM/...) are seeded at full width when the
+slice carries them, so SIMD/crypto code emulates from the real CPU state.
+
+It also supports **reverse execution** (`emu.step_back()`, or `--back N` on the
+CLI): a CPU-context snapshot plus a memory-write journal per step lets it undo
+instructions, reverting both registers and memory.
+
+**Self-modifying code / unpacking.** The emulator tracks every byte the code
+writes and flags when execution enters previously-written memory — the moment a
+packer jumps into its decoded payload. Recover that payload to disk:
+
+```bash
+memslicer-emu packed.msl -u 0x401000 --dump-written ./unpacked
+#   [self-modifying code: 1 write-then-execute site(s)]
+#     W->X @ 0x000000401020
+#   [wrote 1 dirtied range(s) to ./unpacked]
+#     0x000000401020-0x000000402000  0xfe0 bytes (executed)  -> ./unpacked/written_0x401020_0x402000.bin
+```
+
+```python
+emu.step_until(0x401000)
+emu.self_modified_exec()    # [0x401020] — addresses run from written memory
+emu.written_ranges()        # coalesced dirtied byte ranges
+emu.dump_written("out/")    # write each range out (executed ones = the payload)
+```
+
+**Parked in a syscall.** A process is often captured blocked in a library/kernel
+call (a `Sleep`, a wait, a `recv`), so the captured PC sits in `ntdll`/`kernel`
+and stepping forward would hit a syscall the emulator can't service. Unwind back
+to your own code with `--resume-from-syscall` (`-R`): it scans the stack for the
+caller's return address into the program image and continues there as if the
+call had returned.
+
+```bash
+memslicer-emu parked.msl -R --until 0xb1070 -r
+#   [resume-from-syscall] pc = 0x7c90e514  (ntdll.dll+0x...)
+#     caller return @ 0xb3275  (sample.exe)  [stack 0x..., depth 3]
+#     resumed: pc -> 0xb3275, esp -> 0x...
+```
+
+For a stdcall API that cleans up its own arguments (e.g. `Sleep`'s `ret 4`), add
+`--pop-bytes N` so the caller's stack is left balanced. Override the auto-detected
+image with `--image-range LO:HI`. As a library:
+
+```python
+emu.in_system_call()        # True — PC is outside the program image
+frame = emu.resume_from_syscall(pop_bytes=4)   # find caller, reposition pc/sp
+emu.pc == frame.return_addr  # now back in the image; keep stepping
+```
+
+A slice can capture **more than one thread** (one Thread Context block each).
+By default the emulator seeds from the Current thread, but any captured thread
+can be selected:
+
+```bash
+memslicer-emu dump.msl --list-threads   # list captured threads (Current = '*')
+memslicer-emu dump.msl --thread 200 -s 5 -r   # emulate thread tid=200 instead
+```
+
+```python
+emu = open_slice("dump.msl", thread=200)   # seed from tid 200
+emu.switch_thread(100)                      # re-seed from another thread later
+```
+
+**Segment bases & Windows TEB/PEB.** Captured `fs_base` / `gs_base` are seeded,
+so TEB/PEB- and TLS-relative accesses (`gs:[...]` on x64, `fs:[...]` on x86)
+resolve during emulation:
+
+```python
+emu.segment_base("gs")      # captured GS base (TEB on Windows x64)
+emu.peb_address()           # follow gs:[0x60] / fs:[0x30] to the Windows PEB
+```
+
+On Windows the Frida backend recovers each thread's TEB (via
+`NtQueryInformationThread`) and records it as `gs_base` (x64) / `fs_base` (x86),
+since the CPU context alone carries no segment base. On x86 the emulator installs
+a synthetic GDT for the captured base (32-bit `FS`/`GS` can't be set as a
+register), so SEH prologues that read `fs:[0]` emulate correctly.
+
+### Symbolic execution (angr)
+
+Load a slice into [angr](https://angr.io) for symbolic execution from the exact
+captured point — the memory and a thread's registers become an angr `SimState`
+(the Current thread by default; `load_angr(..., thread=tid)` selects another):
+
+```bash
+pip install memslicer[symbex]
+memslicer-symbex dump.msl --find 0x401050 --avoid 0x401080
+```
+
+```python
+from memslicer.symbex import load_angr
+project, state = load_angr("dump.msl")     # state at the captured PC
+simgr = project.factory.simgr(state)
+simgr.explore(find=0x401050)
+```
+
+### Behavior graph (`memslicer-behavior`)
+
+Emulate a slice and extract a **behavior graph** — control flow (basic blocks
+or instructions) plus the system interactions (syscalls / APIs) the code
+performs — for graph-based dynamic analysis:
+
+```bash
+pip install memslicer[emu]
+
+# 1. discover which system calls the code makes
+memslicer-behavior dump.msl --emit-stubs stubs.py -o graph.dot
+
+# 2. edit stubs.py so each call returns what your investigation needs,
+#    then re-run with the edited stubs
+memslicer-behavior dump.msl --stubs stubs.py -o graph.json
+```
+
+A static snapshot has no OS, so system calls cannot be truly executed. Each one
+is modelled by an analyst-editable **stub** (the Speakeasy/Qiling approach): the
+first run auto-generates a skeleton (one function per observed call, pre-filled
+with the observed arguments); you fill in the bodies to return handles, buffers
+or errors and `--stubs` reloads them so emulation advances down the path of
+interest. Output is JSON (node-link) or Graphviz DOT; granularity switches
+between basic blocks and instructions with `--granularity`.
+
+**API calls** are handled the same way: when a call lands on a module's export
+it is resolved to `module!Export`, intercepted, routed to the same stub registry
+(Win64/SysV calling conventions), recorded as a behavior node and returned to
+the caller — so the API body is never emulated. Both **PE exports** (Windows)
+and **ELF `.dynsym` / PLT-GOT imports** (Linux) are resolved; the latter uses
+the captured process's already-bound GOT, so `call func@plt` resolves to the
+owning library's `lib!symbol`. Other addresses are labelled `module+offset`, and
+syscalls are named from per-architecture Linux tables.
+
+**Bundled stub library.** Instead of writing stubs by hand you can start from a
+curated, categorized library covering the APIs malware most often touches
+(file / network / registry / process / memory / library / crypto / system).
+Each stub decodes its interesting arguments, logs them readably, and returns a
+plausible value (a fresh handle, an allocation address, success) so emulation
+keeps advancing. `--stublib` enables it; `--stubs` merges your edits on top:
+
+```bash
+memslicer-behavior dump.msl --stublib -o graph.json              # bundled stubs
+memslicer-behavior dump.msl --stublib --stubs mine.py -o g.json  # + overrides
+```
+
+Every syscall / API node carries a **behavior category**, so the graph groups
+by what the code *does*, not just which symbol it called.
+
+**Data-flow edges.** A lightweight value-equality taint links calls causally:
+a `dataflow` edge when one call's return value is later passed as an argument
+(the handle `CreateFile` returns, consumed by `WriteFile`; the address
+`VirtualAlloc` returns, written by `WriteProcessMemory`), and a `buffer` edge
+when two calls share the same pointer/handle argument (`ReadFile` fills a
+buffer, `send` ships it). Both run automatically for either backend.
+
+**Memory annotations** (`--memory`, on by default). Writes into executable
+memory — unpacking, self-modifying code, code injection — are flagged (the
+writing block is highlighted), every write is bucketed by its target region
+type (heap / stack / image / …), and statically-RWX regions are listed under
+`meta.memory`.
+
+**Dynamic call graph** (`--call-graph`). Overlays function nodes and
+`call`/`ret` edges (a shadow call stack tracks the current function) on top of
+the basic-block CFG.
+
+**High-fidelity Windows emulation (Speakeasy).** For Windows, `--backend
+speakeasy` drives [Speakeasy](https://github.com/mandiant/speakeasy) — built on
+the same Unicorn engine but shipping hundreds of real API handlers plus
+PEB/TEB, the object manager and a fake filesystem/registry/network — and
+projects its emulation onto the same behavior graph. Your `--stublib`/`--stubs`
+stubs still override individual handlers when you want to steer a path:
+
+```bash
+pip install 'memslicer[speakeasy]'   # git head; the PyPI release pins unicorn 1.x
+memslicer-behavior dump.msl --backend speakeasy -o graph.json
+```
+
+**Export & features.** The graph serializes to JSON, Graphviz DOT, **GraphML**
+and **GEXF** (`-f`, or inferred from the `.json`/`.dot`/`.graphml`/`.gexf`
+extension; the XML formats need no extra dependency). `--features` writes a
+fixed-key numeric **feature vector** (node/edge counts by kind/type, calls per
+category, memory and data-flow tallies) ready to stack into an ML matrix.
+`BehaviorGraph.to_networkx()` returns a live `MultiDiGraph` with the optional
+`graph` extra.
+
+For deeper analysis you can also hand a *live* emulator off to angr
+(concrete → symbolic) and let angr's SimOS model the OS from that point on:
+
+```python
+from memslicer.emu import open_slice
+from memslicer.symbex import handoff_to_angr
+emu = open_slice("dump.msl")
+for _ in range(20):
+    emu.step()                       # run concretely to a point of interest
+project, state = handoff_to_angr(emu)  # continue symbolically from here
+simgr = project.factory.simgr(state)
+```
+
+```python
+from memslicer.behavior import trace_slice
+graph = trace_slice("dump.msl")            # registers seeded, hooks installed
+print(graph.meta, len(graph.nodes), graph.events)
+open("graph.dot", "w").write(graph.to_dot())
+```
+
+### radare2 plugins
+
+A slice can also be opened in [radare2](https://github.com/radareorg/radare2)
+via the `io.msl` / `bin.msl` / `debug.msl` / `core.msl` plugins:
+
+```bash
+r2 dump.msl                          # static analysis: maps, arch, entrypoint
+r2 -qc 'il; is' dump.msl             # modules (libraries) and symbols / PE exports
+r2 -D msl -d msl://dump.msl          # emulated debugging: ds / dr step via ESIL
+#   > dpt        list captured threads     > dpt=<tid>   switch the seeded thread
+```
+
+The plugins live in [radareorg/radare2-extras](https://github.com/radareorg/radare2-extras)
+under `msl/` (see its `README.md`). `bin.msl` exposes captured modules as
+libraries and symbols, including PE export tables so call targets are named;
+`debug.msl` lists/selects threads (`dpt`). The `msl://` io plugin decodes lz4
+slices; zstd slices are not decodable by radare2 (no zstd) — use `-c lz4`/
+`-c none` or `memslicer-emu`. Encrypted slices are not supported by the
+plugins. `memslicer-emu` handles both zstd and lz4.
+
+---
+
 ## Architecture
 
 ```
@@ -433,6 +701,40 @@ pytest --cov=memslicer --cov-report=term-missing
 ruff check src/
 ruff format src/
 ```
+
+CI (`.github/workflows/tests.yml`) runs `ruff` and the test suite on every pull
+request and on pushes to `main`, across Python 3.10 and 3.12.
+
+### Releasing
+
+Releases are automated by `.github/workflows/publish.yml`, triggered by the
+**version in `pyproject.toml`**. To cut a release:
+
+1. Bump `version` under `[project]` in `pyproject.toml` (e.g. `0.2.7` → `0.2.8`).
+2. Open a PR and merge it to `main`.
+
+On that push to `main` the workflow:
+
+1. Detects that the version changed (compares `pyproject.toml` at `HEAD` vs
+   `HEAD~1`; merges that don't change the version skip publishing entirely).
+2. Runs the test suite on Python 3.10–3.12.
+3. Builds the sdist + wheel and publishes to PyPI via OIDC **trusted
+   publishing** (no API token stored).
+4. Creates and pushes the `vX.Y.Z` git tag.
+
+A separate workflow (`changelog.yml`) regenerates the `CHANGELOG.md` section for
+the new version from the commit messages since the previous tag.
+
+**Before the first PyPI release, two things must be set up:**
+
+- **PyPI trusted publisher** — configure it once at pypi.org → *memslicer* →
+  *Publishing*: owner `reverseame`, repository `memslicer`, workflow
+  `publish.yml`, environment `pypi`. Without it the publish step fails at the
+  OIDC token exchange (`invalid-publisher`).
+- **The `speakeasy` extra** — it pins a direct git source, and PyPI rejects
+  distributions that declare direct-reference (`@ git+https://…`) dependencies.
+  Drop or rework that extra (e.g. document installing Speakeasy manually) before
+  publishing, otherwise the upload is rejected even after OIDC is configured.
 
 ---
 

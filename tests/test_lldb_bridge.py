@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from memslicer.acquirer.bridge import MemoryRange, ModuleInfo, PlatformInfo
+from memslicer.acquirer.bridge import PlatformInfo
 from memslicer.acquirer.platform_detect import parse_lldb_triple
 from memslicer.msl.constants import ArchType, OSType
 

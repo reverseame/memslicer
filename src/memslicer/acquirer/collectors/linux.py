@@ -6,10 +6,24 @@ import hashlib
 import logging
 import os
 import re
-import struct
 import sys
 import time
-from pathlib import Path
+
+from memslicer.acquirer.collectors._io import read_proc_file, read_symlink
+from memslicer.acquirer.elf_notes import parse_elf_notes
+from memslicer.acquirer.collectors.addr_utils import (
+    decode_proc_net_ipv4,
+    decode_proc_net_ipv6,
+)
+from memslicer.acquirer.collectors.constants import (
+    AF_INET, AF_INET6, AF_UNIX, PROTO_TCP, PROTO_UDP,
+    HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE,
+)
+from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, KernelModuleRow, PersistenceManifest, PersistenceRow,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,22 +68,6 @@ def redact_environ(raw: bytes) -> tuple[str, list[str]]:
         else:
             sanitized.append(text)
     return "\x00".join(sanitized), redacted
-
-from memslicer.acquirer.collectors._io import read_proc_file, read_symlink
-from memslicer.acquirer.elf_notes import parse_elf_notes
-from memslicer.acquirer.collectors.addr_utils import (
-    decode_proc_net_ipv4,
-    decode_proc_net_ipv6,
-)
-from memslicer.acquirer.collectors.constants import (
-    AF_INET, AF_INET6, AF_UNIX, PROTO_TCP, PROTO_UDP,
-    HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE,
-)
-from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import (
-    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
-    KernelModuleList, KernelModuleRow, PersistenceManifest, PersistenceRow,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -2006,7 +2004,6 @@ class LinuxCollector:
         text = self._read_file_text(self._proc_modules)
         if not text:
             return []
-        rows: list[tuple[int, int, int, int, int]] = []  # type: ignore[assignment]
         parsed: list[tuple[str, int, int, int, int]] = []
         state_map = {"Live": 1, "Loading": 2, "Unloading": 3}
         for line in text.splitlines():
@@ -2024,12 +2021,10 @@ class LinuxCollector:
             state_code = state_map.get(state_str, 0)
             base = 0
             if len(parts) > 5:
-                base_s = parts[-1]
+                # The address field is always hex; int(_, 16) accepts it with or
+                # without the "0x" prefix. It is 0 when kptr_restrict redacts it.
                 try:
-                    if base_s.startswith("0x") or base_s.startswith("0X"):
-                        base = int(base_s, 16)
-                    else:
-                        base = int(base_s, 16)
+                    base = int(parts[-1], 16)
                 except ValueError:
                     base = 0
             parsed.append((name, size, refcount, state_code, base))
@@ -2076,10 +2071,6 @@ class LinuxCollector:
         the kernel too — there's nothing the collector can say about it.
         """
         proc_rows = self._parse_proc_modules()
-        proc_map: dict[str, tuple[int, int, int, int]] = {
-            name: (size, refcount, state, base)
-            for (name, size, refcount, state, base) in proc_rows
-        }
         sysfs_map = self._read_sysfs_modules()
 
         rows: list[KernelModuleRow] = []

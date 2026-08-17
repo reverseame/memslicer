@@ -26,7 +26,7 @@ def test_block_header_size():
 
 
 def test_version():
-    assert VERSION == (1, 0)
+    assert VERSION == (1, 1)
 
 
 def test_endianness_values():

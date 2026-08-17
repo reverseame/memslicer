@@ -41,11 +41,8 @@ from memslicer.acquirer.os_detail import (
     parse_os_detail,
     system_info_to_fields,
 )
-from memslicer.msl.constants import OSType
 from memslicer.msl.types import (
     ConnectionEntry,
-    HandleEntry,
-    ProcessEntry,
 )
 
 

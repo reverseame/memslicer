@@ -2,6 +2,11 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The 'speakeasy' extra pins a git source (the PyPI release is unusable here),
+# which hatchling treats as a direct reference and rejects unless allowed.
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [project]
 name = "memslicer"
 version = "0.2.7"
@@ -22,6 +27,9 @@ dependencies = [
 memslicer = "memslicer.cli:cli"
 memslicer-sysctx = "memslicer.cli_sysctx:main"
 memslicer-enrich = "memslicer.cli_enrich:main"
+memslicer-emu = "memslicer.cli_emu:main"
+memslicer-symbex = "memslicer.cli_symbex:main"
+memslicer-behavior = "memslicer.cli_behavior:main"
 
 [project.optional-dependencies]
 dev = [
@@ -33,6 +41,29 @@ dev = [
 pretty = [
     "rich>=13.0",
 ]
+emu = [
+    "unicorn>=2.0",
+    "capstone>=5.0",
+]
+symbex = [
+    "angr>=9.2",
+]
+speakeasy = [
+    # High-fidelity Windows API emulation. The PyPI release pins unicorn 1.x
+    # (incompatible with the emu extra and Python 3.12); the git head supports
+    # unicorn>=2.1 and Python>=3.10.
+    "speakeasy-emulator @ git+https://github.com/mandiant/speakeasy.git",
+]
+graph = [
+    # Optional: BehaviorGraph.to_networkx(). GraphML/GEXF export are
+    # dependency-free, so networkx is only needed for the live nx object.
+    "networkx>=3.0",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Several test modules bootstrap sys.path (insert ../src) before importing
+# memslicer, so their package imports intentionally follow module-level code.
+"tests/*" = ["E402"]
 
 [tool.pytest.ini_options]
 markers = [

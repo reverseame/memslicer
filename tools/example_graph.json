@@ -1,0 +1,71 @@
+{
+  "meta": {
+    "arch": "x86",
+    "bits": 32,
+    "os": "windows",
+    "backend": "speakeasy",
+    "entry": "0x40b724",
+    "steps": 1842
+  },
+  "nodes": [
+    {"id": "0x40b724", "kind": "block", "label": "0x40b724 entry", "addr": 4241188, "hits": 1, "attrs": {}},
+    {"id": "0x40b740", "kind": "block", "label": "0x40b740 unpack_loop", "addr": 4241216, "hits": 256, "attrs": {"writes_exec": 256}},
+    {"id": "0x41c000", "kind": "block", "label": "0x41c000 oep", "addr": 4308992, "hits": 1, "attrs": {}},
+    {"id": "sub_41c100", "kind": "func", "label": "sub_41c100 install", "addr": 4309248, "hits": 1, "attrs": {}},
+    {"id": "sub_41c400", "kind": "func", "label": "sub_41c400 scan_loop", "addr": 4310016, "hits": 1, "attrs": {}},
+    {"id": "sub_41c900", "kind": "func", "label": "sub_41c900 exfil", "addr": 4311296, "hits": 1, "attrs": {}},
+
+    {"id": "CreateMutexA", "kind": "api", "label": "kernel32!CreateMutexA", "addr": 0, "hits": 1, "attrs": {"category": "process", "name": "Alina"}},
+    {"id": "RegSetValueExA", "kind": "api", "label": "advapi32!RegSetValueExA", "addr": 0, "hits": 1, "attrs": {"category": "registry", "value": "Run\\\\jucheck"}},
+    {"id": "CopyFileA", "kind": "api", "label": "kernel32!CopyFileA", "addr": 0, "hits": 1, "attrs": {"category": "file"}},
+
+    {"id": "CreateToolhelp32Snapshot", "kind": "api", "label": "kernel32!CreateToolhelp32Snapshot", "addr": 0, "hits": 1, "attrs": {"category": "process"}},
+    {"id": "Process32Next", "kind": "api", "label": "kernel32!Process32Next", "addr": 0, "hits": 4, "attrs": {"category": "process"}},
+    {"id": "OpenProcess", "kind": "api", "label": "kernel32!OpenProcess", "addr": 0, "hits": 3, "attrs": {"category": "process"}},
+    {"id": "ReadProcessMemory", "kind": "api", "label": "kernel32!ReadProcessMemory", "addr": 0, "hits": 12, "attrs": {"category": "memory"}},
+
+    {"id": "InternetConnectA", "kind": "api", "label": "wininet!InternetConnectA", "addr": 0, "hits": 1, "attrs": {"category": "network", "host": "panel.example.tld"}},
+    {"id": "HttpOpenRequestA", "kind": "api", "label": "wininet!HttpOpenRequestA", "addr": 0, "hits": 1, "attrs": {"category": "network", "path": "/gate.php"}},
+    {"id": "HttpSendRequestA", "kind": "api", "label": "wininet!HttpSendRequestA", "addr": 0, "hits": 1, "attrs": {"category": "network"}},
+
+    {"id": "0x40b9a0", "kind": "insn", "label": "0x40b9a0 syscall", "addr": 4241312, "hits": 1, "attrs": {}},
+    {"id": "NtProtectVirtualMemory", "kind": "syscall", "label": "NtProtectVirtualMemory", "addr": 0, "hits": 1, "attrs": {"category": "memory", "nr": 80}}
+  ],
+  "links": [
+    {"source": "0x40b724", "target": "0x40b740", "type": "fallthrough", "count": 1},
+    {"source": "0x40b740", "target": "0x40b740", "type": "jump", "count": 255},
+    {"source": "0x40b740", "target": "0x40b9a0", "type": "fallthrough", "count": 1},
+    {"source": "0x40b9a0", "target": "NtProtectVirtualMemory", "type": "syscall", "count": 1},
+    {"source": "0x40b9a0", "target": "0x41c000", "type": "jump", "count": 1},
+
+    {"source": "0x41c000", "target": "sub_41c100", "type": "call", "count": 1},
+    {"source": "sub_41c100", "target": "CreateMutexA", "type": "invoke", "count": 1},
+    {"source": "sub_41c100", "target": "CopyFileA", "type": "invoke", "count": 1},
+    {"source": "sub_41c100", "target": "RegSetValueExA", "type": "invoke", "count": 1},
+    {"source": "sub_41c100", "target": "0x41c000", "type": "ret", "count": 1},
+
+    {"source": "0x41c000", "target": "sub_41c400", "type": "call", "count": 1},
+    {"source": "sub_41c400", "target": "CreateToolhelp32Snapshot", "type": "invoke", "count": 1},
+    {"source": "sub_41c400", "target": "Process32Next", "type": "invoke", "count": 4},
+    {"source": "sub_41c400", "target": "OpenProcess", "type": "invoke", "count": 3},
+    {"source": "sub_41c400", "target": "ReadProcessMemory", "type": "invoke", "count": 12},
+    {"source": "CreateToolhelp32Snapshot", "target": "OpenProcess", "type": "dataflow", "count": 1, "value": "snapshot"},
+    {"source": "OpenProcess", "target": "ReadProcessMemory", "type": "dataflow", "count": 1, "value": "hProcess"},
+    {"source": "sub_41c400", "target": "0x41c000", "type": "ret", "count": 1},
+
+    {"source": "0x41c000", "target": "sub_41c900", "type": "call", "count": 1},
+    {"source": "sub_41c900", "target": "InternetConnectA", "type": "invoke", "count": 1},
+    {"source": "sub_41c900", "target": "HttpOpenRequestA", "type": "invoke", "count": 1},
+    {"source": "sub_41c900", "target": "HttpSendRequestA", "type": "invoke", "count": 1},
+    {"source": "InternetConnectA", "target": "HttpOpenRequestA", "type": "dataflow", "count": 1, "value": "hConnect"},
+    {"source": "HttpOpenRequestA", "target": "HttpSendRequestA", "type": "dataflow", "count": 1, "value": "hRequest"},
+    {"source": "ReadProcessMemory", "target": "HttpSendRequestA", "type": "buffer", "count": 1, "value": "track2"},
+    {"source": "sub_41c900", "target": "0x41c000", "type": "ret", "count": 1}
+  ],
+  "events": [
+    {"seq": 1, "kind": "syscall", "name": "NtProtectVirtualMemory", "site": "0x40b9a0", "category": "memory"},
+    {"seq": 2, "kind": "api", "name": "CreateMutexA", "site": "sub_41c100", "category": "process"},
+    {"seq": 3, "kind": "api", "name": "ReadProcessMemory", "site": "sub_41c400", "category": "memory"},
+    {"seq": 4, "kind": "api", "name": "HttpSendRequestA", "site": "sub_41c900", "category": "network"}
+  ]
+}

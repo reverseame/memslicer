@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import io
 import struct
-import uuid
 
 from memslicer.msl.constants import (
     BLOCK_HEADER_SIZE,
@@ -260,8 +259,6 @@ def test_module_list_index_manifest():
 
         ok_manifest = manifest_entry["path_len"] == expected_path_len
         ok_block = mod_payload["path_len"] == expected_path_len
-        is_not_padded_manifest = manifest_entry["path_len"] != padded_len or expected_path_len == padded_len
-        is_not_padded_block = mod_payload["path_len"] != padded_len or expected_path_len == padded_len
 
         results.append(
             (

@@ -274,7 +274,6 @@ def test_existing_parser_reads_new_os_detail():
     """
     from memslicer.acquirer.os_detail import pack_os_detail, parse_os_detail
     from memslicer.msl.types import SystemContext
-    from memslicer.utils.padding import pad8
 
     # Realistic enrichment payload. Every key exercises a different
     # field-ordering bucket so a mis-order would be visible as a diff.

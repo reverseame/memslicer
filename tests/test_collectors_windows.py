@@ -1,5 +1,4 @@
 """Tests for WindowsCollector (Windows investigation data collection)."""
-import os
 import sys
 import subprocess
 from pathlib import Path

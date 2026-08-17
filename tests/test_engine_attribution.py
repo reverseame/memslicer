@@ -33,7 +33,6 @@ from memslicer.acquirer.engine import AcquisitionEngine
 from memslicer.acquirer.identity import (
     AttributionConfig,
     ForensicStringError,
-    TargetIdentity,
     resolve_target_identity,
     validate_forensic_string,
 )
@@ -41,7 +40,6 @@ from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.acquirer.os_detail import parse_os_detail
 from memslicer.acquirer.bridge import MemoryRange
 from memslicer.msl.constants import BlockType
-from memslicer.msl.types import ProcessEntry, ConnectionEntry, HandleEntry
 
 
 # Pull the MockBridge / MockCollector from test_engine.py — no point

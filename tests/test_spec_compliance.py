@@ -10,7 +10,6 @@ import io
 import struct
 import uuid
 
-import blake3
 import pytest
 
 from memslicer.msl.writer import MSLWriter
@@ -20,12 +19,11 @@ from memslicer.msl.types import (
     KeyHint, ImportProvenance, RelatedDump,
 )
 from memslicer.msl.constants import (
-    FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
-    BLOCK_HEADER_SIZE, HASH_SIZE,
-    BlockType, CompAlgo, OSType, ArchType, PageState, RegionType,
+    BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
+    BLOCK_HEADER_SIZE, BlockType, CompAlgo, OSType, ArchType, PageState, RegionType,
     Endianness, ClockSource,
     FLAG_ENCRYPTED, FLAG_REDACTED,
-    COMPRESSED, COMPALGO_MASK,
+    COMPRESSED,
 )
 from memslicer.msl.compression import decompress
 from memslicer.utils.timestamps import now_ns

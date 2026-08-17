@@ -23,7 +23,7 @@ from memslicer.msl.constants import (
     PageState,
     RegionType,
 )
-from memslicer.msl.iterator import BlockRecord, iterate_blocks
+from memslicer.msl.iterator import iterate_blocks
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,

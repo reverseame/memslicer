@@ -29,6 +29,20 @@ def test_zstd_empty():
     assert decompress(compressed, CompAlgo.ZSTD) == b""
 
 
+def test_lz4_trailing_padding_with_size():
+    """The block writer pads (UncompressedSize + lz4-block) to 8 bytes, so the
+    payload reaching decompress() can carry up to 7 trailing bytes. With the
+    known uncompressed_size, decompress() must strip them and still decode.
+    Regression for the "insufficient space in destination buffer" read bug.
+    """
+    data = bytes(range(256)) * 64 + b"\x00" * 40  # 16424 B, like a real region
+    compressed = compress(data, CompAlgo.LZ4)
+    for pad in range(8):
+        padded = compressed + b"\x00" * pad
+        out = decompress(padded, CompAlgo.LZ4, uncompressed_size=len(data))
+        assert out == data, f"failed with {pad} trailing pad bytes"
+
+
 def test_lz4_empty():
     compressed = compress(b"", CompAlgo.LZ4)
     assert decompress(compressed, CompAlgo.LZ4) == b""

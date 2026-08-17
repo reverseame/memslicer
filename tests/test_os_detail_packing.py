@@ -16,7 +16,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.os_detail import (
     DELIMITER,
-    FIELD_ORDER,
     HARD_CAP_BYTES,
     SCHEMA_PREFIX,
     SOFT_BUDGET_BYTES,
@@ -86,7 +85,8 @@ class TestPackBasics:
         kv = out.split(DELIMITER, 1)[1]
         # distro MUST come before kernel, which MUST come before arch, which
         # MUST come before hw_vendor, which MUST come before ram.
-        idx = lambda k: kv.index(k + "=")
+        def idx(k):
+            return kv.index(k + "=")
         assert idx("distro") < idx("kernel") < idx("arch")
         assert idx("hw_vendor") < idx("ram")
 

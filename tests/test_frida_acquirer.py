@@ -1,13 +1,10 @@
 """Tests for Frida acquirer with mocked Frida session."""
-import io
 import logging
 import logging.handlers
 import struct
 import sys
-from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
-import pytest
 
 # Ensure 'frida' is available as a mock in sys.modules so that
 # FridaBridge.connect() can do ``import frida as _frida`` without
@@ -21,8 +18,7 @@ _frida_mock.InvalidOperationError = type(
 sys.modules.setdefault("frida", _frida_mock)
 
 from memslicer.msl.constants import (
-    FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE,
-    BlockType,
+    FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BlockType,
 )
 from memslicer.acquirer.frida_acquirer import FridaAcquirer
 from memslicer.acquirer.engine import classify_region, volatility_key
@@ -805,7 +801,7 @@ class TestAddressNormalization:
         bridge._api = api
 
         # Call read_memory with an int address — bridge normalizes to hex
-        result = bridge.read_memory(0x10000, 4096)
+        bridge.read_memory(0x10000, 4096)
 
         # Verify read_memory was called with a hex string, not an int
         api.read_memory.assert_called_once_with("0x10000", 4096)

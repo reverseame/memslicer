@@ -24,7 +24,7 @@ from memslicer.msl.types import (
 
 from memslicer.acquirer.collectors.constants import (
     AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
-    HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE, HT_REGISTRY,
+    HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_DEVICE, HT_REGISTRY,
 )
 
 # netstat state mapping
@@ -306,7 +306,6 @@ class WindowsCollector:
         GetCurrentProcess = kernel32.GetCurrentProcess
 
         PROCESS_DUP_HANDLE = 0x0040
-        DUPLICATE_SAME_ACCESS = 0x0002
         ObjectTypeInformation = 2
 
         proc_handle = OpenProcess(PROCESS_DUP_HANDLE, False, pid)
@@ -927,7 +926,6 @@ class WindowsCollector:
             # CSV columns: "Image Name","PID","Session Name","Session#","Mem Usage",...
             exe_name = row[0] if len(row) > 0 else ""
             pid = int(row[1]) if len(row) > 1 else 0
-            session_id = int(row[3]) if len(row) > 3 else 0
             # Memory column has "K" suffix: "1,234 K"
             mem_str = row[4].replace(",", "").replace(" K", "").strip() if len(row) > 4 else "0"
             rss = int(mem_str) * 1024 if mem_str.isdigit() else 0

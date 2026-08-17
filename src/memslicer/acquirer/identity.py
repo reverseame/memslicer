@@ -27,7 +27,7 @@ import logging
 import socket
 import sys
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, TypeVar
 
 from memslicer.msl.constants import OSType

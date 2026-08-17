@@ -1,13 +1,11 @@
 """Tests for AndroidCollector – SELinux fallbacks and system properties."""
 from __future__ import annotations
 
-import os
 import sys
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))

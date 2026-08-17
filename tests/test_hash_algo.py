@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import struct
 import sys
 from pathlib import Path
 
@@ -24,10 +23,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.msl.constants import HashAlgo, HASH_SIZE
 from memslicer.msl.integrity import IntegrityChain, make_hasher
-from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity
+from memslicer.msl.types import FileHeader, ProcessIdentity
 from memslicer.msl.writer import MSLWriter
 from memslicer.msl.iterator import iterate_blocks, read_hash_algo
-from memslicer.msl.constants import CompAlgo, PageState
 
 
 # ---------------------------------------------------------------------------

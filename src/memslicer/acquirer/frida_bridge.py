@@ -5,13 +5,78 @@ import logging
 from typing import Any
 
 from memslicer.acquirer.bridge import (
-    DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo,
+    MemoryRange, ModuleInfo, PlatformInfo,
+    RegisterValue, ThreadInfo, register_role, register_width_bytes,
+    vector_register_width,
 )
 from memslicer.acquirer.platform_detect import detect_platform
 
 
 # Frida JS script for RPC exports
 _FRIDA_SCRIPT = """\
+// Resolve an export across Frida API generations (instance vs. legacy static).
+function _resolveExport(mod, name) {
+    try {
+        var m = Process.findModuleByName(mod);
+        if (m) {
+            if (typeof m.findExportByName === 'function') {
+                var p = m.findExportByName(name);
+                if (p) return p;
+            }
+            if (typeof m.getExportByName === 'function') {
+                try { return m.getExportByName(name); } catch (e) {}
+            }
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.findExportByName === 'function') {
+            var p2 = Module.findExportByName(mod, name);
+            if (p2) return p2;
+        }
+    } catch (e) {}
+    try {
+        if (typeof Module.getExportByName === 'function') {
+            return Module.getExportByName(mod, name);
+        }
+    } catch (e) {}
+    return null;
+}
+
+// Build a per-thread TEB resolver on Windows. Frida's CpuContext carries no
+// segment base, so the TEB/PEB and TLS anchor is otherwise lost; we recover it
+// via NtQueryInformationThread(ThreadBasicInformation).TebBaseAddress. Returns
+// null on non-Windows or when the needed exports are unavailable.
+function _makeTebResolver() {
+    if (Process.platform !== 'windows') return null;
+    var pOpen = _resolveExport('kernel32.dll', 'OpenThread');
+    var pQuery = _resolveExport('ntdll.dll', 'NtQueryInformationThread');
+    var pClose = _resolveExport('kernel32.dll', 'CloseHandle');
+    if (!pOpen || !pQuery || !pClose) return null;
+    var OpenThread = new NativeFunction(pOpen, 'pointer', ['uint32', 'int', 'uint32']);
+    var NtQueryInformationThread = new NativeFunction(
+        pQuery, 'int', ['pointer', 'int', 'pointer', 'uint32', 'pointer']);
+    var CloseHandle = new NativeFunction(pClose, 'int', ['pointer']);
+    var THREAD_QUERY_INFORMATION = 0x0040;
+    var ThreadBasicInformation = 0;
+    var psize = Process.pointerSize;
+    // THREAD_BASIC_INFORMATION: NTSTATUS ExitStatus; PVOID TebBaseAddress; ...
+    // TebBaseAddress sits at offset == pointerSize (NTSTATUS padded to align).
+    var bufLen = (psize === 8) ? 48 : 28;
+    return function (tid) {
+        var h = OpenThread(THREAD_QUERY_INFORMATION, 0, tid);
+        if (h.isNull()) return null;
+        try {
+            var buf = Memory.alloc(bufLen);
+            var status = NtQueryInformationThread(
+                h, ThreadBasicInformation, buf, bufLen, NULL);
+            if (status !== 0) return null;
+            return buf.add(psize).readPointer();
+        } finally {
+            CloseHandle(h);
+        }
+    };
+}
+
 rpc.exports = {
     enumerateRanges: function(prot) {
         return Process.enumerateRanges(prot);
@@ -29,6 +94,58 @@ rpc.exports = {
     },
     enumerateModules: function() {
         return Process.enumerateModules();
+    },
+    enumerateThreads: function() {
+        // Frida exposes CpuContext registers as NON-enumerable accessor
+        // properties, so `for..in` / Object.keys yield nothing even though the
+        // context is populated (read by name, e.g. raw.eip, works). Iterate an
+        // explicit per-arch register-name list; keep a `for..in` pass as a
+        // fallback for builds that DO expose them enumerably.
+        var REG_NAMES = {
+            ia32: ["pc","sp","eax","ecx","edx","ebx","esp","ebp","esi","edi","eip"],
+            x64:  ["pc","sp","rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","rip",
+                   "r8","r9","r10","r11","r12","r13","r14","r15"],
+            arm:  ["pc","sp","lr","cpsr","r0","r1","r2","r3","r4","r5","r6","r7",
+                   "r8","r9","r10","r11","r12"],
+            arm64:["pc","sp","fp","lr","nzcv",
+                   "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11",
+                   "x12","x13","x14","x15","x16","x17","x18","x19","x20","x21",
+                   "x22","x23","x24","x25","x26","x27","x28"]
+        };
+        var names = REG_NAMES[Process.arch] || [];
+        // CpuContext exposes no segment base; recover the TEB on Windows and
+        // surface it as gs_base (x64) / fs_base (ia32) so the emulator can seed
+        // segment-relative (TEB/PEB, TLS) access.
+        var tebResolver = _makeTebResolver();
+        var segBaseReg = (Process.arch === 'x64') ? 'gs_base' : 'fs_base';
+        return Process.enumerateThreads().map(function(t) {
+            var ctx = {};
+            var raw = t.context || {};
+            // Primary: CpuContext serializes its registers via toJSON, which
+            // for..in / Object.keys miss; JSON captures them all (any arch).
+            try {
+                var j = JSON.parse(JSON.stringify(raw));
+                for (var jk in j) {
+                    var jv = j[jk];
+                    ctx[jk] = (jv && jv.toString) ? jv.toString() : String(jv);
+                }
+            } catch (e) {}
+            // Fallback: explicit per-arch names by direct (by-name) access.
+            for (var i = 0; i < names.length; i++) {
+                var k = names[i];
+                if (ctx[k] !== undefined) continue;
+                var v = raw[k];
+                if (v === undefined || v === null) continue;
+                try { ctx[k] = v.toString(); } catch (e) { ctx[k] = String(v); }
+            }
+            if (tebResolver && ctx[segBaseReg] === undefined) {
+                try {
+                    var teb = tebResolver(t.id);
+                    if (teb && !teb.isNull()) ctx[segBaseReg] = teb.toString();
+                } catch (e) {}
+            }
+            return {id: t.id, state: t.state, context: ctx};
+        });
     },
     getPlatform: function() {
         return Process.platform;
@@ -197,6 +314,58 @@ class FridaBridge:
             )
             for m in raw
         ]
+
+    # Frida thread.state strings -> MSL ThreadState codes (spec Table 19a).
+    _STATE_MAP = {
+        "running": 1, "stopped": 3, "waiting": 4,
+        "uninterruptible": 4, "halted": 3,
+    }
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Enumerate threads with register state via Frida RPC.
+
+        Frida exposes both arch-specific names (``rip``/``rsp``) and the
+        generic ``pc``/``sp`` aliases. On x86/x86_64 the generic aliases
+        duplicate ``rip``/``rsp``/``eip``/``esp`` and are dropped; on
+        AArch64 ``pc``/``sp`` ARE the canonical names and are kept.
+        """
+        try:
+            raw = self._api.enumerate_threads()
+        except Exception as exc:
+            self._log.warning("Thread enumeration failed: %s", exc)
+            return []
+
+        arch = self._platform_info.arch if self._platform_info else None
+        width = register_width_bytes(arch) if arch is not None else 8
+
+        threads: list[ThreadInfo] = []
+        for idx, t in enumerate(raw):
+            ctx = t.get("context", {}) or {}
+            names = set(ctx)
+            drop_pc = bool(names & {"rip", "eip"})
+            drop_sp = bool(names & {"rsp", "esp"})
+            regs: list[RegisterValue] = []
+            for name, val in ctx.items():
+                if name == "pc" and drop_pc:
+                    continue
+                if name == "sp" and drop_sp:
+                    continue
+                try:
+                    ival = _parse_frida_addr(val)
+                except (TypeError, ValueError):
+                    continue
+                regs.append(RegisterValue(
+                    name=name, value=ival,
+                    size=vector_register_width(name) or width,
+                    role=register_role(name),
+                ))
+            threads.append(ThreadInfo(
+                tid=t.get("id", 0),
+                registers=regs,
+                is_current=(idx == 0),
+                state=self._STATE_MAP.get(t.get("state", ""), 0),
+            ))
+        return threads
 
     def read_memory(self, address: int, size: int) -> bytes | None:
         """Read memory via Frida RPC. Returns None on failure."""

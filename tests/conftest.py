@@ -5,7 +5,7 @@ import pytest
 import uuid
 from unittest.mock import MagicMock
 
-from memslicer.msl.constants import OSType, ArchType, CompAlgo, PageState, RegionType
+from memslicer.msl.constants import OSType, ArchType, PageState, RegionType
 from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry
 from memslicer.utils.timestamps import now_ns
 
