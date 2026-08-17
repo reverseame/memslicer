@@ -275,11 +275,11 @@ memslicer-behavior dump.msl --arg0 "S3cr3tKey!" -g block -o graph.dot
 
 Open [`tools/graph_viewer.html`](tools/graph_viewer.html) in any web browser (`file://` supported) and drag & drop your generated `graph.json` file. It renders an interactive 2D D3.js visualization with HTML5 disassembly cards, color-coded branching, search, and filtering options.
 
-## 🧠 Symbolic Execution & Analysis (`memslicer-symbex`)
+## Symbolic Execution & Analysis (`memslicer-symbex`)
 
 `MemSlicerRev` integrates an advanced symbolic execution bridge powered by `angr` to explore execution paths, deobfuscate memory, and solve path constraints directly from `.msl` snapshot files.
 
-### 🚀 CLI Usage
+### CLI Usage
 
 ```powershell
 python -m memslicer.cli_symbex <dump.msl> --find <TARGET_ADDR> --avoid <FAIL_ADDR> [OPTIONS]
