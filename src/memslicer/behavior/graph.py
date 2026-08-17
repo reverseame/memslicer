@@ -221,7 +221,7 @@ class BehaviorGraph:
         for edge in self.edges.values():
             etype = edge["type"]
             count = edge.get("count", 1)
-            label = edge.get("label", "")
+            label = edge.get("label") or (f"{etype} {edge['value']}" if etype in ("dataflow", "buffer") and "value" in edge else edge.get("value", ""))
             if count > 1:
                 label = f"{label} (x{count})" if label else f"x{count}"
 
@@ -234,7 +234,7 @@ class BehaviorGraph:
             elif etype == "jump_false":
                 attrs.extend(['color="#c62828"', 'fontcolor="#c62828"', 'penwidth=1.8'])
             elif etype == "dataflow":
-                attrs.extend(['color="#e5484d"', 'fontcolor="#e5484d"', 'penwidth=2.0'])
+                attrs.extend(['color=red', 'fontcolor=red', 'penwidth=2.0'])
             elif etype == "buffer":
                 attrs.extend(['color="#f57c00"', 'fontcolor="#f57c00"', 'style=dashed', 'penwidth=1.5', 'constraint=false'])
             elif etype in ("invoke", "syscall"):
