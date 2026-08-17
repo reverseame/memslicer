@@ -2,11 +2,11 @@
 import sys
 import os
 from unittest.mock import MagicMock
+import pytest
 
-# Garantizar que el directorio Tests esté en sys.path
+pytest.importorskip("angr")
+
 sys.path.insert(0, os.path.dirname(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Tests")))
-
 from inspector import universal_provenance_inspector
 
 

@@ -1,8 +1,10 @@
 """Unit and benchmark test suite for anti-analysis and anti-debugging bypass module."""
 import os
 import sys
-import angr
-import claripy
+import pytest
+
+angr = pytest.importorskip("angr")
+claripy = pytest.importorskip("claripy")
 
 from memslicer.symbex.anti_analysis import (
     SimIsDebuggerPresent,
