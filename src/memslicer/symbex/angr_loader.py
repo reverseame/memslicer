@@ -68,6 +68,7 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
     """
     try:
         import angr
+        import claripy
     except ImportError as exc:
         raise SymbexError(
             "symbolic execution requires the 'symbex' extra: "
@@ -142,35 +143,154 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
         for reg in sel.registers:
             try:
                 setattr(state.regs, reg.name, reg.value)
-            except Exception:
-                pass
+            except Exception as exc:
+                # A captured register from the real dump silently not applied
+                # means the state diverges from what was actually on the
+                # machine — worth a warning, not just a swallowed exception.
+                logger.warning("[angr_loader] Failed to seed captured register '%s'=0x%x: %s", reg.name, reg.value, exc)
             reg_lower = reg.name.lower()
-            if reg_lower in ("gs_base", "gs", "gs_const"):
+            # angr exposes the full segment base as plain `gs`/`fs` on both
+            # X86 and AMD64 — `gs_base`/`gs_const`/`gs_offset`/`fs_base`/... do
+            # not exist as state.regs attributes on either arch, so a capture
+            # using one of those names must be normalized onto `gs`/`fs`
+            # itself instead of being silently dropped (previously this branch
+            # zeroed gs/fs and then tried only the nonexistent names, which
+            # discarded the real captured segment base).
+            if reg_lower in ("gs_base", "gs", "gs_const", "gs_offset") and hasattr(state.regs, "gs"):
                 try:
-                    state.regs.gs = 0
-                except Exception:
-                    pass
-                for rname in ("gs_base", "gs_const", "gs_offset"):
-                    if hasattr(state.regs, rname):
-                        try:
-                            setattr(state.regs, rname, claripy.BVV(reg.value, 64))
-                        except Exception:
-                            pass
-            elif reg_lower in ("fs_base", "fs", "fs_const"):
+                    state.regs.gs = claripy.BVV(reg.value, state.regs.gs.length)
+                except Exception as exc:
+                    logger.warning("[angr_loader] Failed to seed gs=0x%x from captured '%s': %s", reg.value, reg.name, exc)
+            elif reg_lower in ("fs_base", "fs", "fs_const", "fs_offset") and hasattr(state.regs, "fs"):
                 try:
-                    state.regs.fs = 0
-                except Exception:
-                    pass
-                for rname in ("fs_base", "fs_const", "fs_offset"):
-                    if hasattr(state.regs, rname):
-                        try:
-                            setattr(state.regs, rname, claripy.BVV(reg.value, 32))
-                        except Exception:
-                            pass
+                    state.regs.fs = claripy.BVV(reg.value, state.regs.fs.length)
+                except Exception as exc:
+                    logger.warning("[angr_loader] Failed to seed fs=0x%x from captured '%s': %s", reg.value, reg.name, exc)
 
     register_exported_symbols(project, symbol_map)
 
+    # Stash the captured module list (base/size/path per loaded DLL) so callers
+    # that need to resolve a real API address (e.g. anti_analysis's hooking)
+    # can walk each module's PE export table directly from captured memory —
+    # CLE only ever loads the single region containing the entry point as a
+    # real object, so find_symbol()/hook_symbol() cannot see any other DLL's
+    # exports on a real multi-module dump.
+    state.globals["msl_modules"] = list(getattr(image, "modules", []) or [])
+
     return project, state
+
+
+def _read_cstr(state: angr.SimState, addr: int, max_len: int = 256) -> bytes | None:
+    """Reads a NUL-terminated ASCII string from concrete memory. Returns None on
+    any failure (unmapped page, symbolic content, etc.) instead of raising.
+    """
+    try:
+        raw = state.solver.eval(state.memory.load(addr, max_len), cast_to=bytes)
+    except Exception:
+        return None
+    end = raw.find(b"\x00")
+    return raw[:end] if end != -1 else raw
+
+
+def resolve_pe_export(
+    state: angr.SimState,
+    modules: list,
+    dll_candidates: list[str],
+    export_name: str,
+) -> int | None:
+    """Resolves *export_name* to its real virtual address by walking the PE
+    export directory of each module in *modules* whose basename matches one
+    of *dll_candidates* (case-insensitive), reading the PE headers and export
+    tables directly out of captured memory (``state.memory``). Every matching
+    module is tried in turn — a name matching multiple candidates (e.g. both
+    "kernel32.dll" and "ntdll.dll" are valid candidates for an API, but only
+    one of them actually exports it) must not stop at the first match if that
+    module simply doesn't have the requested export.
+
+    Because each module was captured already loaded/rebased, RVAs in its PE
+    headers map directly onto ``module.base + rva`` — no raw-file-offset
+    translation is needed, unlike parsing a PE straight off disk.
+
+    Returns the resolved address, or None if no candidate module exports it
+    or the headers aren't fully present in the captured pages.
+    """
+    candidates_lower = {c.lower() for c in dll_candidates}
+    endness = state.arch.memory_endness
+
+    def read_uint(addr: int, size: int) -> int:
+        # state.memory.load() defaults to big-endian interpretation regardless
+        # of target arch — MUST pass the arch's real endness (little-endian on
+        # x86/AMD64) or every multi-byte integer comes out byte-reversed.
+        return state.solver.eval(state.memory.load(addr, size, endness=endness))
+
+    def search_module(base: int, mod_name: str) -> int | None:
+        try:
+            dos_magic = state.solver.eval(state.memory.load(base, 2), cast_to=bytes)
+            if dos_magic != b"MZ":
+                return None
+            e_lfanew = read_uint(base + 0x3C, 4)
+            pe_off = base + e_lfanew
+
+            pe_magic = state.solver.eval(state.memory.load(pe_off, 4), cast_to=bytes)
+            if pe_magic != b"PE\x00\x00":
+                return None
+
+            # IMAGE_FILE_HEADER starts right after the PE signature (20 bytes);
+            # SizeOfOptionalHeader is the last field, offset +16 within it).
+            file_hdr = pe_off + 4
+            opt_hdr = file_hdr + 20
+            opt_magic = read_uint(opt_hdr, 2)
+            if opt_magic == 0x20B:      # PE32+ (x64)
+                data_dir_off = opt_hdr + 112
+            elif opt_magic == 0x10B:    # PE32 (x86)
+                data_dir_off = opt_hdr + 96
+            else:
+                return None
+
+            export_rva = read_uint(data_dir_off, 4)
+            export_size = read_uint(data_dir_off + 4, 4)
+            if not export_rva or not export_size:
+                return None  # no export table (common for .exe modules)
+
+            export_dir = base + export_rva
+            num_names = read_uint(export_dir + 24, 4)
+            addr_functions = base + read_uint(export_dir + 28, 4)
+            addr_names = base + read_uint(export_dir + 32, 4)
+            addr_ordinals = base + read_uint(export_dir + 36, 4)
+
+            target_bytes = export_name.encode("ascii")
+            for i in range(num_names):
+                name_rva = read_uint(addr_names + i * 4, 4)
+                name_bytes = _read_cstr(state, base + name_rva, max_len=len(target_bytes) + 1)
+                if name_bytes == target_bytes:
+                    ordinal = read_uint(addr_ordinals + i * 2, 2)
+                    func_rva = read_uint(addr_functions + ordinal * 4, 4)
+                    # A func_rva landing inside the export directory itself isn't
+                    # code — it's a forwarder string (e.g. "KERNELBASE.NtQueryInformationProcess")
+                    # telling the loader to resolve this import elsewhere. Hooking
+                    # it would install a SimProcedure somewhere real callers never
+                    # actually reach (their IAT is resolved straight through to the
+                    # forward target at load time), so treat it as not-found here
+                    # and let the caller fall back to the next DLL candidate.
+                    if export_rva <= func_rva < export_rva + export_size:
+                        logger.debug(
+                            "[angr_loader] '%s' in '%s' is a forwarder (rva=0x%x); skipping",
+                            export_name, mod_name, func_rva,
+                        )
+                        return None
+                    return base + func_rva
+            return None
+        except Exception as exc:
+            logger.debug("[angr_loader] PE export resolution for '%s' in '%s' failed: %s", export_name, mod_name, exc)
+            return None
+
+    for mod in modules:
+        name = getattr(mod, "name", "") or ""
+        if name.lower() in candidates_lower:
+            addr = search_module(mod.base, name)
+            if addr is not None:
+                return addr
+    return None
 
 
 def extract_exported_symbols(project: angr.Project) -> dict[str, tuple[int, int]]:
@@ -302,6 +422,7 @@ def handoff_to_angr(emu):
     """
     try:
         import angr
+        import claripy
     except ImportError as exc:
         raise SymbexError(
             "symbolic execution requires the 'symbex' extra: "
@@ -344,22 +465,28 @@ def handoff_to_angr(emu):
             except Exception as exc:
                 logger.warning("[angr_loader] Failed to copy live memory at 0x%x in handoff: %s", paddr, exc)
 
-    # Seed the *live* register file from the emulator.
+    # Seed the *live* register file from the emulator. Most emulator register
+    # names are expected to miss angr's regs (aliases, sub-registers, arch
+    # variants) so failures here are routine — logged at debug, not warning.
     for name, value in emu.registers().items():
         try:
             setattr(state.regs, name, value)
-        except Exception:  # noqa: BLE001 - unknown/aliased register name
-            pass
+        except Exception as exc:  # noqa: BLE001 - unknown/aliased register name
+            logger.debug("[angr_loader] Live register '%s'=0x%x not applicable to angr regs: %s", name, value, exc)
         reg_lower = name.lower()
-        if reg_lower in ("gs_base", "gs") and hasattr(state.regs, "gs_base"):
+        # angr exposes the full segment base as plain `gs`/`fs`, not
+        # `gs_base`/`fs_base` (that attribute doesn't exist on X86 or AMD64),
+        # so normalize onto the real attribute instead of a no-op guarded by
+        # a hasattr() that was always False.
+        if reg_lower in ("gs_base", "gs") and hasattr(state.regs, "gs"):
             try:
-                state.regs.gs_base = value
-            except Exception:
-                pass
-        elif reg_lower in ("fs_base", "fs") and hasattr(state.regs, "fs_base"):
+                state.regs.gs = claripy.BVV(value, state.regs.gs.length)
+            except Exception as exc:
+                logger.warning("[angr_loader] Failed to set gs=0x%x in handoff: %s", value, exc)
+        elif reg_lower in ("fs_base", "fs") and hasattr(state.regs, "fs"):
             try:
-                state.regs.fs_base = value
-            except Exception:
-                pass
+                state.regs.fs = claripy.BVV(value, state.regs.fs.length)
+            except Exception as exc:
+                logger.warning("[angr_loader] Failed to set fs=0x%x in handoff: %s", value, exc)
 
     return project, state

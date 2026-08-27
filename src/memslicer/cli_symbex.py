@@ -225,6 +225,30 @@ def _addrs(values):
     return [_parse_addr(v) for v in values]
 
 
+def _prune_avoided(simgr: Any, avoid_addrs: set, avoid_module_addrs: set) -> int:
+    """Moves any active state sitting on an avoided address/module page into the
+    'avoid' stash. Shared between --find/--find-rax-success and --steps so that
+    --avoid/--avoid-module behave identically (and honestly) in both modes.
+    Returns the number of states pruned.
+    """
+    pruned = 0
+    if avoid_addrs:
+        avoided = [s for s in simgr.active if s.addr in avoid_addrs]
+        for s in avoided:
+            simgr.active.remove(s)
+            simgr.stashes.setdefault("avoid", []).append(s)
+        pruned += len(avoided)
+
+    if avoid_module_addrs:
+        avoided_mods = [s for s in simgr.active if (s.addr & ~0xFFF) in avoid_module_addrs or s.addr in avoid_module_addrs]
+        for s in avoided_mods:
+            simgr.active.remove(s)
+            simgr.stashes.setdefault("avoid", []).append(s)
+        pruned += len(avoided_mods)
+
+    return pruned
+
+
 def _get_buffer_address(
     state: Any,
     fallback_addr: int = 0x7FFF00000000,
@@ -274,7 +298,7 @@ def _get_buffer_address(
 @click.option("-b", "--binary-key", "binary_key", is_flag=True, help="Inject unconstrained raw byte buffer (not restricted to printable ASCII 0x20-0x7E)")
 @click.option("--buffer-addr", "buffer_addr_str", help="Explicit virtual address or custom fallback for injected symbolic buffer (e.g. 0x50000000)")
 @click.option("-m", "--avoid-module", "avoid_modules", multiple=True, help="Module name or address range to avoid (repeatable)")
-@click.option("-r", "--find-rax-success", is_flag=True, help="Find paths where function return value (RAX) equals 1")
+@click.option("-r", "--find-rax-success", is_flag=True, help="Find paths where function return value (RAX) equals 1 post-return. Meaningful for license/key-check style targets; against generic real-world code almost any reachable function can trivially return 1, so a match here is not evidence of anything specific — use --find ADDR instead when you have a real target address")
 @click.option("-f", "--find", multiple=True, help="Address(es) to reach (repeatable)")
 @click.option("-a", "--avoid", multiple=True, help="Address(es) to avoid (repeatable)")
 @click.option("-s", "--steps", type=int, default=0, help="Symbolic steps to run when no --find is given")
@@ -448,6 +472,10 @@ def main(
 
         if find_rax_success:
             click.echo("\n[+] Searching for path where RAX == 1 (symbolic satisfiability post-return)...")
+            click.echo(" [!] Note: RAX==1 is trivially reachable in most real-world code - this mode is")
+            click.echo("     only meaningful against license/key-check style targets. Against a generic")
+            click.echo("     dump, a match is not evidence of anything; prefer --find ADDR if you have")
+            click.echo("     a specific target address.")
         else:
             click.echo(f"\n[+] Searching for target address(es): {[hex(a) for a in target_addrs]}...")
 
@@ -505,17 +533,7 @@ def main(
                 break
 
             # 2. Prune/transfer avoided states AFTER checking found condition
-            if avoid_addrs:
-                avoided = [s for s in simgr.active if s.addr in avoid_addrs]
-                for s in avoided:
-                    simgr.active.remove(s)
-                    simgr.stashes.setdefault("avoid", []).append(s)
-
-            if avoid_module_addrs:
-                avoided_mods = [s for s in simgr.active if (s.addr & ~0xFFF) in avoid_module_addrs or s.addr in avoid_module_addrs]
-                for s in avoided_mods:
-                    simgr.active.remove(s)
-                    simgr.stashes.setdefault("avoid", []).append(s)
+            _prune_avoided(simgr, avoid_addrs, avoid_module_addrs)
 
             pcs_str = ", ".join([f"{s.addr:#x}" for s in simgr.active[:4]])
             if len(simgr.active) > 4:
@@ -580,6 +598,12 @@ def main(
                         break
                 else:
                     break
+
+            # Prune avoided states before stepping — --avoid/--avoid-module must
+            # be honored here too, not just in --find/--find-rax-success mode.
+            _prune_avoided(simgr, avoid_addrs, avoid_module_addrs)
+            if not simgr.active:
+                break
 
             pcs_str = ", ".join([f"{s.addr:#x}" for s in simgr.active[:4]])
             if len(simgr.active) > 4:

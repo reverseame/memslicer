@@ -151,7 +151,12 @@ def classify_state_error(error_record: angr.sim_manager.ErrorRecord) -> tuple[st
 # ----------------------------------------------------------------------
 
 def _is_page_mapped(memory, addr: int) -> bool:
-    """Checks if a virtual memory address is mapped in angr's SimMemory."""
+    """Checks if a virtual memory address is mapped in angr's SimMemory.
+    NOTE: a False here (including on lookup failure) is treated by callers as
+    license to map_region() over this address, which would clobber real data
+    if it was in fact already mapped — so a lookup exception is logged, not
+    just swallowed.
+    """
     try:
         fn = getattr(memory, "is_mapped", None)
         if callable(fn):
@@ -159,8 +164,8 @@ def _is_page_mapped(memory, addr: int) -> bool:
         if hasattr(memory, "permissions"):
             perm = memory.permissions(addr)
             return perm is not None
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[unmapped_handler] is_mapped check failed for 0x%x, assuming unmapped: %s", addr, exc)
     return False
 
 
@@ -378,8 +383,8 @@ def _on_mem_read(state: angr.SimState) -> None:
         if isinstance(read_len, claripy.ast.Base):
             read_len = state.solver.eval(read_len)
         _ensure_page_mapped(state, read_addr, access_size=int(read_len or 1), is_code=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[unmapped_handler] _on_mem_read hook failed at 0x%x: %s", state.addr, exc)
 
 
 def _on_mem_write(state: angr.SimState) -> None:
@@ -393,8 +398,8 @@ def _on_mem_write(state: angr.SimState) -> None:
         if isinstance(write_len, claripy.ast.Base):
             write_len = state.solver.eval(write_len)
         _ensure_page_mapped(state, write_addr, access_size=int(write_len or 1), is_code=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[unmapped_handler] _on_mem_write hook failed at 0x%x: %s", state.addr, exc)
 
 
 def _on_instruction(state: angr.SimState) -> None:
@@ -402,8 +407,8 @@ def _on_instruction(state: angr.SimState) -> None:
     try:
         pc = state.addr
         _ensure_page_mapped(state, pc, access_size=1, is_code=True, fault_addr=pc)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[unmapped_handler] _on_instruction hook failed at 0x%x: %s", state.addr, exc)
 
 
 # ----------------------------------------------------------------------
