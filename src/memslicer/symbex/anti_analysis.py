@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import angr
 import claripy
+
+from memslicer.symbex.angr_loader import resolve_pe_export
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -85,8 +91,8 @@ def mask_peb_anti_debug(state: angr.SimState, peb_base: int | None = None) -> No
                         if teb_val and teb_val >= 0x10000:
                             teb_base = teb_val
                             break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("[anti_analysis] Failed to read %s for dynamic TEB resolution: %s", reg_name, exc)
 
             if teb_base is not None:
                 peb_ptr_offset = 0x60 if is_64bit else 0x30
@@ -96,8 +102,8 @@ def mask_peb_anti_debug(state: angr.SimState, peb_base: int | None = None) -> No
                     )
                     if peb_ptr and peb_ptr >= 0x10000:
                         peb_base = peb_ptr
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("[anti_analysis] Failed to read PEB pointer from TEB+0x%x: %s", peb_ptr_offset, exc)
 
         # Default Fallback TEB / PEB base if unassigned (0x7FFFFEF0000 matches
         # angr's conventional default TEB region on x64)
@@ -114,31 +120,31 @@ def mask_peb_anti_debug(state: angr.SimState, peb_base: int | None = None) -> No
                 claripy.BVV(peb_base, 64 if is_64bit else 32),
                 endness=state.arch.memory_endness
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[anti_analysis] Failed to write TEB->PEB pointer at 0x%x: %s", teb_base + peb_ptr_offset, exc)
 
         if is_64bit:
             try:
                 state.regs.gs = 0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[anti_analysis] Failed to zero gs selector: %s", exc)
             for reg_name in ("gs_const", "gs_base", "gs_offset"):
                 if hasattr(state.regs, reg_name):
                     try:
                         setattr(state.regs, reg_name, claripy.BVV(teb_base, 64))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("[anti_analysis] Failed to set %s = 0x%x: %s", reg_name, teb_base, exc)
         else:
             try:
                 state.regs.fs = 0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("[anti_analysis] Failed to zero fs selector: %s", exc)
             for reg_name in ("fs_const", "fs_base", "fs_offset"):
                 if hasattr(state.regs, reg_name):
                     try:
                         setattr(state.regs, reg_name, claripy.BVV(teb_base, 32))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("[anti_analysis] Failed to set %s = 0x%x: %s", reg_name, teb_base, exc)
 
         # Overwrite BeingDebugged = 0 (Byte at offset 0x02)
         state.memory.store(peb_base + 0x02, claripy.BVV(0, 8))
@@ -162,11 +168,11 @@ def mask_peb_anti_debug(state: angr.SimState, peb_base: int | None = None) -> No
                 heap_flags_offset = 0x70 if is_64bit else 0x40
                 state.memory.store(proc_heap_addr + heap_flags_offset, claripy.BVV(2, 32), endness=state.arch.memory_endness)
                 state.memory.store(proc_heap_addr + heap_flags_offset + 4, claripy.BVV(0, 32), endness=state.arch.memory_endness)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[anti_analysis] Failed to mask ProcessHeap flags at PEB+0x%x: %s", proc_heap_ptr_offset, exc)
 
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[anti_analysis] mask_peb_anti_debug aborted for peb_base=%s (bypass NOT applied): %s", peb_base, exc)
 
 
 # ----------------------------------------------------------------------
@@ -188,19 +194,42 @@ def apply_anti_analysis_bypass(project: angr.Project, state: angr.SimState, peb_
 
     loader = getattr(project, "loader", None)
     find_sym = getattr(loader, "find_symbol", None) if loader is not None else None
+    dll_candidates = ["kernel32.dll", "ntdll.dll", "kernelbase.dll",
+                       "KERNEL32.DLL", "NTDLL.DLL", "KERNELBASE.DLL"]
 
     for api_name, procedure in api_hooks.items():
+        hooked = False
+
         if find_sym is not None and find_sym(api_name) is not None:
             try:
                 project.hook_symbol(api_name, procedure)
+                hooked = True
             except Exception:
                 pass
 
-        for dll in ["kernel32.dll", "ntdll.dll", "KERNEL32.DLL", "NTDLL.DLL"]:
+        for dll in dll_candidates:
             sym_name = f"{dll}!{api_name}"
             if find_sym is not None and find_sym(sym_name) is not None:
                 try:
                     project.hook_symbol(sym_name, procedure)
+                    hooked = True
                 except Exception:
                     pass
+
+        # Fallback for real multi-module dumps: CLE only ever loads the single
+        # region containing the captured PC as a real object, so find_symbol()
+        # never sees another DLL's exports there. If the .msl recorded the
+        # module list (real captures do), resolve the API's address directly
+        # from the PE export table in captured memory and hook by address.
+        if not hooked:
+            modules = state.globals.get("msl_modules")
+            if modules:
+                addr = resolve_pe_export(state, modules, dll_candidates, api_name)
+                if addr is not None:
+                    try:
+                        if not project.is_hooked(addr):
+                            project.hook(addr, procedure)
+                        logger.info("[anti_analysis] Hooked %s at 0x%x via PE export table (no CLE symbol available)", api_name, addr)
+                    except Exception as exc:
+                        logger.debug("[anti_analysis] Failed to hook %s at resolved address 0x%x: %s", api_name, addr, exc)
 
