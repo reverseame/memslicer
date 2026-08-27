@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 
 from memslicer.acquirer.bridge import (
@@ -111,6 +112,24 @@ class GDBBridge:
                         )
                         return pid
             except (subprocess.TimeoutExpired, ValueError, OSError):
+                pass
+
+        # Windows tasklist fallback
+        if sys.platform == "win32":
+            try:
+                res = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    parts = res.stdout.strip().split(",")
+                    if len(parts) >= 2:
+                        pid_str = parts[1].strip('"')
+                        if pid_str.isdigit():
+                            pid = int(pid_str)
+                            logger.info("Resolved process '%s' to PID %d via tasklist", name, pid)
+                            return pid
+            except Exception:
                 pass
 
         raise ValueError(

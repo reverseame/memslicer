@@ -9,5 +9,18 @@ The captured memory and the Current thread's registers are loaded into an angr
 can start from the exact point the slice was taken.
 """
 from memslicer.symbex.angr_loader import load_angr, handoff_to_angr, SymbexError
+from memslicer.symbex.unmapped_handler import (
+    enable_unmapped_memory_recovery,
+    premap_stack_region,
+    repair_errored_states,
+)
 
-__all__ = ["load_angr", "handoff_to_angr", "SymbexError"]
+__all__ = [
+    "load_angr",
+    "handoff_to_angr",
+    "SymbexError",
+    "enable_unmapped_memory_recovery",
+    "premap_stack_region",
+    "repair_errored_states",
+]
+
