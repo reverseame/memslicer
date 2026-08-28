@@ -24,6 +24,20 @@ from memslicer.behavior.stubs import StubRegistry, make_api_context
 from memslicer.emu.engine import MSLEmulator, open_slice
 from memslicer.msl.constants import ArchType
 
+# Exports that end the current process/thread: once one is called there is no
+# return address left to follow, so the trace is over. Reaching one is a normal
+# end of run, not a fault.
+#
+# TerminateProcess/TerminateThread are deliberately NOT here: they take a target
+# handle and are routinely used on *another* process, after which execution
+# continues normally. Only unambiguous self-terminators belong in this set.
+# _cexit is excluded for the same reason -- it runs atexit handlers and returns.
+_TERMINATORS = frozenset({
+    "exit", "_exit", "quick_exit", "exit_group", "abort",   # C runtime / libc
+    "exitprocess", "exitthread",                            # kernel32
+    "rtlexituserprocess", "rtlexituserthread",              # ntdll
+})
+
 
 class BehaviorTracer:
     def __init__(self, emu: MSLEmulator, *, granularity: str = "block",
@@ -137,6 +151,14 @@ class BehaviorTracer:
         if result == ctx.STOP:
             self.stop("api stub requested stop")
             return
+        if bare.lower() in _TERMINATORS:
+            # Deliberately no _return_from_api(): the process/thread is gone, so
+            # the slot we would pop holds whatever the capture happened to have
+            # there (typically 0). Following it walks into thread-teardown code,
+            # which reports a spurious UC_ERR_FETCH_UNMAPPED and appends API
+            # nodes for calls the program never made.
+            self.stop(f"exit: {name}")
+            return
         self._return_from_api()
 
     def _return_from_api(self) -> None:
@@ -184,6 +206,14 @@ class BehaviorTracer:
                 self.graph.meta.setdefault("stop_reason", "max_steps reached")
             break
         self.graph.meta["steps"] = self._steps
+        # Provenance: did the trace consume stack we invented rather than
+        # captured? A non-zero count means some values in this graph are zero
+        # fill, so the run may have diverged from the real process.
+        invented = getattr(self.emu, "synthetic_read_count", None)
+        if callable(invented):
+            self.graph.meta["synthetic_stack_reads"] = invented()
+            self.graph.meta["synthetic_stack_read_sites"] = len(
+                {pc for pc, _, _ in self.emu.synthetic_reads()})
         self.graph.meta["last_pc"] = f"0x{self.emu.pc:x}"
         self.graph.meta["dataflow_edges"] = link_dataflow(self.graph)
         return self.graph

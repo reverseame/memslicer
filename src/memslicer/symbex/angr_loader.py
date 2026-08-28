@@ -177,6 +177,14 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
     # exports on a real multi-module dump.
     state.globals["msl_modules"] = list(getattr(image, "modules", []) or [])
 
+    # Stash live-acquired KeyHints (0x0020) so cli_symbex can auto-target the
+    # symbolic buffer at real captured key material instead of guessing
+    # RBP-0x40/RSP+0x20. Only hints that resolved to an absolute address (their
+    # owning region was actually captured) are useful for injection; keep the
+    # full list here and let the caller filter, so a diagnostic can still report
+    # an unresolved hint rather than have it silently vanish.
+    state.globals["msl_key_hints"] = list(getattr(image, "key_hints", []) or [])
+
     return project, state
 
 

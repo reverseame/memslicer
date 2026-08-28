@@ -5,13 +5,17 @@ Unicorn and Capstone are imported lazily so that importing
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from memslicer.msl.constants import ArchType, OSType
 from memslicer.emu.loader import EmuModule, EmuThread, SliceImage, load_slice
 from memslicer.utils.protection import PROT_X
 
+logger = logging.getLogger(__name__)
+
 _UC_PAGE = 0x1000
+_PREMAP_STACK_MB = 64        # default stack pre-map window (see _premap_stack_region)
 
 
 class EmuError(RuntimeError):
@@ -104,13 +108,18 @@ def _coalesce(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 class MSLEmulator:
     """Emulate an :class:`SliceImage` with Unicorn."""
 
-    def __init__(self, image: SliceImage, thread: "int | EmuThread | None" = None):
+    def __init__(self, image: SliceImage, thread: "int | EmuThread | None" = None,
+                 premap_stack_mb: int = _PREMAP_STACK_MB):
         """Build an emulator for *image*.
 
         *thread* selects which captured thread to seed the CPU from: ``None``
         uses the Current thread (the default), otherwise pass a captured thread
         id or an :class:`EmuThread`. Use :meth:`switch_thread` to re-seed from
         another thread later.
+
+        *premap_stack_mb* sizes the zero-filled RW window pre-mapped around the
+        captured stack pointer (see :meth:`_premap_stack_region`); pass 0 to
+        map only what the slice captured.
         """
         try:
             import unicorn  # noqa: F401
@@ -138,6 +147,23 @@ class MSLEmulator:
 
         self._mapped: list[tuple[int, int]] = []  # coalesced mapped spans
         self._seg_bases: dict[str, int] = {}       # x86 fs/gs base (GDT-seeded)
+        self._premap_stack_mb = premap_stack_mb
+        self._pending = None      # write log of the in-progress step
+        # Self-modifying-code tracking: every [addr, addr+size) the emulated code
+        # writes is recorded, and executing an address that was previously written
+        # is flagged as a write-then-execute (W->X) event -- the moment a packer
+        # jumps into its freshly decoded payload.
+        self._written = []        # list of [start, end) byte ranges written
+        self._written_pages: set[int] = set()   # page numbers the code has written
+        self._wx_events = []      # PCs where execution entered written memory
+        self._wx_seen = set()
+        # Stack we invented rather than captured (see _premap_stack_region) and
+        # the reads that came back with a value we made up. Initialized before
+        # _map_memory() because the pre-mapping installs a hook that uses them.
+        self._synthetic: list[tuple[int, int]] = []
+        self._synthetic_reads: list[tuple[int, int, int]] = []
+        self._synthetic_read_count = 0
+        self._max_synthetic_reads = 256
         self._map_memory()
         self._seed_registers()
 
@@ -147,19 +173,13 @@ class MSLEmulator:
         # reverts the writes.
         self._history = []        # list of (UcContext, [(addr, old_bytes), ...])
         self._max_back = 4096
-        self._pending = None      # write log of the in-progress step
-        # Self-modifying-code tracking: every [addr, addr+size) the emulated code
-        # writes is recorded, and executing an address that was previously written
-        # is flagged as a write-then-execute (W->X) event -- the moment a packer
-        # jumps into its freshly decoded payload.
-        self._written = []        # list of [start, end) byte ranges written
-        self._wx_events = []      # PCs where execution entered written memory
-        self._wx_seen = set()
         self.uc.hook_add (self._U.UC_HOOK_MEM_WRITE, self._on_mem_write)
 
     def _on_mem_write(self, uc, access, address, size, value, user):
         # Called before the write is applied, so mem_read returns the old bytes.
         self._written.append ((address, address + size))
+        for page in range (address >> 12, (address + max (size, 1) - 1 >> 12) + 1):
+            self._written_pages.add (page)
         if self._pending is None:
             return
         try:
@@ -182,6 +202,156 @@ class MSLEmulator:
         for r in self.image.regions:
             for paddr, data in r.pages.items():
                 self.uc.mem_write(paddr, data)
+        # A slice only captures a few pages around the captured SP, so any frame
+        # deeper than that faults; back the rest of the stack with blank pages.
+        self._premap_stack_region(self._captured_sp(), self._premap_stack_mb)
+
+    def _captured_sp(self) -> int | None:
+        """The stack pointer of the thread we are about to seed, read from the
+        capture rather than from ``self.uc``.
+
+        ``_map_memory`` runs before ``_seed_registers``, so at mapping time the
+        CPU's SP is still 0 -- the value has to come from the Thread Context.
+        Prefers the ``REG_FLAG_SP``-flagged register, then this architecture's
+        SP name, then the same fallback names ``premap_stack_region`` probes on
+        the angr side.
+        """
+        thread = self.thread
+        if thread is None:
+            return None
+        regs = {r.name.lower(): r.value for r in thread.registers}
+        for r in thread.registers:
+            if r.is_sp and r.value:
+                return r.value
+        for name in (self._sp_name, "sp", "rsp", "esp", "r13", "r29", "r1"):
+            val = regs.get(name)
+            if val:
+                return val
+        return None
+
+    def _premap_stack_region(self, sp_val: "int | None",
+                             region_size_mb: int = _PREMAP_STACK_MB) -> None:
+        """Pre-map a contiguous RW window (default 64MB) around the stack
+        pointer so deep frames don't fault with ``UC_ERR_*_UNMAPPED``.
+
+        The concrete port of ``memslicer.symbex.unmapped_handler``'s
+        ``premap_stack_region``: same window size, same 4KB granularity, same
+        "only fill what is not already mapped" rule -- Unicorn's ``mem_map``
+        raises ``UC_ERR_MAP`` on an overlapping range, exactly as angr's
+        ``map_region`` does. Only the zero-fill differs: angr needs an explicit
+        ``store``, while Unicorn hands back freshly mapped pages already zeroed.
+
+        Mapped pages are RW, not RWX: this window is a stand-in for stack the
+        capture missed, and code executing from it would be a fetch out of
+        memory we invented, not out of anything the slice recorded.
+
+        Already-mapped pages are left untouched, so real captured stack bytes
+        are never clobbered. The set of occupied ranges is read back from
+        ``uc.mem_regions()`` rather than from ``self._mapped``, so pages mapped
+        directly on ``self.uc`` by a caller are respected too.
+        """
+        if not region_size_mb or sp_val is None or sp_val < 0x10000:
+            return
+
+        half_size = (region_size_mb * 1024 * 1024) // 2
+        max_user_addr = (1 << self.bits) - 1
+        if self.bits == 64:
+            max_user_addr = 0x7FFFFFFFFFFF
+
+        start_addr = max(0x10000, (sp_val - half_size) & ~(_UC_PAGE - 1))
+        end_addr = min(max_user_addr, (sp_val + half_size) & ~(_UC_PAGE - 1))
+        if end_addr <= start_addr:
+            return
+
+        # mem_regions() reports inclusive ends; normalize to [lo, hi) spans.
+        occupied = _coalesce([(lo, hi + 1) for lo, hi, _ in self.uc.mem_regions()])
+        perms = self._U.UC_PROT_READ | self._U.UC_PROT_WRITE
+
+        added: list[tuple[int, int]] = []
+        cursor = start_addr
+        for lo, hi in occupied:
+            if hi <= cursor:
+                continue
+            if lo >= end_addr:
+                break
+            if lo > cursor:
+                added.append((cursor, min(lo, end_addr)))
+            cursor = max(cursor, hi)
+            if cursor >= end_addr:
+                break
+        if cursor < end_addr:
+            added.append((cursor, end_addr))
+
+        mapped_bytes = 0
+        for lo, hi in added:
+            try:
+                self.uc.mem_map(lo, hi - lo, perms)
+            except self._U.UcError as exc:
+                # Not silently swallowed: a refused map means this part of the
+                # window stays unmapped and can still fault mid-trace.
+                logger.warning("stack pre-map failed for %#x-%#x: %s", lo, hi, exc)
+                continue
+            mapped_bytes += hi - lo
+            self._mapped = _coalesce(self._mapped + [(lo, hi)])
+            # Remember this is fill we invented, and watch reads of it: a read
+            # of a page the emulated code never wrote returns a zero we made up,
+            # not a value the capture recorded.
+            self._synthetic = _coalesce(self._synthetic + [(lo, hi)])
+            self.uc.hook_add(self._U.UC_HOOK_MEM_READ, self._on_synthetic_read,
+                             begin=lo, end=hi - 1)
+
+        logger.info(
+            "pre-mapped %d KB of blank stack in the %d MB window around SP=%#x "
+            "(%#x-%#x)", mapped_bytes // 1024, region_size_mb, sp_val,
+            start_addr, end_addr,
+        )
+
+    def _on_synthetic_read(self, uc, access, address, size, value, user):
+        """Record a read of pre-mapped stack the emulated code never wrote.
+
+        Once the code has written a page it owns it, and reading it back is
+        ordinary program behaviour -- that is the whole point of the pre-map.
+        What matters is the other case: a read of untouched fill, where the
+        emulator hands back a zero that no capture ever recorded.
+
+        Ownership is tracked per 4KB page, so a read of an untouched byte in a
+        page the code wrote elsewhere is not flagged. Byte-exact tracking would
+        cost more per write than this diagnostic is worth.
+        """
+        if (address >> 12) in self._written_pages:
+            return
+        self._synthetic_read_count += 1
+        if self._synthetic_read_count == 1:
+            logger.warning(
+                "read of pre-mapped stack the code never wrote at %#x: the value "
+                "is invented zero fill, not captured data", address)
+        if len(self._synthetic_reads) < self._max_synthetic_reads:
+            pc = uc.reg_read(self._reg_const(self._pc_name))
+            self._synthetic_reads.append((pc, address, size))
+
+    # -- provenance of pre-mapped stack -------------------------------------
+
+    def synthetic_ranges(self) -> list[tuple[int, int]]:
+        """Coalesced ``[start, end)`` spans of stack this emulator invented,
+        i.e. mapped as blank fill because the slice never captured them."""
+        return list(self._synthetic)
+
+    def is_synthetic(self, addr: int) -> bool:
+        """True if *addr* lies in pre-mapped fill rather than captured memory."""
+        return any(lo <= addr < hi for lo, hi in self._synthetic)
+
+    def synthetic_reads(self) -> list[tuple[int, int, int]]:
+        """``(pc, addr, size)`` for each read of pre-mapped stack the emulated
+        code had not written -- every one returned a value we made up.
+
+        A non-empty list means the trace consumed invented data and may have
+        diverged from the real process. Capped at ``_max_synthetic_reads``
+        entries; :meth:`synthetic_read_count` is the untruncated total."""
+        return list(self._synthetic_reads)
+
+    def synthetic_read_count(self) -> int:
+        """Total reads of unwritten pre-mapped stack (not capped)."""
+        return self._synthetic_read_count
 
     def _find_free_page(self, size: int) -> int:
         """Return a page-aligned address with *size* bytes free of mapped spans."""
@@ -279,6 +449,8 @@ class MSLEmulator:
             if const is not None:
                 self.uc.reg_write(const, 0)
         self._seed_registers()
+        # Each thread has its own stack: back the new one's too.
+        self._premap_stack_region(self._captured_sp(), self._premap_stack_mb)
         self._history = []
         return self.thread
 
@@ -539,10 +711,13 @@ class MSLEmulator:
         return out
 
 
-def open_slice(path: str, thread: "int | EmuThread | None" = None) -> MSLEmulator:
+def open_slice(path: str, thread: "int | EmuThread | None" = None,
+               premap_stack_mb: int = _PREMAP_STACK_MB) -> MSLEmulator:
     """Convenience: load *path* and build a ready-to-step emulator.
 
     *thread* selects the captured thread to seed from (default: the Current
-    thread); see :class:`MSLEmulator`.
+    thread) and *premap_stack_mb* sizes the blank stack window mapped around
+    its SP; see :class:`MSLEmulator`.
     """
-    return MSLEmulator(load_slice(path), thread=thread)
+    return MSLEmulator(load_slice(path), thread=thread,
+                       premap_stack_mb=premap_stack_mb)

@@ -63,6 +63,26 @@ class ThreadInfo:
     state: int = 0        # ThreadState code (0=Unknown)
 
 
+@dataclass
+class KeyHintEvent:
+    """A cryptographic-key event observed live by a bridge hook.
+
+    Reported by an optional in-target interceptor on a key-derivation API
+    (e.g. Windows CNG ``BCryptGenerateSymmetricKey``). ``address`` is the
+    absolute virtual address of the key material at the moment of the call and
+    ``length`` its byte length (0 if the hook could not determine it). The
+    engine later maps ``address`` to the owning captured MemoryRegion and emits
+    a ``KeyHint`` block (region UUID + offset). ``api`` and ``algorithm`` are
+    human-readable provenance carried into the hint's Note."""
+
+    address: int
+    length: int = 0
+    key_type: int = 0     # KeyHint key_type code (0 = unknown/unspecified)
+    protocol: int = 0     # KeyHint protocol code (0 = unknown/unspecified)
+    api: str = ""         # e.g. "BCryptGenerateSymmetricKey"
+    algorithm: str = ""   # e.g. "AES" (best-effort; may be empty)
+
+
 # Canonical register-name sets used to tag special registers regardless of
 # the originating backend (spec Section 5.7, Table 19b roles).
 _PC_NAMES = frozenset({"rip", "eip", "pc"})
@@ -153,6 +173,16 @@ class DebuggerBridge(Protocol):
     def read_memory(self, address: int, size: int) -> bytes | None:
         """Read *size* bytes from *address*. Return ``None`` on failure."""
         ...
+
+    def collect_key_hints(self) -> list[KeyHintEvent]:
+        """Return key-derivation events observed since ``connect()``.
+
+        Optional capability. Bridges that do not hook key-derivation APIs
+        return an empty list (the default); the engine then emits no KeyHint
+        blocks. A bridge that supports it must arm its hooks in ``connect()``
+        so calls made during the whole capture window are caught.
+        """
+        return []
 
     def disconnect(self) -> None:
         """Detach from the target process and clean up."""

@@ -25,7 +25,7 @@ from memslicer.msl.constants import (
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, TargetIntrospection,
-    KernelSymbolBundle, ThreadContext, ThreadRegister,
+    KernelSymbolBundle, KeyHint, ThreadContext, ThreadRegister,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.protection import (
@@ -774,6 +774,11 @@ class AcquisitionEngine(BaseAcquirer):
                     # Startup test read
                     self._perform_startup_test_read(ranges, page_size)
 
+                    # (base, size, block_uuid) for every region actually
+                    # written, so live-observed KeyHint addresses can be mapped
+                    # to a region UUID + offset after the loop.
+                    written_regions: list[tuple[int, int, bytes]] = []
+
                     for idx, r in enumerate(ranges):
                         if self._abort.is_set():
                             break
@@ -798,7 +803,8 @@ class AcquisitionEngine(BaseAcquirer):
                         region, data_size = self._read_region(
                             r.base, r.size, prot, r.file_path, page_size,
                         )
-                        writer.write_memory_region(region)
+                        region_uuid = writer.write_memory_region(region)
+                        written_regions.append((r.base, r.size, region_uuid))
                         region_count += 1
                         bytes_captured += data_size
                         captured = region.page_states.count(PageState.CAPTURED)
@@ -816,6 +822,12 @@ class AcquisitionEngine(BaseAcquirer):
                         region_count, total_ranges,
                         bytes_captured, len(module_entries), total_ranges,
                     )
+
+                    # KeyHint blocks (0x0020): map each live-observed key
+                    # buffer address to the captured region that owns it and
+                    # record it. Emitted after all MemoryRegion blocks so a
+                    # hint always references an already-written region UUID.
+                    self._write_key_hints(writer, written_regions)
 
                 finally:
                     writer.finalize()
@@ -847,6 +859,79 @@ class AcquisitionEngine(BaseAcquirer):
             pages_failed=pages_failed,
             skip_reasons=skip_reasons,
         )
+
+    def _write_key_hints(
+        self,
+        writer: MSLWriter,
+        written_regions: list[tuple[int, int, bytes]],
+    ) -> None:
+        """Emit KeyHint blocks for key-derivation events seen during capture.
+
+        Each event's absolute address is mapped to the captured region that
+        contains it; the KeyHint stores that region's UUID plus the byte
+        offset (spec Table 18). An event whose address falls outside every
+        captured region is logged and skipped -- a hint that cannot be tied to
+        real captured bytes would point nowhere useful, so no block is written
+        for it (never invent a hint at a bogus location).
+        """
+        collect = getattr(self._bridge, "collect_key_hints", None)
+        if collect is None:
+            return
+        try:
+            events = collect()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("KeyHint collection failed: %s", exc)
+            return
+        if not events:
+            return
+
+        written = 0
+        # A key buffer re-used across many derivation calls (common in a tight
+        # crypto loop) yields many identical events; collapse them so the slice
+        # carries one KeyHint per distinct (location, length, provenance)
+        # instead of hundreds of duplicates.
+        seen: set[tuple[bytes, int, int, str]] = set()
+        for ev in events:
+            owner = next(
+                (
+                    (base, u) for (base, size, u) in written_regions
+                    if base <= ev.address < base + size
+                ),
+                None,
+            )
+            if owner is None:
+                self._log.warning(
+                    "KeyHint at 0x%x (%s) is not inside any captured region "
+                    "-- skipping (no block written).",
+                    ev.address, ev.api or "?",
+                )
+                continue
+            base, region_uuid = owner
+            note = ev.api or ""
+            if ev.algorithm:
+                note = f"{note} {ev.algorithm}".strip()
+            offset = ev.address - base
+            dedup_key = (region_uuid, offset, ev.length, note)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            writer.write_key_hint(KeyHint(
+                region_uuid=region_uuid,
+                region_offset=offset,
+                key_len=ev.length,
+                key_type=ev.key_type,
+                protocol=ev.protocol,
+                confidence=0x02,   # Confirmed: observed at a live API call
+                key_state=0x01,    # Active
+                note=note,
+            ))
+            written += 1
+
+        if written:
+            self._log.info(
+                "Wrote %d KeyHint block(s) from %d observed event(s)",
+                written, len(events),
+            )
 
     def _read_region(
         self,

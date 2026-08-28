@@ -18,6 +18,10 @@ from memslicer.utils.padding import pad8
 _REGION_HDR = "<QQBBB5sQ"   # BaseAddr, RegionSize, Protection, RegionType, PageSizeLog2, rsv, Timestamp
 _TC_HDR = "<QQHBBIH6s"       # ThreadID, StartTime, Flags, State, rsv, RegCount, NameLen, rsv
 _MOD_HDR = "<QQHHI"          # BaseAddr, ModuleSize, PathLen, VersionLen, rsv
+# KeyHint fixed part AFTER the 16B RegionUUID (spec Table 18 / writer.write_key_hint):
+# RegionOffset(8) KeyLen(4) KeyType(2) Protocol(2) Confidence(1) KeyState(1)
+# Reserved(2) NoteLen(4) Reserved2(4) == 28 bytes, then Note(var, pad8).
+_KEYHINT_HDR = "<QIHHBB2sI4s"
 _THREAD_FLAG_CURRENT = 0x1
 
 
@@ -79,6 +83,26 @@ class EmuModule:
 
 
 @dataclass
+class KeyHintInfo:
+    """A KeyHint block (0x0020): where captured cryptographic key material sits.
+
+    The on-disk block locates the key by ``region_uuid`` + ``region_offset``
+    (spec Table 18). ``address`` is the resolved absolute virtual address
+    (the owning MemoryRegion's base + ``region_offset``); it is ``None`` when
+    no captured region carries that UUID, so callers must handle a hint that
+    could not be resolved rather than assume ``address`` is always set."""
+    region_uuid: bytes
+    region_offset: int
+    key_len: int
+    key_type: int = 0
+    protocol: int = 0
+    confidence: int = 0     # 0x00=Speculative, 0x01=Heuristic, 0x02=Confirmed
+    key_state: int = 0      # 0x00=Unknown, 0x01=Active, 0x02=Expired
+    note: str = ""
+    address: int | None = None
+
+
+@dataclass
 class SliceImage:
     """Everything needed to emulate a slice."""
     arch: ArchType
@@ -86,6 +110,7 @@ class SliceImage:
     regions: list[EmuRegion] = field(default_factory=list)
     threads: list[EmuThread] = field(default_factory=list)
     modules: list[EmuModule] = field(default_factory=list)
+    key_hints: list[KeyHintInfo] = field(default_factory=list)
 
     @property
     def current_thread(self) -> EmuThread | None:
@@ -173,6 +198,38 @@ def _parse_module(payload: bytes) -> EmuModule:
     return EmuModule(base=base, size=size, path=path)
 
 
+def _parse_key_hint(payload: bytes) -> KeyHintInfo:
+    """Parse a KeyHint block payload (spec Table 18).
+
+    Layout: RegionUUID(16) + fixed 28B (:data:`_KEYHINT_HDR`) + Note(var).
+    ``NoteLen`` counts the NUL-terminated UTF-8 note bytes the writer emitted;
+    the trailing padding-to-8 is ignored. Raises :class:`ValueError` on a
+    payload too short to hold the fixed part (a corrupt/truncated block)."""
+    if len(payload) < 44:
+        raise ValueError(
+            f"KeyHint payload too short: {len(payload)} bytes (need >= 44)"
+        )
+    region_uuid = payload[:16]
+    (
+        region_offset, key_len, key_type, protocol,
+        confidence, key_state, _rsv, note_len, _rsv2,
+    ) = struct.unpack(_KEYHINT_HDR, payload[16:44])
+    note = ""
+    if note_len:
+        raw = payload[44:44 + note_len]
+        note = raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    return KeyHintInfo(
+        region_uuid=region_uuid,
+        region_offset=region_offset,
+        key_len=key_len,
+        key_type=key_type,
+        protocol=protocol,
+        confidence=confidence,
+        key_state=key_state,
+        note=note,
+    )
+
+
 def load_slice(path: str) -> SliceImage:
     """Load *path* (an ``.msl`` file) into a :class:`SliceImage`."""
     with open(path, "rb") as f:
@@ -190,12 +247,26 @@ def load_slice(path: str) -> SliceImage:
             arch = ArchType.Unknown
 
         image = SliceImage(arch=arch, os=os_type)
+        # Map each MemoryRegion's block UUID to its base so KeyHints (which
+        # locate key material by region_uuid + offset, spec Table 18) can be
+        # resolved to an absolute address. Block ordering is not guaranteed,
+        # so resolution is deferred to a second pass after the file is walked.
+        region_base_by_uuid: dict[bytes, int] = {}
         f.seek(0)
         for blk in iterate_blocks(f):
             if blk.block_type == BlockType.MemoryRegion:
-                image.regions.append(_parse_region(blk.payload))
+                region = _parse_region(blk.payload)
+                image.regions.append(region)
+                region_base_by_uuid[blk.block_uuid] = region.base
             elif blk.block_type == BlockType.ThreadContext:
                 image.threads.append(_parse_thread(blk.payload))
             elif blk.block_type == BlockType.ModuleEntry:
                 image.modules.append(_parse_module(blk.payload))
+            elif blk.block_type == BlockType.KeyHint:
+                image.key_hints.append(_parse_key_hint(blk.payload))
+
+        for hint in image.key_hints:
+            base = region_base_by_uuid.get(hint.region_uuid)
+            if base is not None:
+                hint.address = base + hint.region_offset
     return image
