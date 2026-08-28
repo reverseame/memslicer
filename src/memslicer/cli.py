@@ -163,6 +163,7 @@ def _create_acquirer(
     attribution=None,
     hash_algo: HashAlgo = HashAlgo.BLAKE3,
     capture_threads: bool = True,
+    collect_key_hints: bool = False,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -180,6 +181,14 @@ def _create_acquirer(
             device=device,
             read_timeout=read_timeout,
             logger=logger,
+            collect_key_hints=collect_key_hints,
+        )
+    elif collect_key_hints:
+        # KeyHint hooking is a Frida-only in-target interceptor; fail loudly
+        # rather than silently producing a slice with no KeyHint blocks.
+        raise click.UsageError(
+            "--key-hints requires --backend frida (in-target API hooking is "
+            "not available for the gdb/lldb backends)"
         )
     elif backend == "gdb":
         try:
@@ -253,6 +262,13 @@ def _create_acquirer(
     )
 
 
+_KEY_HINTS_HELP = (
+    "Hook Windows CNG key-derivation APIs (BCryptGenerateSymmetricKey, "
+    "NCryptDeriveKey) during capture and record where derived key material "
+    "lives as KeyHint blocks (Frida backend only)"
+)
+
+
 @click.command()
 @click.argument("target")
 @click.option("-b", "--backend", type=click.Choice(["frida", "gdb", "lldb"]), default="frida", help="Debugger backend to use")
@@ -273,10 +289,11 @@ def _create_acquirer(
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
 @click.option("--no-registers", is_flag=True, default=False, help="Do not capture thread register state (Thread Context blocks)")
+@click.option("--key-hints", "key_hints", is_flag=True, default=False, help=_KEY_HINTS_HELP)
 @attribution_options
 def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, max_region_size, investigation,
-        encrypt, no_encrypt, passphrase, hash_algo_str, no_registers,
+        encrypt, no_encrypt, passphrase, hash_algo_str, no_registers, key_hints,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
         include_kernel_symbols, include_kernel_modules,
@@ -426,6 +443,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         attribution=attribution,
         hash_algo=hash_algo,
         capture_threads=not no_registers,
+        collect_key_hints=key_hints,
     )
     acquirer.set_progress_callback(progress)
 

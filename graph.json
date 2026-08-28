@@ -1,0 +1,2189 @@
+{
+  "meta": {
+    "memory": {
+      "writes": 301,
+      "exec_writes": 0,
+      "by_region": {
+        "anon": 33,
+        "unmapped": 268
+      },
+      "exec_write_targets": [],
+      "rwx_regions": [
+        "0x7ffbe65e7000"
+      ]
+    },
+    "arch": "x86_64",
+    "entry": "0x7ffbe668d624",
+    "granularity": "block",
+    "stop_reason": "exit: ucrtbase.dll!exit",
+    "steps": 301,
+    "synthetic_stack_reads": 254,
+    "synthetic_stack_read_sites": 1,
+    "last_pc": "0x7ffbe43203e0",
+    "dataflow_edges": 9
+  },
+  "nodes": [
+    {
+      "id": "0x7ffbe668d624",
+      "kind": "block",
+      "label": "ntdll.dll+0x9d624",
+      "addr": 140719879149092,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719879149092,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ffbe3cc62ce",
+      "kind": "block",
+      "label": "KERNELBASE.dll+0x462ce",
+      "addr": 140719835341518,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719835341518,
+            "bytes": "0f1f440000",
+            "mnemonic": "nop",
+            "op_str": "dword ptr [rax + rax]",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341523,
+            "bytes": "8bf8",
+            "mnemonic": "mov",
+            "op_str": "edi, eax",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341525,
+            "bytes": "898424b0000000",
+            "mnemonic": "mov",
+            "op_str": "dword ptr [rsp + 0xb0], eax",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341532,
+            "bytes": "85db",
+            "mnemonic": "test",
+            "op_str": "ebx, ebx",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341534,
+            "bytes": "7428",
+            "mnemonic": "je",
+            "op_str": "0x7ffbe3cc6308",
+            "comment": "KERNELBASE.dll+0x46308"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ffbe3cc6308",
+      "kind": "block",
+      "label": "KERNELBASE.dll+0x46308",
+      "addr": 140719835341576,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719835341576,
+            "bytes": "488b8c24b8000000",
+            "mnemonic": "mov",
+            "op_str": "rcx, qword ptr [rsp + 0xb8]",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341584,
+            "bytes": "4885c9",
+            "mnemonic": "test",
+            "op_str": "rcx, rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341587,
+            "bytes": "0f8548760800",
+            "mnemonic": "jne",
+            "op_str": "0x7ffbe3d4d961",
+            "comment": "KERNELBASE.dll+0xcd961"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ffbe3cc6319",
+      "kind": "block",
+      "label": "KERNELBASE.dll+0x46319",
+      "addr": 140719835341593,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719835341593,
+            "bytes": "85db",
+            "mnemonic": "test",
+            "op_str": "ebx, ebx",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341595,
+            "bytes": "7537",
+            "mnemonic": "jne",
+            "op_str": "0x7ffbe3cc6354",
+            "comment": "KERNELBASE.dll+0x46354"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ffbe3cc631d",
+      "kind": "block",
+      "label": "KERNELBASE.dll+0x4631d",
+      "addr": 140719835341597,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719835341597,
+            "bytes": "b8c0000000",
+            "mnemonic": "mov",
+            "op_str": "eax, 0xc0",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341602,
+            "bytes": "3bf8",
+            "mnemonic": "cmp",
+            "op_str": "edi, eax",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341604,
+            "bytes": "7402",
+            "mnemonic": "je",
+            "op_str": "0x7ffbe3cc6328",
+            "comment": "KERNELBASE.dll+0x46328"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ffbe3cc6326",
+      "kind": "block",
+      "label": "KERNELBASE.dll+0x46326",
+      "addr": 140719835341606,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140719835341606,
+            "bytes": "8bc6",
+            "mnemonic": "mov",
+            "op_str": "eax, esi",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341608,
+            "bytes": "4881c480000000",
+            "mnemonic": "add",
+            "op_str": "rsp, 0x80",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341615,
+            "bytes": "5f",
+            "mnemonic": "pop",
+            "op_str": "rdi",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341616,
+            "bytes": "5e",
+            "mnemonic": "pop",
+            "op_str": "rsi",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341617,
+            "bytes": "5b",
+            "mnemonic": "pop",
+            "op_str": "rbx",
+            "comment": ""
+          },
+          {
+            "addr": 140719835341618,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31930",
+      "kind": "block",
+      "label": "target.exe+0x1930",
+      "addr": 140700960364848,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364848,
+            "bytes": "837d1001",
+            "mnemonic": "cmp",
+            "op_str": "dword ptr [rbp + 0x10], 1",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364852,
+            "bytes": "7e1f",
+            "mnemonic": "jle",
+            "op_str": "0x7ff77ec31955",
+            "comment": "target.exe+0x1955"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31955",
+      "kind": "block",
+      "label": "target.exe+0x1955",
+      "addr": 140700960364885,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364885,
+            "bytes": "488d05d9370000",
+            "mnemonic": "lea",
+            "op_str": "rax, [rip + 0x37d9]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364892,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364895,
+            "bytes": "e8cc170000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33130",
+            "comment": "target.exe+0x3130"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33130",
+      "kind": "block",
+      "label": "target.exe+0x3130",
+      "addr": 140700960370992,
+      "hits": 2,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960370992,
+            "bytes": "55",
+            "mnemonic": "push",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370993,
+            "bytes": "53",
+            "mnemonic": "push",
+            "op_str": "rbx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370994,
+            "bytes": "4883ec48",
+            "mnemonic": "sub",
+            "op_str": "rsp, 0x48",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370998,
+            "bytes": "488d6c2440",
+            "mnemonic": "lea",
+            "op_str": "rbp, [rsp + 0x40]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371003,
+            "bytes": "48894d20",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0x20], rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371007,
+            "bytes": "48895528",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0x28], rdx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371011,
+            "bytes": "4c894530",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0x30], r8",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371015,
+            "bytes": "4c894d38",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0x38], r9",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371019,
+            "bytes": "488d4528",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp + 0x28]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371023,
+            "bytes": "488945f0",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp - 0x10], rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371027,
+            "bytes": "488b5df0",
+            "mnemonic": "mov",
+            "op_str": "rbx, qword ptr [rbp - 0x10]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371031,
+            "bytes": "b901000000",
+            "mnemonic": "mov",
+            "op_str": "ecx, 1",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371036,
+            "bytes": "e82f030000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33490",
+            "comment": "target.exe+0x3490"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33490",
+      "kind": "block",
+      "label": "target.exe+0x3490",
+      "addr": 140700960371856,
+      "hits": 2,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371856,
+            "bytes": "ff25ca7f0000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x7fca]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!__acrt_iob_func",
+      "kind": "api",
+      "label": "ucrtbase.dll!__acrt_iob_func",
+      "addr": 0,
+      "hits": 3,
+      "attrs": {
+        "calls": 3,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec33161",
+      "kind": "block",
+      "label": "target.exe+0x3161",
+      "addr": 140700960371041,
+      "hits": 2,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371041,
+            "bytes": "488b5520",
+            "mnemonic": "mov",
+            "op_str": "rdx, qword ptr [rbp + 0x20]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371045,
+            "bytes": "48895c2420",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rsp + 0x20], rbx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371050,
+            "bytes": "41b900000000",
+            "mnemonic": "mov",
+            "op_str": "r9d, 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371056,
+            "bytes": "4989d0",
+            "mnemonic": "mov",
+            "op_str": "r8, rdx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371059,
+            "bytes": "4889c2",
+            "mnemonic": "mov",
+            "op_str": "rdx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371062,
+            "bytes": "b900000000",
+            "mnemonic": "mov",
+            "op_str": "ecx, 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371067,
+            "bytes": "e828030000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec334a8",
+            "comment": "target.exe+0x34a8"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec334a8",
+      "kind": "block",
+      "label": "target.exe+0x34a8",
+      "addr": 140700960371880,
+      "hits": 2,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371880,
+            "bytes": "ff25ca7f0000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x7fca]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "kind": "api",
+      "label": "ucrtbase.dll!__stdio_common_vfprintf",
+      "addr": 0,
+      "hits": 2,
+      "attrs": {
+        "calls": 2,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec33180",
+      "kind": "block",
+      "label": "target.exe+0x3180",
+      "addr": 140700960371072,
+      "hits": 2,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371072,
+            "bytes": "8945fc",
+            "mnemonic": "mov",
+            "op_str": "dword ptr [rbp - 4], eax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371075,
+            "bytes": "8b45fc",
+            "mnemonic": "mov",
+            "op_str": "eax, dword ptr [rbp - 4]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371078,
+            "bytes": "4883c448",
+            "mnemonic": "add",
+            "op_str": "rsp, 0x48",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371082,
+            "bytes": "5b",
+            "mnemonic": "pop",
+            "op_str": "rbx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371083,
+            "bytes": "5d",
+            "mnemonic": "pop",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960371084,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31964",
+      "kind": "block",
+      "label": "target.exe+0x1964",
+      "addr": 140700960364900,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364900,
+            "bytes": "b900000000",
+            "mnemonic": "mov",
+            "op_str": "ecx, 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364905,
+            "bytes": "488b05f09a0000",
+            "mnemonic": "mov",
+            "op_str": "rax, qword ptr [rip + 0x9af0]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364912,
+            "bytes": "ffd0",
+            "mnemonic": "call",
+            "op_str": "rax",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31972",
+      "kind": "block",
+      "label": "target.exe+0x1972",
+      "addr": 140700960364914,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364914,
+            "bytes": "4889c2",
+            "mnemonic": "mov",
+            "op_str": "rdx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364917,
+            "bytes": "488d45c0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x40]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364921,
+            "bytes": "4989d0",
+            "mnemonic": "mov",
+            "op_str": "r8, rdx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364924,
+            "bytes": "ba40000000",
+            "mnemonic": "mov",
+            "op_str": "edx, 0x40",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364929,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364932,
+            "bytes": "e8371b0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec334c0",
+            "comment": "target.exe+0x34c0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec334c0",
+      "kind": "block",
+      "label": "target.exe+0x34c0",
+      "addr": 140700960371904,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371904,
+            "bytes": "ff25ca7f0000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x7fca]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!fgets",
+      "kind": "api",
+      "label": "ucrtbase.dll!fgets",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec31989",
+      "kind": "block",
+      "label": "target.exe+0x1989",
+      "addr": 140700960364937,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364937,
+            "bytes": "4885c0",
+            "mnemonic": "test",
+            "op_str": "rax, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364940,
+            "bytes": "7507",
+            "mnemonic": "jne",
+            "op_str": "0x7ff77ec31995",
+            "comment": "target.exe+0x1995"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31995",
+      "kind": "block",
+      "label": "target.exe+0x1995",
+      "addr": 140700960364949,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364949,
+            "bytes": "488d15ad370000",
+            "mnemonic": "lea",
+            "op_str": "rdx, [rip + 0x37ad]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364956,
+            "bytes": "488d45c0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x40]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364960,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364963,
+            "bytes": "e8c01a0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33468",
+            "comment": "target.exe+0x3468"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33468",
+      "kind": "block",
+      "label": "target.exe+0x3468",
+      "addr": 140700960371816,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371816,
+            "bytes": "ff254a800000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x804a]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!strcspn",
+      "kind": "api",
+      "label": "ucrtbase.dll!strcspn",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec319a8",
+      "kind": "block",
+      "label": "target.exe+0x19a8",
+      "addr": 140700960364968,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364968,
+            "bytes": "c64405c000",
+            "mnemonic": "mov",
+            "op_str": "byte ptr [rbp + rax - 0x40], 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364973,
+            "bytes": "488d45c0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x40]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364977,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364980,
+            "bytes": "e807fdffff",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec316c0",
+            "comment": "target.exe+0x16c0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec316c0",
+      "kind": "block",
+      "label": "target.exe+0x16c0",
+      "addr": 140700960364224,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364224,
+            "bytes": "55",
+            "mnemonic": "push",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364225,
+            "bytes": "b820001000",
+            "mnemonic": "mov",
+            "op_str": "eax, 0x100020",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364230,
+            "bytes": "e8d5190000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec330a0",
+            "comment": "target.exe+0x30a0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec330a0",
+      "kind": "block",
+      "label": "target.exe+0x30a0",
+      "addr": 140700960370848,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960370848,
+            "bytes": "51",
+            "mnemonic": "push",
+            "op_str": "rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370849,
+            "bytes": "50",
+            "mnemonic": "push",
+            "op_str": "rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370850,
+            "bytes": "483d00100000",
+            "mnemonic": "cmp",
+            "op_str": "rax, 0x1000",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370856,
+            "bytes": "488d4c2418",
+            "mnemonic": "lea",
+            "op_str": "rcx, [rsp + 0x18]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370861,
+            "bytes": "7219",
+            "mnemonic": "jb",
+            "op_str": "0x7ff77ec330c8",
+            "comment": "target.exe+0x30c8"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec330af",
+      "kind": "block",
+      "label": "target.exe+0x30af",
+      "addr": 140700960370863,
+      "hits": 256,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960370863,
+            "bytes": "4881e900100000",
+            "mnemonic": "sub",
+            "op_str": "rcx, 0x1000",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370870,
+            "bytes": "48830900",
+            "mnemonic": "or",
+            "op_str": "qword ptr [rcx], 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370874,
+            "bytes": "482d00100000",
+            "mnemonic": "sub",
+            "op_str": "rax, 0x1000",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370880,
+            "bytes": "483d00100000",
+            "mnemonic": "cmp",
+            "op_str": "rax, 0x1000",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370886,
+            "bytes": "77e7",
+            "mnemonic": "ja",
+            "op_str": "0x7ff77ec330af",
+            "comment": "target.exe+0x30af"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec330c8",
+      "kind": "block",
+      "label": "target.exe+0x30c8",
+      "addr": 140700960370888,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960370888,
+            "bytes": "4829c1",
+            "mnemonic": "sub",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370891,
+            "bytes": "48830900",
+            "mnemonic": "or",
+            "op_str": "qword ptr [rcx], 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370895,
+            "bytes": "58",
+            "mnemonic": "pop",
+            "op_str": "rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370896,
+            "bytes": "59",
+            "mnemonic": "pop",
+            "op_str": "rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960370897,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec316cb",
+      "kind": "block",
+      "label": "target.exe+0x16cb",
+      "addr": 140700960364235,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364235,
+            "bytes": "4829c4",
+            "mnemonic": "sub",
+            "op_str": "rsp, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364238,
+            "bytes": "488dac2480000000",
+            "mnemonic": "lea",
+            "op_str": "rbp, [rsp + 0x80]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364246,
+            "bytes": "48898db0ff0f00",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0xfffb0], rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364253,
+            "bytes": "488d45a0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x60]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364257,
+            "bytes": "41b8ffff0f00",
+            "mnemonic": "mov",
+            "op_str": "r8d, 0xfffff",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364263,
+            "bytes": "ba41000000",
+            "mnemonic": "mov",
+            "op_str": "edx, 0x41",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364268,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364271,
+            "bytes": "e86c1d0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33460",
+            "comment": "target.exe+0x3460"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33460",
+      "kind": "block",
+      "label": "target.exe+0x3460",
+      "addr": 140700960371808,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371808,
+            "bytes": "ff254a800000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x804a]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!memset",
+      "kind": "api",
+      "label": "ucrtbase.dll!memset",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec316f4",
+      "kind": "block",
+      "label": "target.exe+0x16f4",
+      "addr": 140700960364276,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364276,
+            "bytes": "c6859fff0f0000",
+            "mnemonic": "mov",
+            "op_str": "byte ptr [rbp + 0xfff9f], 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364283,
+            "bytes": "488d45a0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x60]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364287,
+            "bytes": "488d0d4a390000",
+            "mnemonic": "lea",
+            "op_str": "rcx, [rip + 0x394a]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364294,
+            "bytes": "4889c2",
+            "mnemonic": "mov",
+            "op_str": "rdx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364297,
+            "bytes": "e8221a0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33130",
+            "comment": "target.exe+0x3130"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec3170e",
+      "kind": "block",
+      "label": "target.exe+0x170e",
+      "addr": 140700960364302,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364302,
+            "bytes": "90",
+            "mnemonic": "nop",
+            "op_str": "",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364303,
+            "bytes": "4881c420001000",
+            "mnemonic": "add",
+            "op_str": "rsp, 0x100020",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364310,
+            "bytes": "5d",
+            "mnemonic": "pop",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364311,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec319b9",
+      "kind": "block",
+      "label": "target.exe+0x19b9",
+      "addr": 140700960364985,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364985,
+            "bytes": "488d45c0",
+            "mnemonic": "lea",
+            "op_str": "rax, [rbp - 0x40]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364989,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364992,
+            "bytes": "e88ffdffff",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec31754",
+            "comment": "target.exe+0x1754"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31754",
+      "kind": "block",
+      "label": "target.exe+0x1754",
+      "addr": 140700960364372,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364372,
+            "bytes": "55",
+            "mnemonic": "push",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364373,
+            "bytes": "4889e5",
+            "mnemonic": "mov",
+            "op_str": "rbp, rsp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364376,
+            "bytes": "4883ec30",
+            "mnemonic": "sub",
+            "op_str": "rsp, 0x30",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364380,
+            "bytes": "48894d10",
+            "mnemonic": "mov",
+            "op_str": "qword ptr [rbp + 0x10], rcx",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364384,
+            "bytes": "488b4510",
+            "mnemonic": "mov",
+            "op_str": "rax, qword ptr [rbp + 0x10]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364388,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364391,
+            "bytes": "e8041d0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33470",
+            "comment": "target.exe+0x3470"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33470",
+      "kind": "block",
+      "label": "target.exe+0x3470",
+      "addr": 140700960371824,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371824,
+            "bytes": "ff254a800000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x804a]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!strlen",
+      "kind": "api",
+      "label": "ucrtbase.dll!strlen",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec3176c",
+      "kind": "block",
+      "label": "target.exe+0x176c",
+      "addr": 140700960364396,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364396,
+            "bytes": "4883f810",
+            "mnemonic": "cmp",
+            "op_str": "rax, 0x10",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364400,
+            "bytes": "740a",
+            "mnemonic": "je",
+            "op_str": "0x7ff77ec3177c",
+            "comment": "target.exe+0x177c"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31772",
+      "kind": "block",
+      "label": "target.exe+0x1772",
+      "addr": 140700960364402,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364402,
+            "bytes": "b800000000",
+            "mnemonic": "mov",
+            "op_str": "eax, 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364407,
+            "bytes": "e91c010000",
+            "mnemonic": "jmp",
+            "op_str": "0x7ff77ec31898",
+            "comment": "target.exe+0x1898"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec31898",
+      "kind": "block",
+      "label": "target.exe+0x1898",
+      "addr": 140700960364696,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364696,
+            "bytes": "4883c430",
+            "mnemonic": "add",
+            "op_str": "rsp, 0x30",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364700,
+            "bytes": "5d",
+            "mnemonic": "pop",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364701,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec319c5",
+      "kind": "block",
+      "label": "target.exe+0x19c5",
+      "addr": 140700960364997,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960364997,
+            "bytes": "85c0",
+            "mnemonic": "test",
+            "op_str": "eax, eax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960364999,
+            "bytes": "7407",
+            "mnemonic": "je",
+            "op_str": "0x7ff77ec319d0",
+            "comment": "target.exe+0x19d0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec319d0",
+      "kind": "block",
+      "label": "target.exe+0x19d0",
+      "addr": 140700960365008,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960365008,
+            "bytes": "488d0579370000",
+            "mnemonic": "lea",
+            "op_str": "rax, [rip + 0x3779]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960365015,
+            "bytes": "4889c1",
+            "mnemonic": "mov",
+            "op_str": "rcx, rax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960365018,
+            "bytes": "e8f11a0000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec334d0",
+            "comment": "target.exe+0x34d0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec334d0",
+      "kind": "block",
+      "label": "target.exe+0x34d0",
+      "addr": 140700960371920,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960371920,
+            "bytes": "ff25ca7f0000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x7fca]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!puts",
+      "kind": "api",
+      "label": "ucrtbase.dll!puts",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "other"
+      }
+    },
+    {
+      "id": "0x7ff77ec319df",
+      "kind": "block",
+      "label": "target.exe+0x19df",
+      "addr": 140700960365023,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960365023,
+            "bytes": "b800000000",
+            "mnemonic": "mov",
+            "op_str": "eax, 0",
+            "comment": ""
+          },
+          {
+            "addr": 140700960365028,
+            "bytes": "4883c460",
+            "mnemonic": "add",
+            "op_str": "rsp, 0x60",
+            "comment": ""
+          },
+          {
+            "addr": 140700960365032,
+            "bytes": "5d",
+            "mnemonic": "pop",
+            "op_str": "rbp",
+            "comment": ""
+          },
+          {
+            "addr": 140700960365033,
+            "bytes": "c3",
+            "mnemonic": "ret",
+            "op_str": "",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec3133b",
+      "kind": "block",
+      "label": "target.exe+0x133b",
+      "addr": 140700960363323,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960363323,
+            "bytes": "8905db8c0000",
+            "mnemonic": "mov",
+            "op_str": "dword ptr [rip + 0x8cdb], eax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960363329,
+            "bytes": "8b05d98c0000",
+            "mnemonic": "mov",
+            "op_str": "eax, dword ptr [rip + 0x8cd9]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960363335,
+            "bytes": "85c0",
+            "mnemonic": "test",
+            "op_str": "eax, eax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960363337,
+            "bytes": "750d",
+            "mnemonic": "jne",
+            "op_str": "0x7ff77ec31358",
+            "comment": "target.exe+0x1358"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec3134b",
+      "kind": "block",
+      "label": "target.exe+0x134b",
+      "addr": 140700960363339,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960363339,
+            "bytes": "8b05cb8c0000",
+            "mnemonic": "mov",
+            "op_str": "eax, dword ptr [rip + 0x8ccb]",
+            "comment": ""
+          },
+          {
+            "addr": 140700960363345,
+            "bytes": "89c1",
+            "mnemonic": "mov",
+            "op_str": "ecx, eax",
+            "comment": ""
+          },
+          {
+            "addr": 140700960363347,
+            "bytes": "e800220000",
+            "mnemonic": "call",
+            "op_str": "0x7ff77ec33558",
+            "comment": "target.exe+0x3558"
+          }
+        ]
+      }
+    },
+    {
+      "id": "0x7ff77ec33558",
+      "kind": "block",
+      "label": "target.exe+0x3558",
+      "addr": 140700960372056,
+      "hits": 1,
+      "attrs": {
+        "instructions": [
+          {
+            "addr": 140700960372056,
+            "bytes": "ff25ea7e0000",
+            "mnemonic": "jmp",
+            "op_str": "qword ptr [rip + 0x7eea]",
+            "comment": ""
+          }
+        ]
+      }
+    },
+    {
+      "id": "api:ucrtbase.dll!exit",
+      "kind": "api",
+      "label": "ucrtbase.dll!exit",
+      "addr": 0,
+      "hits": 1,
+      "attrs": {
+        "calls": 1,
+        "category": "process"
+      }
+    }
+  ],
+  "links": [
+    {
+      "source": "0x7ffbe668d624",
+      "target": "0x7ffbe3cc62ce",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ffbe3cc62ce",
+      "target": "0x7ffbe3cc6308",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ffbe3cc6308",
+      "target": "0x7ffbe3cc6319",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ffbe3cc6319",
+      "target": "0x7ffbe3cc631d",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ffbe3cc631d",
+      "target": "0x7ffbe3cc6326",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ffbe3cc6326",
+      "target": "0x7ff77ec31930",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31930",
+      "target": "0x7ff77ec31955",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31955",
+      "target": "0x7ff77ec33130",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33130",
+      "target": "0x7ff77ec33490",
+      "type": "call",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec33490",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "invoke",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec33490",
+      "target": "0x7ff77ec33161",
+      "type": "jump_true",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec33161",
+      "target": "0x7ff77ec334a8",
+      "type": "call",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec334a8",
+      "target": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "type": "invoke",
+      "count": 2
+    },
+    {
+      "source": "api:ucrtbase.dll!__acrt_iob_func",
+      "target": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "type": "seq",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec334a8",
+      "target": "0x7ff77ec33180",
+      "type": "jump_true",
+      "count": 2
+    },
+    {
+      "source": "0x7ff77ec33180",
+      "target": "0x7ff77ec31964",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31964",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31964",
+      "target": "0x7ff77ec31972",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31972",
+      "target": "0x7ff77ec334c0",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec334c0",
+      "target": "api:ucrtbase.dll!fgets",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!__acrt_iob_func",
+      "target": "api:ucrtbase.dll!fgets",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec334c0",
+      "target": "0x7ff77ec31989",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31989",
+      "target": "0x7ff77ec31995",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31995",
+      "target": "0x7ff77ec33468",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33468",
+      "target": "api:ucrtbase.dll!strcspn",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!fgets",
+      "target": "api:ucrtbase.dll!strcspn",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33468",
+      "target": "0x7ff77ec319a8",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec319a8",
+      "target": "0x7ff77ec316c0",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec316c0",
+      "target": "0x7ff77ec330a0",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec330a0",
+      "target": "0x7ff77ec330af",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec330af",
+      "target": "0x7ff77ec330af",
+      "type": "jump_true",
+      "count": 255
+    },
+    {
+      "source": "0x7ff77ec330af",
+      "target": "0x7ff77ec330c8",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec330c8",
+      "target": "0x7ff77ec316cb",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec316cb",
+      "target": "0x7ff77ec33460",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33460",
+      "target": "api:ucrtbase.dll!memset",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!strcspn",
+      "target": "api:ucrtbase.dll!memset",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33460",
+      "target": "0x7ff77ec316f4",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec316f4",
+      "target": "0x7ff77ec33130",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!memset",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33180",
+      "target": "0x7ff77ec3170e",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec3170e",
+      "target": "0x7ff77ec319b9",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec319b9",
+      "target": "0x7ff77ec31754",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31754",
+      "target": "0x7ff77ec33470",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33470",
+      "target": "api:ucrtbase.dll!strlen",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "target": "api:ucrtbase.dll!strlen",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33470",
+      "target": "0x7ff77ec3176c",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec3176c",
+      "target": "0x7ff77ec31772",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31772",
+      "target": "0x7ff77ec31898",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec31898",
+      "target": "0x7ff77ec319c5",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec319c5",
+      "target": "0x7ff77ec319d0",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec319d0",
+      "target": "0x7ff77ec334d0",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec334d0",
+      "target": "api:ucrtbase.dll!puts",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!strlen",
+      "target": "api:ucrtbase.dll!puts",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec334d0",
+      "target": "0x7ff77ec319df",
+      "type": "jump_true",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec319df",
+      "target": "0x7ff77ec3133b",
+      "type": "ret",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec3133b",
+      "target": "0x7ff77ec3134b",
+      "type": "jump_false",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec3134b",
+      "target": "0x7ff77ec33558",
+      "type": "call",
+      "count": 1
+    },
+    {
+      "source": "0x7ff77ec33558",
+      "target": "api:ucrtbase.dll!exit",
+      "type": "invoke",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!puts",
+      "target": "api:ucrtbase.dll!exit",
+      "type": "seq",
+      "count": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x7ff77ec35135",
+      "arg": 2
+    },
+    {
+      "source": "api:ucrtbase.dll!fgets",
+      "target": "api:ucrtbase.dll!strcspn",
+      "type": "dataflow",
+      "count": 1,
+      "value": "0x9be51ff6f0",
+      "arg": 0
+    },
+    {
+      "source": "api:ucrtbase.dll!fgets",
+      "target": "api:ucrtbase.dll!strcspn",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x9be51ff6f0",
+      "arg": 0
+    },
+    {
+      "source": "api:ucrtbase.dll!memset",
+      "target": "api:ucrtbase.dll!__acrt_iob_func",
+      "type": "buffer",
+      "count": 2,
+      "value": "0x9be50ff6c0",
+      "arg": 1
+    },
+    {
+      "source": "api:ucrtbase.dll!fgets",
+      "target": "api:ucrtbase.dll!strlen",
+      "type": "dataflow",
+      "count": 1,
+      "value": "0x9be51ff6f0",
+      "arg": 0
+    },
+    {
+      "source": "api:ucrtbase.dll!strcspn",
+      "target": "api:ucrtbase.dll!strlen",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x9be51ff6f0",
+      "arg": 0
+    },
+    {
+      "source": "api:ucrtbase.dll!__stdio_common_vfprintf",
+      "target": "api:ucrtbase.dll!strlen",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x7ff77ec35050",
+      "arg": 2
+    },
+    {
+      "source": "api:ucrtbase.dll!strlen",
+      "target": "api:ucrtbase.dll!puts",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x7ff77ec35050",
+      "arg": 2
+    },
+    {
+      "source": "api:ucrtbase.dll!puts",
+      "target": "api:ucrtbase.dll!exit",
+      "type": "buffer",
+      "count": 1,
+      "value": "0x7ff77ec35050",
+      "arg": 2
+    }
+  ],
+  "events": [
+    {
+      "seq": 11,
+      "kind": "api",
+      "name": "ucrtbase.dll!__acrt_iob_func",
+      "site": "0x7ffbe431fcf0",
+      "category": "other",
+      "args": [
+        1,
+        669564008016,
+        8258,
+        32
+      ],
+      "ret": 0,
+      "log": "__acrt_iob_func(0x1, 0x9be51ff650, 0x2042, 0x20)"
+    },
+    {
+      "seq": 14,
+      "kind": "api",
+      "name": "ucrtbase.dll!__stdio_common_vfprintf",
+      "site": "0x7ffbe431b370",
+      "category": "other",
+      "args": [
+        0,
+        0,
+        140700960379189,
+        0
+      ],
+      "ret": 0,
+      "log": "__stdio_common_vfprintf(0x0, 0x0, 0x7ff77ec35135, 0x0)"
+    },
+    {
+      "seq": 17,
+      "kind": "api",
+      "name": "ucrtbase.dll!__acrt_iob_func",
+      "site": "0x7ffbe431fcf0",
+      "category": "other",
+      "args": [
+        0,
+        0,
+        140700960379189,
+        0
+      ],
+      "ret": 0,
+      "log": "__acrt_iob_func(0x0, 0x0, 0x7ff77ec35135, 0x0)"
+    },
+    {
+      "seq": 20,
+      "kind": "api",
+      "name": "ucrtbase.dll!fgets",
+      "site": "0x7ffbe4375150",
+      "category": "other",
+      "args": [
+        669564008176,
+        64,
+        0,
+        0
+      ],
+      "ret": 669564008176,
+      "log": "fgets -> wrote fake key, returning buf ptr (success)"
+    },
+    {
+      "seq": 24,
+      "kind": "api",
+      "name": "ucrtbase.dll!strcspn",
+      "site": "0x7ffbe4325890",
+      "category": "other",
+      "args": [
+        669564008176,
+        140700960379209,
+        0,
+        0
+      ],
+      "ret": 16,
+      "log": "strcspn -> pretending no reject chars found"
+    },
+    {
+      "seq": 287,
+      "kind": "api",
+      "name": "ucrtbase.dll!memset",
+      "site": "0x7ffbe4348830",
+      "category": "other",
+      "args": [
+        669562959552,
+        65,
+        1048575,
+        0
+      ],
+      "ret": 0,
+      "log": "memset(0x9be50ff6c0, 0x41, 0xfffff, 0x0)"
+    },
+    {
+      "seq": 291,
+      "kind": "api",
+      "name": "ucrtbase.dll!__acrt_iob_func",
+      "site": "0x7ffbe431fcf0",
+      "category": "other",
+      "args": [
+        1,
+        669562959552,
+        1048575,
+        0
+      ],
+      "ret": 0,
+      "log": "__acrt_iob_func(0x1, 0x9be50ff6c0, 0xfffff, 0x0)"
+    },
+    {
+      "seq": 294,
+      "kind": "api",
+      "name": "ucrtbase.dll!__stdio_common_vfprintf",
+      "site": "0x7ffbe431b370",
+      "category": "other",
+      "args": [
+        0,
+        0,
+        140700960378960,
+        0
+      ],
+      "ret": 0,
+      "log": "__stdio_common_vfprintf(0x0, 0x0, 0x7ff77ec35050, 0x0)"
+    },
+    {
+      "seq": 300,
+      "kind": "api",
+      "name": "ucrtbase.dll!strlen",
+      "site": "0x7ffbe4325f00",
+      "category": "other",
+      "args": [
+        669564008176,
+        0,
+        140700960378960,
+        0
+      ],
+      "ret": 0,
+      "log": "strlen(0x9be51ff6f0, 0x0, 0x7ff77ec35050, 0x0)"
+    },
+    {
+      "seq": 307,
+      "kind": "api",
+      "name": "ucrtbase.dll!puts",
+      "site": "0x7ffbe4383d50",
+      "category": "other",
+      "args": [
+        140700960379216,
+        0,
+        140700960378960,
+        0
+      ],
+      "ret": 0,
+      "log": "puts(0x7ff77ec35150, 0x0, 0x7ff77ec35050, 0x0)"
+    },
+    {
+      "seq": 312,
+      "kind": "api",
+      "name": "ucrtbase.dll!exit",
+      "site": "0x7ffbe43203e0",
+      "category": "process",
+      "args": [
+        0,
+        0,
+        140700960378960,
+        0
+      ],
+      "ret": 0,
+      "log": "exit"
+    }
+  ]
+}

@@ -468,3 +468,107 @@ def test_graph_serializers(tmp_path):
     dot = graph.to_dot()
     assert dot.startswith("digraph behavior {")
     assert "syscall:close" in dot
+
+
+# -- process/thread terminators end the trace -------------------------------
+#
+# Calling exit()/ExitProcess() leaves no return address to follow. Popping the
+# stack slot anyway lands on whatever the capture held there (typically 0) and
+# walks into thread-teardown code, which used to surface as a bogus
+# UC_ERR_FETCH_UNMAPPED plus API nodes for calls the program never made.
+
+
+def _write_terminator_slice(path, export=b"ExitProcess"):
+    """The API slice, but the exported function is *export* and rbx is seeded
+    so we can tell whether the instruction after the call ever ran."""
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ThreadContexts)
+           | (1 << CapBit.ModuleList))
+    hdr = FileHeader(os_type=OSType.Windows, arch_type=ArchType.x86_64, pid=7,
+                     cap_bitmap=cap)
+    code_page = CODE_API + b"\x90" * (PS - len(CODE_API))
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="C:/demo.exe"))
+        w.write_module_list([ModuleEntry(
+            base_addr=MOD_VA, module_size=PS,
+            path="C:/Windows/System32/kernel32.dll")])
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[code_page]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=MOD_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED],
+            page_data_chunks=[_build_pe_page(name=export)]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
+        w.write_thread_context(ThreadContext(
+            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=[
+                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", (STACK_VA + 0x800).to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rbx", (0xB0B0).to_bytes(8, "little"), 0),
+            ]))
+        w.finalize()
+
+
+def test_exit_api_ends_trace_cleanly(tmp_path):
+    pytest.importorskip("unicorn")
+    from memslicer.behavior.tracer import BehaviorTracer
+    from memslicer.emu.engine import open_slice
+
+    p = tmp_path / "exit.msl"
+    _write_terminator_slice(p)
+    emu = open_slice(str(p))
+    graph = BehaviorTracer(emu).run(max_steps=20)
+
+    # A normal end of run, not a fault.
+    assert graph.meta["stop_reason"] == "exit: kernel32.dll!ExitProcess"
+    # The call itself is still recorded...
+    assert "api:kernel32.dll!ExitProcess" in graph.nodes
+    # ...but nothing after it ran: rbx keeps its captured value.
+    assert emu.read_reg("rbx") == 0xB0B0
+
+
+def test_analyst_stub_cannot_continue_past_exit(tmp_path):
+    """emit_skeleton() writes `return ctx.CONTINUE` for every stub, so a
+    CONTINUE on exit() is boilerplate, not a deliberate override -- honouring
+    it would silently resume into thread teardown."""
+    pytest.importorskip("unicorn")
+    from memslicer.behavior.stubs import load_stubs
+    from memslicer.behavior.tracer import BehaviorTracer
+    from memslicer.emu.engine import open_slice
+
+    stub_file = tmp_path / "stubs.py"
+    stub_file.write_text(
+        "def ExitProcess(ctx):\n"
+        "    ctx.set_ret(0)\n"
+        "    return ctx.CONTINUE\n"
+    )
+    p = tmp_path / "exit.msl"
+    _write_terminator_slice(p)
+    emu = open_slice(str(p))
+    graph = BehaviorTracer(emu, registry=load_stubs(str(stub_file))).run(max_steps=20)
+
+    assert graph.meta["stop_reason"] == "exit: kernel32.dll!ExitProcess"
+    assert emu.read_reg("rbx") == 0xB0B0
+
+
+def test_terminate_process_is_not_a_terminator(tmp_path):
+    """TerminateProcess takes a target handle and is routinely used on another
+    process, so execution must carry on after it."""
+    pytest.importorskip("unicorn")
+    from memslicer.behavior.tracer import BehaviorTracer
+    from memslicer.emu.engine import open_slice
+
+    p = tmp_path / "term.msl"
+    _write_terminator_slice(p, export=b"TerminateProcess")
+    emu = open_slice(str(p))
+    graph = BehaviorTracer(emu).run(max_steps=20)
+
+    assert not graph.meta["stop_reason"].startswith("exit:")
+    # `mov rbx, rax` after the call did run, so rbx no longer holds 0xB0B0.
+    assert emu.read_reg("rbx") != 0xB0B0

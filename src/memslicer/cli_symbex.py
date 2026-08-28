@@ -290,6 +290,30 @@ def _get_buffer_address(
     return fallback_addr
 
 
+def _select_key_hint(state: Any) -> Any | None:
+    """Pick the best usable KeyHint stashed by ``load_angr`` in
+    ``state.globals["msl_key_hints"]`` (a live-acquired hint of where captured
+    key material sits), or ``None`` if there is nothing usable.
+
+    Only hints whose owning region was actually captured — i.e. those with a
+    resolved absolute ``address`` — can seed an injection, so unresolved hints
+    are skipped here (they are still visible in ``state.globals`` for
+    diagnostics). Among resolved hints, prefer the highest confidence, then one
+    that carries a known key length, so a Confirmed hint wins over a
+    Speculative one for the same slice."""
+    try:
+        hints = state.globals.get("msl_key_hints") or []
+    except Exception:
+        return None
+    usable = [h for h in hints if getattr(h, "address", None) is not None]
+    if not usable:
+        return None
+    return max(
+        usable,
+        key=lambda h: (getattr(h, "confidence", 0), 1 if getattr(h, "key_len", 0) else 0),
+    )
+
+
 @click.command()
 @click.argument("dump", type=click.Path(exists=True, dir_okay=False))
 @click.option("-e", "--entry", help="Override starting PC address for symbolic execution (e.g. 0x140001754)")
@@ -297,6 +321,7 @@ def _get_buffer_address(
 @click.option("-k", "--sym-bytes", type=int, default=16, help="Size of symbolic buffer to inject in bytes (default: 16)")
 @click.option("-b", "--binary-key", "binary_key", is_flag=True, help="Inject unconstrained raw byte buffer (not restricted to printable ASCII 0x20-0x7E)")
 @click.option("--buffer-addr", "buffer_addr_str", help="Explicit virtual address or custom fallback for injected symbolic buffer (e.g. 0x50000000)")
+@click.option("--use-key-hints", "use_key_hints", is_flag=True, help="Auto-target the symbolic buffer at a live-acquired KeyHint (0x0020) instead of the RBP-0x40/RSP+0x20 heuristic; also adopts the hint's key length as --sym-bytes when known. An explicit --buffer-addr still wins.")
 @click.option("-m", "--avoid-module", "avoid_modules", multiple=True, help="Module name or address range to avoid (repeatable)")
 @click.option("-r", "--find-rax-success", is_flag=True, help="Find paths where function return value (RAX) equals 1 post-return. Meaningful for license/key-check style targets; against generic real-world code almost any reachable function can trivially return 1, so a match here is not evidence of anything specific — use --find ADDR instead when you have a real target address")
 @click.option("-f", "--find", multiple=True, help="Address(es) to reach (repeatable)")
@@ -312,6 +337,7 @@ def main(
     sym_bytes,
     binary_key,
     buffer_addr_str,
+    use_key_hints,
     avoid_modules,
     find_rax_success,
     find,
@@ -328,6 +354,32 @@ def main(
         raise click.ClickException(str(exc))
 
     explicit_buf_addr = _parse_addr(buffer_addr_str) if buffer_addr_str else None
+
+    # --use-key-hints: prefer a live-acquired KeyHint over the blind
+    # RBP-0x40/RSP+0x20 heuristic. An explicit --buffer-addr is a deliberate
+    # override and still wins; otherwise the hint's resolved address seeds the
+    # injection and (when known) its key length becomes --sym-bytes.
+    if use_key_hints and explicit_buf_addr is None:
+        hint = _select_key_hint(state)
+        if hint is not None:
+            explicit_buf_addr = hint.address
+            note = f" ({hint.note})" if getattr(hint, "note", "") else ""
+            if hint.key_len > 0:
+                sym_bytes = hint.key_len
+                click.echo(
+                    f"[+] Using KeyHint at {hint.address:#x}, "
+                    f"key_len={hint.key_len} -> --sym-bytes {sym_bytes}{note}"
+                )
+            else:
+                click.echo(
+                    f"[+] Using KeyHint at {hint.address:#x} "
+                    f"(unknown key_len; keeping --sym-bytes {sym_bytes}){note}"
+                )
+        else:
+            click.echo(
+                "[!] --use-key-hints: no resolved KeyHint in slice; "
+                "falling back to RBP-0x40/RSP+0x20 heuristic"
+            )
 
     if auto_map_unmapped:
         enable_unmapped_memory_recovery(project=project, state=state)

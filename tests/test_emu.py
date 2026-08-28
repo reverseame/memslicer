@@ -698,3 +698,213 @@ def test_cli_resume_from_syscall_image_range(tmp_path):
         main, [str(p), "-R", "--image-range", f"{CODE_VA:#x}:{CODE_VA + PS:#x}"])
     assert res.exit_code == 0, res.output
     assert f"caller return @ {CODE_VA:#x}" in res.output
+
+
+# ---- stack pre-mapping (requires the emu extra) -------------------------
+#
+# A slice only captures a few pages around the captured SP, so a function that
+# opens a frame deeper than that (a 1MB buffer behind a __chkstk probe loop)
+# walks straight off the captured stack and faults with UC_ERR_*_UNMAPPED.
+# _premap_stack_region backs the rest of the window with blank RW pages -- the
+# concrete port of symbex's premap_stack_region (see test_unmapped_handler.py).
+
+# mov [rsp-0x100000], rax ; mov rbx, [rsp-0x100000]  -- a write 1MB below SP,
+# read back, i.e. the deepest touch a 1MB stack frame would make.
+DEEP_STACK_CODE = bytes.fromhex("488984240000f0ff" "488b9c240000f0ff")
+DEEP_MARKER = 0xD00DFEEDCAFEBABE
+STACK_CANARY = b"\xa5" * PS
+
+
+def _write_deep_stack_slice(path, code=DEEP_STACK_CODE):
+    """A slice whose only captured stack is the single page under SP, filled
+    with a canary so we can prove pre-mapping never overwrites real bytes."""
+    page = code + b"\x90" * (PS - len(code))
+    cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
+           | (1 << CapBit.ThreadContexts))
+    hdr = FileHeader(os_type=OSType.Linux, arch_type=ArchType.x86_64, pid=7,
+                     cap_bitmap=cap)
+    with open(path, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_process_identity(ProcessIdentity(exe_path="/bin/demo"))
+        w.write_memory_region(MemoryRegion(
+            base_addr=CODE_VA, region_size=PS, protection=0b101,
+            region_type=RegionType.Image, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[page]))
+        w.write_memory_region(MemoryRegion(
+            base_addr=STACK_VA, region_size=PS, protection=0b011,
+            region_type=RegionType.Stack, page_size=PS,
+            page_states=[PageState.CAPTURED], page_data_chunks=[STACK_CANARY]))
+        w.write_thread_context(ThreadContext(
+            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            name="main", registers=[
+                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
+                ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rax", DEEP_MARKER.to_bytes(8, "little"), 0),
+            ]))
+        w.finalize()
+
+
+def test_deep_stack_write_faults_without_premap(tmp_path):
+    """Before-state: with pre-mapping off, the first touch below the captured
+    stack page dies exactly as memslicer.behavior did."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)), premap_stack_mb=0)
+
+    res = emu.step()                                  # mov [rsp-0x100000], rax
+    assert not res.ok
+    assert "UNMAPPED" in res.error.upper(), res.error
+
+
+def test_premap_stack_region_absorbs_deep_frame(tmp_path):
+    """After-state: the same write lands, and the value reads back intact."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))             # default 64MB window
+
+    deep_addr = STACK_VA + 0xf00 - 0x100000
+    r1 = emu.step()                                   # mov [rsp-0x100000], rax
+    assert r1.ok, r1.error
+    r2 = emu.step()                                   # mov rbx, [rsp-0x100000]
+    assert r2.ok, r2.error
+    # The value, not just the absence of an exception.
+    assert emu.read_reg("rbx") == DEEP_MARKER
+    assert emu.read_mem(deep_addr, 8) == DEEP_MARKER.to_bytes(8, "little")
+
+
+def test_premap_stack_region_zero_fills_and_spans_window(tmp_path):
+    """Pre-mapped pages read as zero, and the window really is 64MB wide."""
+    unicorn = pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+    sp = STACK_VA + 0xf00
+
+    assert emu.read_mem(sp - 0x100000, 64) == b"\x00" * 64
+    # 32MB either side of SP (the half-window edges), minus a page of slack.
+    assert emu.read_mem(sp - 32 * 1024 * 1024 + PS, 8) == b"\x00" * 8
+    assert emu.read_mem(sp + 32 * 1024 * 1024 - 2 * PS, 8) == b"\x00" * 8
+    # Just outside the window is still unmapped: this is a bounded window, not
+    # a blanket "map everything".
+    with pytest.raises(unicorn.UcError):
+        emu.read_mem(sp + 33 * 1024 * 1024, 8)
+
+
+def test_premap_stack_region_preserves_captured_bytes(tmp_path):
+    """Captured stack pages inside the window are never re-mapped or zeroed."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    assert emu.read_mem(STACK_VA, PS) == STACK_CANARY
+    assert emu.read_mem(CODE_VA, len(DEEP_STACK_CODE)) == DEEP_STACK_CODE
+
+
+def test_premap_stack_region_follows_thread_switch(tmp_path):
+    """switch_thread() re-seeds SP from another thread, so that thread's stack
+    gets a window too."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "mt.msl"
+    _write_multithread_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+    emu.switch_thread(200)
+    sp = emu.read_reg("rsp")
+    assert emu.read_mem(sp - 0x100000, 8) == b"\x00" * 8
+
+
+# ---- provenance of pre-mapped stack ------------------------------------
+#
+# Pre-mapping trades a loud fault for a quiet zero: reading stack the slice
+# never captured now yields 0 instead of raising. So the emulator has to say
+# which values it invented -- CLAUDE.md's rule that auto-recovery must
+# distinguish "fill I created" from "real data being touched again".
+
+# mov rbx, [rsp-0x200000]  -- a read of stack nothing ever wrote.
+UNWRITTEN_READ_CODE = bytes.fromhex("488b9c240000e0ff")
+
+
+def test_synthetic_ranges_exclude_captured_memory(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+
+    assert emu.is_synthetic(STACK_VA + 0xf00 - 0x100000)   # fill we invented
+    assert not emu.is_synthetic(STACK_VA)                  # captured stack page
+    assert not emu.is_synthetic(CODE_VA)                   # captured code page
+    assert emu.synthetic_ranges()
+
+
+def test_write_then_read_of_premapped_stack_is_not_flagged(tmp_path):
+    """Once the code writes a page it owns it; reading it back is ordinary
+    program behaviour, not consumption of invented data."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "deep.msl"
+    _write_deep_stack_slice(p)
+    emu = MSLEmulator(load_slice(str(p)))
+    emu.step()                                   # mov [rsp-0x100000], rax
+    emu.step()                                   # mov rbx, [rsp-0x100000]
+
+    assert emu.read_reg("rbx") == DEEP_MARKER
+    assert emu.synthetic_read_count() == 0
+    assert emu.synthetic_reads() == []
+
+
+def test_read_of_unwritten_premapped_stack_is_flagged(tmp_path):
+    """The value came from fill we invented, so the run is recorded as having
+    consumed data the capture never held."""
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "unwritten.msl"
+    _write_deep_stack_slice(p, code=UNWRITTEN_READ_CODE)
+    emu = MSLEmulator(load_slice(str(p)))
+    res = emu.step()                             # mov rbx, [rsp-0x200000]
+
+    assert res.ok                                # it did not fault...
+    assert emu.read_reg("rbx") == 0              # ...it read invented zeros
+    assert emu.synthetic_read_count() == 1
+    (pc, addr, size), = emu.synthetic_reads()
+    assert pc == CODE_VA
+    assert addr == STACK_VA + 0xf00 - 0x200000
+    assert size == 8
+
+
+def test_no_premap_means_nothing_is_synthetic(tmp_path):
+    pytest.importorskip("unicorn")
+    pytest.importorskip("capstone")
+    from memslicer.emu.engine import MSLEmulator
+
+    p = tmp_path / "unwritten.msl"
+    _write_deep_stack_slice(p, code=UNWRITTEN_READ_CODE)
+    emu = MSLEmulator(load_slice(str(p)), premap_stack_mb=0)
+    res = emu.step()
+
+    assert not res.ok                            # loud fault, as before the port
+    assert emu.synthetic_ranges() == []
+    assert emu.synthetic_read_count() == 0

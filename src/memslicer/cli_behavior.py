@@ -38,6 +38,10 @@ from memslicer.emu.engine import EmuError, open_slice
 @click.option("--stubs", type=click.Path(exists=True, dir_okay=False),
               default=None, help="Load analyst-edited syscall/API stubs "
               "(merged on top of --stublib if both are given).")
+@click.option("--premap-stack/--no-premap-stack", "premap_stack", default=True,
+              help="Back the stack with blank pages beyond what the slice "
+              "captured, so deep frames do not fault. Disable to make such "
+              "accesses fault instead of reading invented zeros. [default: on]")
 @click.option("--memory/--no-memory", "memory", default=True,
               help="Annotate memory writes (RWX, self-modifying code, region "
               "type). [default: on]")
@@ -56,7 +60,7 @@ from memslicer.emu.engine import EmuError, open_slice
               help="DOT rendering style: 'ida' (disassembly tables) or 'basic'. [default: ida]")
 @click.option("--arg0", "--rcx", default=None,
               help="Pass a string or address argument in RCX register (e.g. password string).")
-def main(dump, granularity, max_steps, start, backend, memory, call_graph,
+def main(dump, granularity, max_steps, start, backend, premap_stack, memory, call_graph,
          stublib, stubs, emit_stubs, output, fmt, features, style, arg0):
     """Extract the behavior graph of the MSL slice DUMP."""
     registry = build_default_registry() if stublib else None
@@ -71,7 +75,7 @@ def main(dump, granularity, max_steps, start, backend, memory, call_graph,
         return
 
     try:
-        emu = open_slice(dump)
+        emu = open_slice(dump, premap_stack_mb=64 if premap_stack else 0)
     except EmuError as exc:
         raise click.ClickException(str(exc))
 
@@ -151,6 +155,15 @@ def _write_graph(graph, output, fmt, style="ida"):
         f"edges={len(graph.edges)} syscalls={len(graph.events)} "
         f"stop={m.get('stop_reason')!r}"
     )
+    invented = m.get("synthetic_stack_reads") or 0
+    if invented:
+        sites = m.get("synthetic_stack_read_sites") or 0
+        click.echo(
+            f"note: {invented} read(s) from {sites} instruction(s) took values "
+            f"from pre-mapped stack the slice never captured -- those bytes are "
+            f"invented zero fill. Re-run with --no-premap-stack to make such "
+            f"accesses fault instead."
+        )
 
 
 if __name__ == "__main__":

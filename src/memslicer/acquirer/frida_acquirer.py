@@ -31,12 +31,14 @@ class FridaAcquirer(BaseAcquirer):
         max_chunk_size: int = _DEFAULT_MAX_CHUNK,
         investigation: bool = False,
         collector: InvestigationCollector | None = None,
+        collect_key_hints: bool = False,
     ) -> None:
         bridge = FridaBridge(
             target=target,
             device=device,
             read_timeout=read_timeout,
             logger=logger,
+            collect_key_hints=collect_key_hints,
         )
         self._engine = AcquisitionEngine(
             bridge=bridge,
