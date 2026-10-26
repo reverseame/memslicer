@@ -19,7 +19,7 @@ from memslicer.acquirer.bridge import (
     PlatformInfo,
     RegisterValue,
     ThreadInfo,
-    register_role,
+    make_register,
     register_width_bytes,
     vector_register_width,
 )
@@ -353,7 +353,8 @@ class GDBBridge:
         for gid_s, st in re.findall(r'id="(\d+)"[^{]*?state="([^"]*)"', info_out):
             state_map[int(gid_s)] = st
 
-        width = register_width_bytes(self.get_platform_info().arch)
+        info = self.get_platform_info()
+        width = register_width_bytes(info.arch)
 
         threads: list[ThreadInfo] = []
         for gid in gids:
@@ -364,6 +365,7 @@ class GDBBridge:
             except (RuntimeError, TimeoutError):
                 continue
             regs: list[RegisterValue] = []
+            partial = False
             for num_s, val_s in re.findall(
                 r'\{number="(\d+)",value="([^"]*)"\}', vals_out
             ):
@@ -376,17 +378,21 @@ class GDBBridge:
                 try:
                     ival = int(val_s, 16) if val_s.startswith("0x") else int(val_s)
                 except ValueError:
+                    # Non-scalar values (vector unions, "<unavailable>") are
+                    # skipped; that makes the register file incomplete.
+                    partial = True
                     continue
-                regs.append(RegisterValue(
-                    name=name.lower(), value=ival,
-                    size=vector_register_width(name) or width,
-                    role=register_role(name),
+                regs.append(make_register(
+                    name, ival, vector_register_width(name) or width,
+                    info.arch, info.os,
                 ))
             threads.append(ThreadInfo(
                 tid=tid_map.get(gid, gid),
                 registers=regs,
                 is_current=(gid == current_gid),
                 state=self._STATE_MAP.get(state_map.get(gid, ""), 0),
+                suspended=True,   # GDB all-stop: registers read while stopped
+                partial=partial,
             ))
         return threads
 

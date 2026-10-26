@@ -60,7 +60,7 @@ class ThreadRegister:
     """
     name: str = ""               # lowercase canonical mnemonic, e.g. "rip"
     value: bytes = b""           # raw value bytes (width = len(value))
-    flags: int = 0               # REG_FLAG_PC / REG_FLAG_SP / REG_FLAG_FP / REG_FLAG_FLAGS
+    flags: int = 0               # REG_FLAG_PC/SP/FP/FLAGS/TLS/LR
 
 
 @dataclass
@@ -68,8 +68,9 @@ class ThreadContext:
     """Execution state of a single thread (Block 0x0011, spec Section 5.7)."""
     thread_id: int = 0
     start_time_ns: int = 0
-    flags: int = 0               # THREAD_FLAG_CURRENT / THREAD_FLAG_CRASHED
+    flags: int = 0               # THREAD_FLAG_CURRENT/CRASHED/SUSPENDED/PARTIAL
     state: ThreadState = ThreadState.Unknown
+    arch: int = 0                # ArchType of this thread's mode; 0 = file header ArchType
     name: str = ""
     registers: list[ThreadRegister] = field(default_factory=list)
 
