@@ -7,6 +7,15 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Align Thread Context blocks with spec 1.1.1 (Section 5.7): register names
+  follow the canonical mnemonics of Table 19g (ARM64 `fp`/`lr`/`cpsr` are
+  written as `x29`/`x30`/`pstate`, x86_64 `eflags` as `rflags`); the TLS
+  base (`fs_base`/`gs_base`/`tpidr_el0`/... per OS) and link register carry
+  the new Table 19b role flags; `Suspended` is set when registers were read
+  from a stopped thread (GDB/LLDB, never Frida) and `Partial` when a register
+  could not be read; thread states `Uninterruptible`/`Halted`/`Zombie`; the
+  per-thread `Arch` byte (+0x13) is written and read. The emulator loader
+  normalises `fp`/`lr` in slices from 1.1.0 producers (consumer rule 29).
 - Capture per-thread CPU register state into Thread Context blocks
   (0x0011, spec Section 5.7) so a slice can be emulated/stepped by a
   consumer. Supported on the Frida, GDB and LLDB backends; the

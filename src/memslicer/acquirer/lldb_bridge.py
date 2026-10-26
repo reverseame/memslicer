@@ -11,7 +11,7 @@ from memslicer.acquirer.bridge import (
     PlatformInfo,
     RegisterValue,
     ThreadInfo,
-    register_role,
+    make_register,
     register_width_bytes,
 )
 from memslicer.acquirer.platform_detect import (
@@ -406,7 +406,8 @@ class LLDBBridge:
         except Exception:
             selected_tid = None
 
-        width = register_width_bytes(self.get_platform_info().arch)
+        info = self.get_platform_info()
+        width = register_width_bytes(info.arch)
         threads: list[ThreadInfo] = []
 
         for i in range(process.GetNumThreads()):
@@ -414,6 +415,7 @@ class LLDBBridge:
             tid = thread.GetThreadID()
             frame = thread.GetFrameAtIndex(0)
             regs: list[RegisterValue] = []
+            partial = False
             if frame.IsValid():
                 error = _lldb.SBError()
                 for reg_set in frame.GetRegisters():
@@ -426,33 +428,35 @@ class LLDBBridge:
                             # Vector/FP register: GetValueAsUnsigned only returns
                             # up to 64 bits, so read the full raw bytes. Best
                             # effort -- if the SBData API can't provide them, skip
-                            # (as before) rather than truncate.
+                            # rather than truncate, and mark the file Partial.
                             try:
                                 data = reg.GetData()
                                 derr = _lldb.SBError()
                                 raw = data.ReadRawData(derr, 0, byte_size)
                                 if derr.Fail() or not raw or len(raw) < byte_size:
+                                    partial = True
                                     continue
-                                regs.append(RegisterValue(
-                                    name=name.lower(),
-                                    value=int.from_bytes(raw[:byte_size], "little"),
-                                    size=byte_size, role=register_role(name),
+                                regs.append(make_register(
+                                    name, int.from_bytes(raw[:byte_size], "little"),
+                                    byte_size, info.arch, info.os,
                                 ))
                             except Exception:  # noqa: BLE001 - SBData API varies
-                                pass
+                                partial = True
                             continue
                         value = reg.GetValueAsUnsigned(error, 0)
                         if error.Fail():
+                            partial = True
                             continue
-                        regs.append(RegisterValue(
-                            name=name.lower(), value=value, size=byte_size,
-                            role=register_role(name),
+                        regs.append(make_register(
+                            name, value, byte_size, info.arch, info.os,
                         ))
             threads.append(ThreadInfo(
                 tid=tid,
                 registers=regs,
                 is_current=(tid == selected_tid) if selected_tid is not None else (i == 0),
                 state=3,  # process is stopped while attached
+                suspended=True,
+                partial=partial,
             ))
         return threads
 

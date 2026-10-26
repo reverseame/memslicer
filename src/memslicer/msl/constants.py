@@ -42,14 +42,18 @@ VERSION: tuple[int, int] = (1, 1)
 # Thread Context flags (spec Section 5.7)
 # ---------------------------------------------------------------------------
 # Thread-level Flags field (Table 19a)
-THREAD_FLAG_CURRENT: int = 0x0001   # bit 0: resumption thread (PC of interest)
-THREAD_FLAG_CRASHED: int = 0x0002   # bit 1
+THREAD_FLAG_CURRENT: int = 0x0001    # bit 0: resumption thread (PC of interest)
+THREAD_FLAG_CRASHED: int = 0x0002    # bit 1
+THREAD_FLAG_SUSPENDED: int = 0x0004  # bit 2: registers read from a stopped thread
+THREAD_FLAG_PARTIAL: int = 0x0008    # bit 3: register file incomplete
 
 # Per-register Flags field (Table 19b)
 REG_FLAG_PC: int = 0x0001     # bit 0: program counter
 REG_FLAG_SP: int = 0x0002     # bit 1: stack pointer
 REG_FLAG_FP: int = 0x0004     # bit 2: frame pointer
 REG_FLAG_FLAGS: int = 0x0008  # bit 3: flags/status register
+REG_FLAG_TLS: int = 0x0010    # bit 4: thread pointer / TLS base
+REG_FLAG_LR: int = 0x0020     # bit 5: link register
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +140,9 @@ class ThreadState(IntEnum):
     Sleeping = 0x02
     Stopped = 0x03
     Waiting = 0x04
+    Uninterruptible = 0x05
+    Halted = 0x06
+    Zombie = 0x07
 
 
 class CompAlgo(IntEnum):

@@ -19,8 +19,8 @@ from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
     CompAlgo, HashAlgo, OSType, PageState, RegionType, CapBit,
     Endianness, VERSION, HASH_SIZE, FLAG_INVESTIGATION, FLAG_ENCRYPTED,
-    ThreadState, THREAD_FLAG_CURRENT,
-    REG_FLAG_PC, REG_FLAG_SP, REG_FLAG_FP, REG_FLAG_FLAGS,
+    ThreadState, THREAD_FLAG_CURRENT, THREAD_FLAG_SUSPENDED, THREAD_FLAG_PARTIAL,
+    REG_FLAG_PC, REG_FLAG_SP, REG_FLAG_FP, REG_FLAG_FLAGS, REG_FLAG_TLS, REG_FLAG_LR,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
@@ -41,6 +41,7 @@ _DEFAULT_MAX_CHUNK = 20971520  # 20 MB
 _REG_ROLE_FLAG = {
     "pc": REG_FLAG_PC, "sp": REG_FLAG_SP,
     "fp": REG_FLAG_FP, "flags": REG_FLAG_FLAGS,
+    "tls": REG_FLAG_TLS, "lr": REG_FLAG_LR,
 }
 
 
@@ -70,9 +71,14 @@ def _build_thread_contexts(threads: list[ThreadInfo]) -> list[ThreadContext]:
             state = ThreadState(t.state)
         except ValueError:
             state = ThreadState.Unknown
+        flags = THREAD_FLAG_CURRENT if t.is_current else 0
+        if t.suspended:
+            flags |= THREAD_FLAG_SUSPENDED
+        if t.partial:
+            flags |= THREAD_FLAG_PARTIAL
         contexts.append(ThreadContext(
             thread_id=t.tid,
-            flags=THREAD_FLAG_CURRENT if t.is_current else 0,
+            flags=flags,
             state=state,
             name=t.name,
             registers=regs,

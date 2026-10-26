@@ -43,13 +43,13 @@ class RegisterValue:
 
     ``role`` marks special registers so the engine can flag them without
     architecture-specific knowledge: one of ``"pc"``, ``"sp"``, ``"fp"``,
-    ``"flags"`` or ``""`` for a general register.
+    ``"flags"``, ``"tls"``, ``"lr"`` or ``""`` for a general register.
     """
 
-    name: str             # lowercase canonical mnemonic, e.g. "rip"
+    name: str             # lowercase canonical mnemonic (spec Table 19g), e.g. "rip"
     value: int            # register value as an unsigned integer
     size: int = 8         # value width in bytes
-    role: str = ""        # "pc" | "sp" | "fp" | "flags" | ""
+    role: str = ""        # "pc" | "sp" | "fp" | "flags" | "tls" | "lr" | ""
 
 
 @dataclass
@@ -61,18 +61,65 @@ class ThreadInfo:
     name: str = ""
     is_current: bool = False
     state: int = 0        # ThreadState code (0=Unknown)
+    suspended: bool = False  # registers read while the thread was stopped
+    partial: bool = False    # some register the bridge normally reads was lost
 
 
-# Canonical register-name sets used to tag special registers regardless of
-# the originating backend (spec Section 5.7, Table 19b roles).
+# Debugger-native names that spec Table 19g forbids on disk, per architecture.
+_CANONICAL_NAMES: dict[ArchType, dict[str, str]] = {
+    ArchType.x86_64: {"eflags": "rflags"},
+    ArchType.ARM64: {"fp": "x29", "lr": "x30", "cpsr": "pstate",
+                     "tpidr": "tpidr_el0"},
+    ArchType.ARM32: {"r13": "sp", "r14": "lr", "r15": "pc"},
+}
+
+
+def canonical_register_name(name: str, arch: ArchType) -> str:
+    """Lowercase *name* and replace Table 19g-forbidden aliases for *arch*."""
+    n = name.lower()
+    return _CANONICAL_NAMES.get(arch, {}).get(n, n)
+
+
+# Role sets for canonical names (spec Section 5.7, Table 19b/19g roles).
 _PC_NAMES = frozenset({"rip", "eip", "pc"})
 _SP_NAMES = frozenset({"rsp", "esp", "sp"})
-_FP_NAMES = frozenset({"rbp", "ebp", "fp", "x29"})
-_FLAGS_NAMES = frozenset({"rflags", "eflags", "cpsr", "pstate", "flags", "cspr"})
+_FP_NAMES = frozenset({"rbp", "ebp", "x29"})
+_FLAGS_NAMES = frozenset({"rflags", "eflags", "cpsr", "pstate", "nzcv"})
+_LR_NAMES = frozenset({"x30", "lr"})
+
+# Thread-pointer register per (arch, os): the one the OS uses for TLS. Only
+# that register carries the TLS role (Table 19g).
+_TLS_UNIX_X86_64 = "fs_base"
+_TLS_UNIX_ARM64 = "tpidr_el0"
+_TLS_NAMES: dict[tuple[ArchType, OSType], str] = {
+    (ArchType.x86_64, OSType.Windows): "gs_base",
+    (ArchType.x86_64, OSType.macOS): "gs_base",
+    (ArchType.x86_64, OSType.Linux): _TLS_UNIX_X86_64,
+    (ArchType.x86_64, OSType.Android): _TLS_UNIX_X86_64,
+    (ArchType.x86_64, OSType.FreeBSD): _TLS_UNIX_X86_64,
+    (ArchType.x86, OSType.Windows): "fs_base",
+    (ArchType.x86, OSType.Linux): "gs_base",
+    (ArchType.x86, OSType.Android): "gs_base",
+    (ArchType.ARM64, OSType.Windows): "x18",
+    (ArchType.ARM64, OSType.macOS): "tpidrro_el0",
+    (ArchType.ARM64, OSType.iOS): "tpidrro_el0",
+    (ArchType.ARM64, OSType.Linux): _TLS_UNIX_ARM64,
+    (ArchType.ARM64, OSType.Android): _TLS_UNIX_ARM64,
+    (ArchType.ARM64, OSType.FreeBSD): _TLS_UNIX_ARM64,
+    (ArchType.ARM32, OSType.Linux): "tpidruro",
+    (ArchType.ARM32, OSType.Android): "tpidruro",
+}
 
 
-def register_role(name: str) -> str:
-    """Map a register mnemonic to its role: ``pc``/``sp``/``fp``/``flags``/``""``."""
+def register_role(name: str, arch: ArchType | None = None,
+                  os: OSType | None = None) -> str:
+    """Map a canonical register name to its role.
+
+    Returns ``pc``/``sp``/``fp``/``flags``/``lr``/``tls`` or ``""``. The
+    ``tls`` role needs *arch* and *os*: it is assigned only to the register
+    the OS uses as thread pointer (e.g. ``fs_base`` on Linux x86_64,
+    ``gs_base`` on Windows x86_64, ``tpidr_el0`` on Linux ARM64).
+    """
     n = name.lower()
     if n in _PC_NAMES:
         return "pc"
@@ -82,7 +129,19 @@ def register_role(name: str) -> str:
         return "fp"
     if n in _FLAGS_NAMES:
         return "flags"
+    if n in _LR_NAMES:
+        return "lr"
+    if arch is not None and os is not None and n == _TLS_NAMES.get((arch, os)):
+        return "tls"
     return ""
+
+
+def make_register(name: str, value: int, size: int,
+                  arch: ArchType, os: OSType) -> RegisterValue:
+    """Build a :class:`RegisterValue` with the canonical name and role."""
+    canon = canonical_register_name(name, arch)
+    return RegisterValue(name=canon, value=value, size=size,
+                         role=register_role(canon, arch, os))
 
 
 # Register width in bytes per architecture (GPRs).

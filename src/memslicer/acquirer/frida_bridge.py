@@ -6,7 +6,7 @@ from typing import Any
 
 from memslicer.acquirer.bridge import (
     MemoryRange, ModuleInfo, PlatformInfo,
-    RegisterValue, ThreadInfo, register_role, register_width_bytes,
+    RegisterValue, ThreadInfo, make_register, register_width_bytes,
     vector_register_width,
 )
 from memslicer.acquirer.platform_detect import detect_platform
@@ -318,7 +318,7 @@ class FridaBridge:
     # Frida thread.state strings -> MSL ThreadState codes (spec Table 19a).
     _STATE_MAP = {
         "running": 1, "stopped": 3, "waiting": 4,
-        "uninterruptible": 4, "halted": 3,
+        "uninterruptible": 5, "halted": 6,
     }
 
     def enumerate_threads(self) -> list[ThreadInfo]:
@@ -327,7 +327,11 @@ class FridaBridge:
         Frida exposes both arch-specific names (``rip``/``rsp``) and the
         generic ``pc``/``sp`` aliases. On x86/x86_64 the generic aliases
         duplicate ``rip``/``rsp``/``eip``/``esp`` and are dropped; on
-        AArch64 ``pc``/``sp`` ARE the canonical names and are kept.
+        AArch64 ``pc``/``sp`` ARE the canonical names and are kept, while
+        ``fp``/``lr`` are renamed to ``x29``/``x30`` (spec Table 19g).
+
+        Frida samples the context of running threads without stopping them,
+        so the resulting blocks never carry the ``Suspended`` flag.
         """
         try:
             raw = self._api.enumerate_threads()
@@ -335,8 +339,8 @@ class FridaBridge:
             self._log.warning("Thread enumeration failed: %s", exc)
             return []
 
-        arch = self._platform_info.arch if self._platform_info else None
-        width = register_width_bytes(arch) if arch is not None else 8
+        info = self._platform_info or self.get_platform_info()
+        width = register_width_bytes(info.arch)
 
         threads: list[ThreadInfo] = []
         for idx, t in enumerate(raw):
@@ -345,6 +349,7 @@ class FridaBridge:
             drop_pc = bool(names & {"rip", "eip"})
             drop_sp = bool(names & {"rsp", "esp"})
             regs: list[RegisterValue] = []
+            partial = False
             for name, val in ctx.items():
                 if name == "pc" and drop_pc:
                     continue
@@ -353,17 +358,18 @@ class FridaBridge:
                 try:
                     ival = _parse_frida_addr(val)
                 except (TypeError, ValueError):
+                    partial = True
                     continue
-                regs.append(RegisterValue(
-                    name=name, value=ival,
-                    size=vector_register_width(name) or width,
-                    role=register_role(name),
+                regs.append(make_register(
+                    name, ival, vector_register_width(name) or width,
+                    info.arch, info.os,
                 ))
             threads.append(ThreadInfo(
                 tid=t.get("id", 0),
                 registers=regs,
                 is_current=(idx == 0),
                 state=self._STATE_MAP.get(t.get("state", ""), 0),
+                partial=partial,
             ))
         return threads
 

@@ -11,14 +11,18 @@ from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
     ArchType, BlockType, OSType, PageState, REG_FLAG_PC, REG_FLAG_SP,
+    THREAD_FLAG_CURRENT,
 )
 from memslicer.msl.iterator import iterate_blocks
 from memslicer.utils.padding import pad8
 
 _REGION_HDR = "<QQBBB5sQ"   # BaseAddr, RegionSize, Protection, RegionType, PageSizeLog2, rsv, Timestamp
-_TC_HDR = "<QQHBBIH6s"       # ThreadID, StartTime, Flags, State, rsv, RegCount, NameLen, rsv
+_TC_HDR = "<QQHBBIH6s"       # ThreadID, StartTime, Flags, State, Arch, RegCount, NameLen, rsv
 _MOD_HDR = "<QQHHI"          # BaseAddr, ModuleSize, PathLen, VersionLen, rsv
-_THREAD_FLAG_CURRENT = 0x1
+
+# Spec 1.1.1 consumer rule 29: 1.1.0 producers could write the ARM64 aliases
+# forbidden by Table 19g; normalise them so the emulator finds the registers.
+_ARM64_ALIASES = {"fp": "x29", "lr": "x30"}
 
 
 @dataclass
@@ -33,9 +37,10 @@ class EmuReg:
 
 @dataclass
 class EmuThread:
-    """A captured thread: identifier and register file."""
+    """A captured thread: identifier, execution mode and register file."""
     tid: int
     is_current: bool
+    arch: ArchType = ArchType.Unknown   # mode this thread executes in
     registers: list[EmuReg] = field(default_factory=list)
 
     @property
@@ -145,15 +150,24 @@ def _parse_region(payload: bytes) -> EmuRegion:
                      page_size=page_size, region_type=_rt, pages=pages)
 
 
-def _parse_thread(payload: bytes) -> EmuThread:
-    tid, _st, flags, _state, _r, regcount, namelen, _r2 = struct.unpack(
+def _parse_thread(payload: bytes, file_arch: ArchType) -> EmuThread:
+    tid, _st, flags, _state, arch_code, regcount, namelen, _r2 = struct.unpack(
         _TC_HDR, payload[:32]
     )
+    # Table 19a: Arch 0 = same as the file header ArchType.
+    arch = file_arch
+    if arch_code:
+        try:
+            arch = ArchType(arch_code)
+        except ValueError:
+            arch = ArchType.Unknown
     off = 32 + pad8(namelen)
     regs: list[EmuReg] = []
     for _ in range(regcount):
         rnamelen, width, rflags, _ = struct.unpack("<BBHI", payload[off:off + 8])
         name = payload[off + 8:off + 8 + rnamelen - 1].decode("utf-8", "replace")
+        if arch == ArchType.ARM64:
+            name = _ARM64_ALIASES.get(name, name)
         voff = off + 8 + pad8(rnamelen)
         value = int.from_bytes(payload[voff:voff + width], "little")
         regs.append(EmuReg(
@@ -162,8 +176,8 @@ def _parse_thread(payload: bytes) -> EmuThread:
             is_sp=bool(rflags & REG_FLAG_SP),
         ))
         off = voff + pad8(width)
-    return EmuThread(tid=tid, is_current=bool(flags & _THREAD_FLAG_CURRENT),
-                     registers=regs)
+    return EmuThread(tid=tid, is_current=bool(flags & THREAD_FLAG_CURRENT),
+                     arch=arch, registers=regs)
 
 
 def _parse_module(payload: bytes) -> EmuModule:
@@ -195,7 +209,7 @@ def load_slice(path: str) -> SliceImage:
             if blk.block_type == BlockType.MemoryRegion:
                 image.regions.append(_parse_region(blk.payload))
             elif blk.block_type == BlockType.ThreadContext:
-                image.threads.append(_parse_thread(blk.payload))
+                image.threads.append(_parse_thread(blk.payload, arch))
             elif blk.block_type == BlockType.ModuleEntry:
                 image.modules.append(_parse_module(blk.payload))
     return image
