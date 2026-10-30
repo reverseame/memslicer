@@ -127,9 +127,12 @@ class BlockType(IntEnum):
     # Non-spec extension blocks (outside the 0x0054-0x0058 spec range).
     PhysicalMemoryMap = 0x0059
     ModuleBuildIdManifest = 0x005A
+    RegionOmissionManifest = 0x005B
+    EndOfExtension = 0x0FFE
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
     PointerGraph = 0x1003
+    AnalysisFindings = 0x1B70   # spec 1.1.2, Section 5.12: schema-tagged JSON, extension segments only
 
 
 class ThreadState(IntEnum):
