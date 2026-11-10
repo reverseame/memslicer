@@ -3,13 +3,15 @@ import io
 import struct
 
 from memslicer.acquirer.bridge import (
-    RegisterValue, ThreadInfo, register_role, register_width_bytes,
-    vector_register_width,
+    RegisterValue, ThreadInfo, canonical_register_name, make_register,
+    register_role, register_width_bytes, vector_register_width,
 )
 from memslicer.acquirer.engine import _build_thread_contexts
 from memslicer.msl.constants import (
-    ArchType, BlockType, CapBit, CompAlgo, REG_FLAG_PC, REG_FLAG_SP,
-    THREAD_FLAG_CURRENT, ThreadState,
+    ArchType, BlockType, CapBit, CompAlgo, OSType,
+    REG_FLAG_LR, REG_FLAG_PC, REG_FLAG_SP, REG_FLAG_TLS,
+    THREAD_FLAG_CURRENT, THREAD_FLAG_PARTIAL, THREAD_FLAG_SUSPENDED,
+    ThreadState,
 )
 from memslicer.msl.iterator import iterate_blocks
 from memslicer.msl.types import FileHeader, ThreadContext, ThreadRegister
@@ -22,7 +24,7 @@ _REG = "<BBHI"
 
 
 def _decode_thread_context(payload: bytes) -> dict:
-    tid, start, flags, state, _r, regc, nlen, _r2 = struct.unpack(
+    tid, start, flags, state, arch, regc, nlen, _r2 = struct.unpack(
         _HDR, payload[:_HDR_SIZE]
     )
     off = _HDR_SIZE
@@ -40,7 +42,8 @@ def _decode_thread_context(payload: bytes) -> dict:
         off += pad8(width)
         regs.append((rname, width, rflags, value))
     return dict(
-        tid=tid, start=start, flags=flags, state=state, name=name, regs=regs,
+        tid=tid, start=start, flags=flags, state=state, arch=arch,
+        name=name, regs=regs,
     )
 
 
@@ -133,7 +136,67 @@ def test_register_role():
     assert register_role("rflags") == "flags"
     assert register_role("pc") == "pc"      # AArch64 canonical
     assert register_role("sp") == "sp"
+    assert register_role("x30") == "lr"
+    assert register_role("lr") == "lr"      # ARM32 canonical
     assert register_role("rax") == ""
+
+
+def test_register_role_tls_depends_on_os():
+    # Table 19g: only the register the OS uses as thread pointer is TLS.
+    assert register_role("fs_base", ArchType.x86_64, OSType.Linux) == "tls"
+    assert register_role("gs_base", ArchType.x86_64, OSType.Linux) == ""
+    assert register_role("gs_base", ArchType.x86_64, OSType.Windows) == "tls"
+    assert register_role("fs_base", ArchType.x86_64, OSType.Windows) == ""
+    assert register_role("fs", ArchType.x86_64, OSType.Linux) == ""   # selector, never TLS
+    assert register_role("tpidr_el0", ArchType.ARM64, OSType.Linux) == "tls"
+    assert register_role("tpidrro_el0", ArchType.ARM64, OSType.macOS) == "tls"
+    assert register_role("x18", ArchType.ARM64, OSType.Windows) == "tls"
+    assert register_role("x18", ArchType.ARM64, OSType.Linux) == ""
+    assert register_role("fs_base") == ""                              # no OS -> no TLS
+
+
+def test_canonical_register_name():
+    # Table 19g forbids the debugger-native ARM64 / x86_64 aliases.
+    assert canonical_register_name("fp", ArchType.ARM64) == "x29"
+    assert canonical_register_name("LR", ArchType.ARM64) == "x30"
+    assert canonical_register_name("cpsr", ArchType.ARM64) == "pstate"
+    assert canonical_register_name("eflags", ArchType.x86_64) == "rflags"
+    assert canonical_register_name("eflags", ArchType.x86) == "eflags"   # canonical on x86
+    assert canonical_register_name("lr", ArchType.ARM32) == "lr"         # canonical on ARM32
+    assert canonical_register_name("r14", ArchType.ARM32) == "lr"
+    r = make_register("fp", 0x10, 8, ArchType.ARM64, OSType.Linux)
+    assert (r.name, r.role) == ("x29", "fp")
+    r = make_register("lr", 0x20, 8, ArchType.ARM64, OSType.Linux)
+    assert (r.name, r.role) == ("x30", "lr")
+
+
+def test_build_thread_contexts_flags_and_roles():
+    t = ThreadInfo(tid=1, is_current=True, suspended=True, partial=True, registers=[
+        RegisterValue("pc", 0x1000, 8, "pc"),
+        RegisterValue("x30", 0x2000, 8, "lr"),
+        RegisterValue("tpidr_el0", 0x3000, 8, "tls"),
+    ])
+    tc = _build_thread_contexts([t])[0]
+    assert tc.flags == THREAD_FLAG_CURRENT | THREAD_FLAG_SUSPENDED | THREAD_FLAG_PARTIAL
+    by_name = {r.name: r.flags for r in tc.registers}
+    assert by_name["x30"] == REG_FLAG_LR
+    assert by_name["tpidr_el0"] == REG_FLAG_TLS
+    got = _decode_thread_context(_write_one(tc))
+    assert got["flags"] == tc.flags
+    assert ("x30", 8, REG_FLAG_LR, 0x2000) in got["regs"]
+
+
+def test_thread_context_arch_byte():
+    pc = ThreadRegister("eip", (0x1000).to_bytes(4, "little"), REG_FLAG_PC)
+    # 0 = same as header; small codes written verbatim.
+    assert _decode_thread_context(_write_one(ThreadContext(thread_id=1, registers=[pc])))["arch"] == 0
+    tc = ThreadContext(thread_id=1, arch=int(ArchType.x86), registers=[pc])
+    assert _decode_thread_context(_write_one(tc))["arch"] == ArchType.x86
+    tc = ThreadContext(thread_id=1, arch=int(ArchType.ARM32), registers=[pc])
+    assert _decode_thread_context(_write_one(tc))["arch"] == ArchType.ARM32
+    # Codes above 0xFF are not representable and MUST be written as 0.
+    tc = ThreadContext(thread_id=1, arch=int(ArchType.Unknown), registers=[pc])
+    assert _decode_thread_context(_write_one(tc))["arch"] == 0
 
 
 def test_register_width_bytes():

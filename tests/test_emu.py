@@ -72,6 +72,33 @@ def test_loader_rejects_non_msl(tmp_path):
         load_slice(str(p))
 
 
+def test_loader_normalises_arm64_aliases_and_arch_byte(tmp_path):
+    # 1.1.0 producers could write fp/lr (forbidden by 1.1.1 Table 19g);
+    # consumer rule 29: normalise to x29/x30. Arch byte 0 = header arch.
+    p = tmp_path / "arm.msl"
+    hdr = FileHeader(os_type=OSType.Linux, arch_type=ArchType.ARM64, pid=1,
+                     cap_bitmap=(1 << CapBit.ThreadContexts))
+    with open(p, "wb") as f:
+        w = MSLWriter(f, hdr, CompAlgo.NONE)
+        w.write_thread_context(ThreadContext(thread_id=1, flags=THREAD_FLAG_CURRENT, registers=[
+            ThreadRegister("pc", (0x1000).to_bytes(8, "little"), REG_FLAG_PC),
+            ThreadRegister("sp", (0x2000).to_bytes(8, "little"), REG_FLAG_SP),
+            ThreadRegister("fp", (0x3000).to_bytes(8, "little"), 0),
+            ThreadRegister("lr", (0x4000).to_bytes(8, "little"), 0),
+        ]))
+        w.write_thread_context(ThreadContext(thread_id=2, arch=int(ArchType.ARM32), registers=[
+            ThreadRegister("pc", (0x10).to_bytes(4, "little"), REG_FLAG_PC),
+            ThreadRegister("lr", (0x20).to_bytes(4, "little"), 0),
+        ]))
+        w.finalize()
+    img = load_slice(str(p))
+    t1, t2 = img.threads
+    assert t1.arch == ArchType.ARM64
+    assert t1.as_dict() == {"pc": 0x1000, "sp": 0x2000, "x29": 0x3000, "x30": 0x4000}
+    assert t2.arch == ArchType.ARM32                 # per-thread mode from +0x13
+    assert t2.as_dict()["lr"] == 0x20                # lr is canonical on ARM32
+
+
 # ---- engine (requires the emu extra) ----
 
 def test_emulator_steps_real_code(tmp_path):

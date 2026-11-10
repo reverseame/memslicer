@@ -399,13 +399,16 @@ class MSLWriter:
         name_raw = thread.name.encode("utf-8") + b"\x00" if thread.name else b""
         name_encoded = encode_string(thread.name) if thread.name else b""
 
+        # Table 19a: Arch is one byte; ArchType codes above 0xFF are not
+        # representable and MUST be written as 0 (= file header ArchType).
+        arch = thread.arch if 0 < thread.arch <= 0xFF else 0
         payload = struct.pack(
             "<QQHBBIH6s",
             thread.thread_id,        # 8B ThreadID
             thread.start_time_ns,    # 8B StartTime
-            thread.flags,            # 2B Flags (Current/Crashed)
+            thread.flags,            # 2B Flags (Current/Crashed/Suspended/Partial)
             int(thread.state),       # 1B ThreadState
-            0,                       # 1B Reserved
+            arch,                    # 1B Arch (0 = same as file header)
             len(thread.registers),   # 4B RegCount
             len(name_raw),           # 2B NameLen (incl. null), 0 if absent
             b"\x00" * 6,             # 6B Reserved2
@@ -418,7 +421,7 @@ class MSLWriter:
                 "<BBHI",
                 len(reg_name_raw),   # 1B NameLen (incl. null)
                 len(reg.value),      # 1B Width (value width in bytes)
-                reg.flags,           # 2B Flags (PC/SP/FP/FLAGS)
+                reg.flags,           # 2B Flags (PC/SP/FP/FLAGS/TLS/LR)
                 0,                    # 4B Reserved
             )
             entry += encode_string(reg.name)   # Name, UTF-8, pad8

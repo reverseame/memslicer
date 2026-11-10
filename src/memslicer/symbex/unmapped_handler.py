@@ -359,8 +359,7 @@ def _ensure_page_mapped(
     for target_addr in addrs_to_map:
         start_page = target_addr & ~(page_size - 1)
         end_page = min(max_user_addr, (target_addr + access_len - 1)) & ~(page_size - 1)
-        if start_page > end_page:
-            end_page = start_page
+        end_page = max(end_page, start_page)
         for page_base in range(start_page, end_page + page_size, page_size):
             hook_at = fault_addr if (fault_addr is not None and (target_addr & ~(page_size - 1)) == (fault_addr & ~(page_size - 1))) else target_addr
             success = _map_single_page(

@@ -375,10 +375,7 @@ def repair_syscall_errored_state(state: angr.SimState, error: Exception | None =
     if ins_bytes.startswith(b"\x0f\x05"):  # syscall (x64)
         skip_len = 2
         target_arch = "amd64"
-    elif ins_bytes.startswith(b"\x0f\x34"):  # sysenter (x86)
-        skip_len = 2
-        target_arch = "x86"
-    elif ins_bytes.startswith(b"\xcd\x2e"):  # int 0x2e (x86)
+    elif ins_bytes.startswith(b"\x0f\x34") or ins_bytes.startswith(b"\xcd\x2e"):  # sysenter / int 0x2e (x86)
         skip_len = 2
         target_arch = "x86"
     elif ins_bytes.startswith(b"\x01\x00\x00\xd4"):  # ARM64 svc #0 (little-endian)
