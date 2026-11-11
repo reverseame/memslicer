@@ -223,23 +223,85 @@ Usage: memslicer [OPTIONS] TARGET
     Investigation encrypted (-I, default), Investigation unencrypted (-I --no-encrypt).
 
 Options:
-  -b, --backend [frida|gdb|lldb]  Debugger backend. [default: frida]
-  -o, --output PATH               Output .msl file path.
-  -c, --compress [none|zstd|lz4]  Compression algorithm. [default: none]
-  -U, --usb                       Connect to a USB device (Frida only).
-  -R, --remote HOST:PORT          Connect to a remote Frida server (Frida only).
+  -b, --backend [frida|gdb|lldb]  Debugger backend to use
+  -o, --output TEXT               Output .msl file path
+  -c, --compress [none|zstd|lz4]  Compression algorithm
+  -U, --usb                       Connect to USB device (Frida backend only)
+  -R, --remote TEXT               Remote server host:port (Frida: frida-
+                                  server, GDB: gdbserver, LLDB: lldb-server)
   --os [windows|linux|macos|android|ios]
-                                  Override automatic OS detection.
-  --filter-prot TEXT              Filter regions by protection (e.g. 'rw-', 'r--').
-  --filter-addr TEXT              Filter regions by address range (e.g. '0x1000-0x2000').
-  -v, --verbose                   Enable verbose/debug output.
-  --read-timeout FLOAT            Per-read timeout in seconds. [default: 10]
-  --include-unreadable            Include memory regions with no read permission.
-  --max-region-size INT           Skip regions larger than this size (0 = no limit).
-  -I, --investigation             Investigation mode: capture system-wide context.
-  -E, --encrypt                   Enable AEAD encryption (AES-256-GCM + Argon2id).
-  --no-encrypt                    Disable encryption (overrides -I default).
-  --passphrase TEXT               Encryption passphrase (prompted if not provided).
+                                  Override OS detection
+  --filter-prot TEXT              Protection filter (e.g., 'r--', 'rw-')
+  --filter-addr TEXT              Address range filter (e.g., '0x1000-0x2000')
+  -v, --verbose                   Enable verbose/debug output
+  --read-timeout FLOAT            Per-read timeout in seconds (default: 10)
+  --include-unreadable            Include regions with no read permission
+  --max-region-size INTEGER       Skip regions larger than this size (0 = no
+                                  limit)
+  -I, --investigation             Investigation mode: capture system-wide
+                                  context (encrypted by default)
+  -E, --encrypt                   Enable AEAD encryption
+  --no-encrypt                    Disable encryption (overrides investigation
+                                  default)
+  --passphrase TEXT               Encryption passphrase (prompted if --encrypt
+                                  and not provided)
+  --hash-algo [blake3|sha256|sha512-256]
+                                  Integrity hash algorithm (default: blake3)
+  --no-registers                  Do not capture thread register state (Thread
+                                  Context blocks)
+  --key-hints                     Hook Windows CNG key-derivation APIs
+                                  (BCryptGenerateSymmetricKey,
+                                  NCryptDeriveKey) during capture and record
+                                  where derived key material lives as KeyHint
+                                  blocks (Frida backend only)
+  --examiner, --operator TEXT     Examiner / operator name for
+                                  SystemContext.acq_user (defaults to
+                                  getpass.getuser())
+  --case-ref, --case-id, --case-number TEXT
+                                  Case / evidence reference for
+                                  SystemContext.case_ref
+  --hostname-override TEXT        Override collected hostname (use when remote
+                                  collector is blind)
+  --domain-override TEXT          Override collected domain
+  --include-serials               Emit hardware serials / machine-id in
+                                  os_detail (privacy-sensitive)
+  --include-network-identity      Emit NIC MAC addresses in os_detail
+                                  (privacy-sensitive)
+  --include-fingerprint           Emit ro.build.fingerprint in os_detail
+                                  (Android; leaks device+region+carrier+build-
+                                  date)
+  --include-kernel-modules / --no-include-kernel-modules
+                                  Emit the KernelModuleList block enumerating
+                                  loaded kernel modules from /proc/modules and
+                                  /sys/module (default: off, memslicer is
+                                  process-centric)
+  --include-kernel-symbols / --no-include-kernel-symbols
+                                  Emit kernel symbolication anchors in
+                                  os_detail and the KernelSymbolBundle block
+                                  (page_size, build_id, KASLR base, BTF hash,
+                                  clocks; default: off, memslicer is process-
+                                  centric)
+  --include-module-build-ids / --no-include-module-build-ids
+                                  Live build-id extraction: read the first 4
+                                  KiB of each loaded module through the
+                                  debugger bridge and populate ModuleEntry
+                                  build-ids and per-module disk hashes
+                                  (default: off). The retroactive
+                                  ModuleBuildIdManifest overlay block is
+                                  produced separately by memslicer-enrich.
+  --include-target-introspection / --no-include-target-introspection
+                                  Collect per-target process introspection
+                                  (TracerPid, loginuid, SELinux context,
+                                  smaps, cgroup, ancestry, etc.) and emit the
+                                  TargetIntrospection block (default: off)
+  --include-environ               Emit /proc/<pid>/environ in
+                                  TargetIntrospection (may leak credentials;
+                                  default: off)
+  --include-persistence-manifest  Emit the PersistenceManifest block listing
+                                  systemd units, cron entries, and other
+                                  persistence paths (names+mtime+size only; no
+                                  content). May leak application inventory;
+                                  default: off.
   --help                          Show this message and exit.
 ```
 
@@ -274,6 +336,14 @@ memslicer-behavior dump.msl --arg0 "S3cr3tKey!" -g block -o graph.dot
   - `ida` (default): Renders IDA Pro / Binary Ninja style disassembly tables with memory addresses, hex opcodes, assembly mnemonics, and resolved symbol comments.
   - `basic`: Simple node boxes for basic DOT renderers.
 - **`--arg0, --rcx TEXT`**: Pass an input string or memory argument in `RCX` register for analyzing functions that expect arguments.
+- **`--start ADDR`**: Override the start address (default: the captured PC).
+- **`-n, --max-steps N`**: Cap on emulated instructions (default `100000`).
+- **`-f, --format [json|dot|graphml|gexf]`**: Output format (otherwise inferred from the `-o` extension).
+- **`--premap-stack / --no-premap-stack`** (default on): a slice only captures a few pages around the
+  captured stack pointer, so deeper frames used to stop the trace with `UC_ERR_*_UNMAPPED`. The emulator
+  now backs a 64 MB window around SP with blank RW pages. Because that turns a loud fault into a quiet
+  zero, every read of such invented memory is tracked and reported (`graph.meta['synthetic_stack_reads']`
+  and in the run summary). Use `--no-premap-stack` to get the old fail-loud behaviour.
 - **Sub-Graph Module Clustering (`subgraph cluster_*`)**: Automatically groups basic blocks and API call nodes by their owning module (`notepad.exe`, `USER32.dll`, `win32u.dll`, etc.) inside dashed bounding boxes.
 - **Color-Coded Branching**:
   - **Green (`#2e7d32`)**: Conditional branch taken (`jump_true`).
@@ -296,10 +366,20 @@ python -m memslicer.cli_symbex <dump.msl> --find <TARGET_ADDR> --avoid <FAIL_ADD
 ```
 
 #### Available Options:
-- `-f, --find ADDR`: Target address(es) to reach (repeatable, hex/dec format).
-- `-a, --avoid ADDR`: Address(es) to bypass (repeatable, hex/dec format).
-- `-v, --veritesting`: Enables hybrid Static-Dynamic Symbolic Execution (Veritesting) to merge states and prevent path explosion in loops.
-- `-s, --steps N`: Step forward N symbolic instructions when no `--find` target is specified.
+- `-f, --find ADDR` / `-a, --avoid ADDR`: Address(es) to reach / bypass (repeatable, hex or decimal).
+- `-m, --avoid-module NAME|LO-HI`: Avoid every address inside a module (by name) or an address range (repeatable).
+- `-s, --steps N`: Step forward N symbolic steps when no `--find` target is given (prints live progress).
+- `-r, --find-rax-success`: Look for paths where the function returns `RAX == 1`. Only meaningful for
+  license/key-check style targets; on generic real-world code almost any function can return 1, so prefer `--find`.
+- `-e, --entry ADDR`: Override the start PC (useful when the slice was captured parked in `Sleep`/`fgets`).
+- `-c, --call-function ADDR`: Build a clean call state for the function at `ADDR`, passing the symbolic buffer as its first argument.
+- `-k, --sym-bytes N`: Size of the injected symbolic buffer (default `16`).
+- `-b, --binary-key`: Unconstrained raw bytes instead of printable ASCII (`0x20`-`0x7E`).
+- `--buffer-addr ADDR`: Explicit address for the symbolic buffer (otherwise a `RBP-0x40` / `RSP+0x20` heuristic is used).
+- `--use-key-hints`: Place the symbolic buffer at a live-captured KeyHint (see below) and adopt its key length as `--sym-bytes`. An explicit `--buffer-addr` still wins.
+- `-v, --veritesting`: Hybrid static/dynamic symbolic execution (Veritesting) to merge states and limit path explosion in loops.
+- `--bypass-anti-analysis`: Hook common anti-debug APIs and mask PEB debug flags (see feature 3).
+- `-u / --no-auto-map-unmapped` (default on): Automatically map unmapped pages and stub missing code/APIs (see feature 4).
 
 ---
 
@@ -310,7 +390,7 @@ The CLI automatically inspects SMT solver constraints upon reaching target addre
 - **CPU Registers**: Formatted in canonical 64/32-bit hexadecimal notation (`0x...`).
 - **RAM Memory & Pointer Linkage**: Automatically maps CPU pointers to resolved memory buffers (e.g., `RCX (0xc000000000000000) ---> Points to text: 'S3cr3tKey!'`).
 - **Memory Region Classification**: Categorizes virtual addresses (Stack, Heap, Executable Image, or Symbolic Virtual Memory).
-- **Multi-Channel Detection**: Automatic tracking for STDIN, Disk Files, Network Sockets, CLI Arguments (`argv`), and Environment Variables.
+- **Multi-Channel Classification**: Symbolic inputs are grouped by the name of their symbolic variable (STDIN, files, sockets, `argv`, environment). This only applies when those inputs are actually symbolic in the state; a slice loaded from a real dump normally only has the injected buffer.
 
 #### 2. Anti-State Explosion (Veritesting)
 Reduces $2^N$ exponential path branching by collapsing intermediate conditional decision diamonds (`if-else`) into unified boolean expressions inside the Z3 solver pool.
@@ -319,6 +399,10 @@ Reduces $2^N$ exponential path branching by collapsing intermediate conditional 
 Includes dedicated SimProcedure stubs and PEB sanitization to bypass evasion checks in malware:
 - **API Stubs**: Intercepts `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, and `NtQueryInformationProcess` (`ProcessDebugPort`, `ProcessDebugFlags`).
 - **PEB Masking**: Sanitizes `BeingDebugged` (`0`) and `NtGlobalFlag` (`0`) in process memory.
+- **Works on real multi-module dumps**: angr only loads the region holding the captured PC as a real CLE
+  object, so other DLLs have no symbol table. When symbol hooking finds nothing, the APIs are resolved by
+  parsing each module's PE export table directly from captured memory (forwarders are skipped) and hooked
+  by address. Use it from the CLI with `--bypass-anti-analysis`.
 
 ```python
 from memslicer.symbex.angr_loader import load_angr
@@ -332,6 +416,34 @@ apply_anti_analysis_bypass(project, state)
 simgr = project.factory.simgr(state, veritesting=True)
 simgr.explore(find=0x14000175e, avoid=0x140001765)
 ```
+
+#### 4. Unmapped Memory Recovery & Syscall Handling (`unmapped_handler`, `syscall_handler`)
+A slice only contains what was captured, so symbolic paths regularly touch memory or code that is not in it.
+With auto-mapping on (the default), the stack is pre-mapped around SP, missing data pages are mapped on demand,
+and calls into missing code get a generic return stub. Recovery only applies to genuinely new (synthetic)
+memory, never to already-loaded code that is simply revisited. Direct `syscall`/`sysenter`/`int 0x2e`/`svc`
+instructions are resolved per OS/arch (Windows NT and Linux tables) and a state that errored on a syscall is
+repaired by skipping the instruction. Syscalls have **no real side effects**.
+
+#### 5. Live KeyHints (capture → symbex)
+`memslicer <pid> --backend frida --key-hints` hooks the Windows CNG key-derivation APIs
+(`BCryptGenerateSymmetricKey`, `NCryptDeriveKey`) during the capture and records where the derived key
+material lives as `KeyHint` blocks (region + offset + length). `memslicer-symbex --use-key-hints` then injects
+the symbolic buffer exactly there instead of guessing:
+
+```bash
+memslicer 1234 --backend frida --os windows --key-hints -o target.msl
+memslicer-symbex target.msl --use-key-hints --steps 50
+#   [+] Using KeyHint at 0x7ff7bebf4020, key_len=32 -> --sym-bytes 32 (BCryptGenerateSymmetricKey)
+```
+
+Only keys derived **while the capture is running** are caught (hooks are armed at attach time); a one-shot
+derivation that happens before or after the capture window produces no hint.
+
+#### Limitations
+Useful for targeted symbolic extraction of comparison-based logic and common Windows x64 anti-debug bypass.
+It does **not** unpack, defeat anti-VM checks, model real syscall effects or follow other processes. See
+[`docs/malware_analysis_guide.md`](docs/malware_analysis_guide.md) for an honest assessment and workflow.
 
 ---
 
@@ -395,6 +507,9 @@ memslicer-emu dump.msl --steps 5 -r
 #   0x00401007  mov rbx, 2    [rbx=0x2 rip=0x40100e]
 #   ...
 ```
+
+Other useful options: `--pc ADDR` overrides the start PC, `--max-steps N` caps `--until`, `-r/--registers`
+dumps registers after stepping, and `--unwind-depth N` bounds the stack scan of `--resume-from-syscall`.
 
 It is also usable as a library for programmatic / differential analysis:
 
@@ -485,6 +600,17 @@ On Windows the Frida backend recovers each thread's TEB (via
 since the CPU context alone carries no segment base. On x86 the emulator installs
 a synthetic GDT for the captured base (32-bit `FS`/`GS` can't be set as a
 register), so SEH prologues that read `fs:[0]` emulate correctly.
+
+**Stack beyond the captured window.** A slice only captures a few pages around the stack pointer, so
+deeper frames used to end emulation with `UC_ERR_*_UNMAPPED`. The emulator now pre-maps a 64 MB blank RW
+window around the captured SP (`open_slice(..., premap_stack_mb=64)`, `0` disables it). Reads of that
+invented memory are tracked so they are never mistaken for captured data:
+
+```python
+emu.synthetic_ranges()        # pre-mapped [lo, hi) windows
+emu.is_synthetic(addr)        # True if addr was invented, not captured or written
+emu.synthetic_read_count()    # reads of invented zeros (also in behavior graph meta)
+```
 
 ### Symbolic execution (angr)
 

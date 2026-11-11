@@ -81,9 +81,44 @@ All notable changes to this project will be documented in this file.
   - Graph export to GraphML and GEXF (dependency-free) and to a `networkx`
     `MultiDiGraph` (optional `graph` extra), plus a fixed-key per-graph feature
     vector (`--features`) for ML/triage pipelines.
+- `memslicer-symbex` anti-analysis bypass (`--bypass-anti-analysis`):
+  SimProcedures for `IsDebuggerPresent`, `CheckRemoteDebuggerPresent` and
+  `NtQueryInformationProcess`, plus PEB `BeingDebugged`/`NtGlobalFlag`
+  masking. On real multi-module dumps the APIs are resolved by parsing each
+  module's PE export table from captured memory (`resolve_pe_export()`), since
+  angr only loads the PC's region as a CLE object.
+- `memslicer-symbex --veritesting` (`-v`) to merge states and limit path
+  explosion, and constraint provenance reporting (registers, pointed-to
+  memory, region classification) when a target is reached.
+- `memslicer-symbex` automatic recovery of unmapped memory and missing code
+  (`unmapped_handler`, on by default, `--no-auto-map-unmapped` to disable) and
+  OS/arch-aware syscall resolution with errored-state repair
+  (`syscall_handler`). New options `--entry`, `--call-function`,
+  `--sym-bytes`, `--binary-key`, `--buffer-addr`, `--avoid-module` and
+  `--find-rax-success`.
+- Live KeyHints: `memslicer --key-hints` (Frida, Windows) hooks CNG
+  `BCryptGenerateSymmetricKey` / `NCryptDeriveKey` during capture and writes
+  `KeyHint` blocks (0x0020) locating derived key material; the emulator loader
+  parses them and `memslicer-symbex --use-key-hints` targets the symbolic
+  buffer at the hinted address. Only keys derived during the capture window are
+  recorded.
+- `memslicer.emu` pre-maps a 64 MB stack window around the captured SP so deep
+  frames no longer fault (`premap_stack_mb`, `memslicer-behavior
+  --no-premap-stack` to disable). Reads of that invented memory are tracked
+  (`synthetic_ranges()` / `is_synthetic()` / `synthetic_reads()`) and reported
+  as `synthetic_stack_reads` in the behavior graph metadata.
+- `memslicer-behavior` IDA-style DOT rendering (`--style ida`), module
+  clustering and colour-coded branches, plus the `tools/graph_viewer.html`
+  interactive viewer.
 
 ### Bug Fixes
 
+- `memslicer-symbex`: the generic API auto-stub no longer hooks already-loaded
+  code that is merely revisited (loops, backward jumps), which corrupted
+  execution; `GS`/`FS` segment bases captured as `gs_base`/`fs_base` are now
+  seeded instead of silently dropped; `--avoid`/`--avoid-module` now apply in
+  `--steps` mode; several anti-analysis errors (wrong fallback address,
+  missing symbolic guard) fixed; PE header reads use the target's endianness.
 - Investigation mode: the `SystemProcessTable` / `SystemNetworkTable` /
   `SystemHandleTable` capability bits are now written to the on-disk file
   header. They were previously set on the header object only after it had
