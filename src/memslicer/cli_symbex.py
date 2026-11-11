@@ -7,6 +7,7 @@ Requires the ``symbex`` extra::  pip install memslicer[symbex]
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 import click
 import claripy
@@ -19,6 +20,8 @@ from memslicer.symbex.unmapped_handler import (
     repair_errored_states,
     _ensure_page_mapped,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def format_address(val: int | None) -> str:
@@ -57,6 +60,7 @@ def inspect_and_print_provenance(state: Any) -> None:
         "RAM Memory": {},
         "CLI Arguments": [],
         "Environment Variables": [],
+        "Symbolic Variables": {},
         "Pointer Mapping": {},
     }
 
@@ -134,15 +138,22 @@ def inspect_and_print_provenance(state: Any) -> None:
 
             # Generic Symbolic Variables / License Keys
             elif "key" in var or "license" in var or "buf" in var:
+                if var in findings["Symbolic Variables"]:
+                    continue
+                # Evaluate the variable's own leaf AST from the constraint. A fresh
+                # claripy.BVS(...) here would be a new, unconstrained variable and
+                # evaluate to arbitrary bytes instead of the solved value.
+                leaf = next(
+                    (lf for lf in constraint.leaf_asts() if lf.symbolic and var in lf.variables),
+                    None,
+                )
+                if leaf is None:
+                    continue
                 try:
-                    if "Symbolic Variables" not in findings:
-                        findings["Symbolic Variables"] = {}
-                    for v_ast in state.solver.variables:
-                        if var in str(v_ast):
-                            val = state.solver.eval(claripy.BVS(v_ast, 128), cast_to=bytes)
-                            findings["Symbolic Variables"][var] = val
-                except Exception:
-                    pass
+                    findings["Symbolic Variables"][var] = state.solver.eval(leaf, cast_to=bytes)
+                except Exception as exc:
+                    logger.warning("[provenance] could not evaluate symbolic variable %s: %s", var, exc)
+                    findings["Symbolic Variables"][var] = "Symbolic (unsolved)"
 
     # Reconstruct memory string and map register pointers
     if mem_bytes:
@@ -195,14 +206,16 @@ def inspect_and_print_provenance(state: Any) -> None:
             click.echo(f"     - Register {k:<5} = {formatted_val}")
 
     # Print other channels
-    for category in ["STDIN", "Files", "Network Sockets", "CLI Arguments"]:
+    for category in ["Symbolic Variables", "STDIN", "Files", "Network Sockets",
+                     "CLI Arguments", "Environment Variables"]:
         data = findings[category]
         if data:
             has_data = True
             click.echo(f"\n [+] DETECTED SOURCE: {category}")
             if isinstance(data, dict):
                 for k, v in data.items():
-                    click.echo(f"     - {k} = {v}")
+                    shown = v.hex() if category == "Symbolic Variables" and isinstance(v, bytes) else v
+                    click.echo(f"     - {k} = {shown}")
             elif isinstance(data, list):
                 for item in data:
                     click.echo(f"     - Value: {item!r}")
@@ -430,8 +443,6 @@ def main(
         state.globals["injected_key_addr"] = key_mem_addr
         state.globals["injected_key_bytes"] = sym_bytes
 
-        if hasattr(state, "posix") and hasattr(state.posix, "stdin"):
-            state.posix.stdin.content = [(sym_key, sym_bytes)]
 
         mode_str = "raw binary bytes" if binary_key else "printable ASCII"
         click.echo(f"[+] Overrode PC to {entry_addr:#x} with {sym_bytes}-byte symbolic key buffer ({mode_str}) at {key_mem_addr:#x}")
@@ -451,8 +462,6 @@ def main(
         state.globals["injected_key_addr"] = key_mem_addr
         state.globals["injected_key_bytes"] = sym_bytes
 
-        if hasattr(state, "posix") and hasattr(state.posix, "stdin"):
-            state.posix.stdin.content = [(sym_key, sym_bytes)]
 
         mode_str = "raw binary bytes" if binary_key else "printable ASCII"
         click.echo(f"[+] Prepared {sym_bytes}-byte symbolic key buffer ({mode_str}) at {key_mem_addr:#x}")
@@ -546,8 +555,6 @@ def main(
                         try:
                             if s.solver.satisfiable(extra_constraints=(s.regs.rax == 1,)):
                                 is_ret_state = getattr(s.history, "jumpkind", None) == "Ijk_Ret" or getattr(getattr(s.history, "parent", None), "jumpkind", None) == "Ijk_Ret"
-                                parent_addr = getattr(getattr(s.history, "parent", None), "addr", None)
-                                is_success_path = parent_addr == 0x40002d or (hasattr(s, "addr") and s.addr in (0x400031, 0x400038))
                                 if not is_ret_state and hasattr(s, "addr") and s.addr:
                                     try:
                                         blk = project.factory.block(s.addr)
@@ -556,7 +563,7 @@ def main(
                                     except Exception:
                                         pass
                                 is_unique_success = not s.solver.satisfiable(extra_constraints=(s.regs.rax == 0,))
-                                if is_ret_state or is_success_path or is_unique_success:
+                                if is_ret_state or is_unique_success:
                                     s.add_constraints(s.regs.rax == 1)
                                     found_states.append(s)
                         except Exception:
@@ -570,9 +577,7 @@ def main(
                             try:
                                 if s.solver.satisfiable(extra_constraints=(s.regs.rax == 1,)):
                                     is_ret_state = getattr(s.history, "jumpkind", None) == "Ijk_Ret" or getattr(getattr(s.history, "parent", None), "jumpkind", None) == "Ijk_Ret"
-                                    parent_addr = getattr(getattr(s.history, "parent", None), "addr", None)
-                                    is_success_path = parent_addr == 0x40002d or (hasattr(s, "addr") and s.addr in (0x400031, 0x400038))
-                                    if is_ret_state or is_success_path:
+                                    if is_ret_state:
                                         s.add_constraints(s.regs.rax == 1)
                                         found_states.append(s)
                             except Exception:
@@ -632,7 +637,7 @@ def main(
             try:
                 stdin = s.posix.dumps(0)
                 if stdin:
-                    click.echo(f"stdin   : {stdin!r}")
+                    click.echo(f"stdin (read by the program): {stdin!r}")
             except Exception:  # noqa: BLE001
                 pass
         else:
