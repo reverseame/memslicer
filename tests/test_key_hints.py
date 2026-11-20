@@ -281,6 +281,9 @@ def test_engine_skips_key_hint_outside_captured_regions(tmp_path):
 
 def test_cli_select_key_hint_prefers_confirmed(tmp_path):
     """_select_key_hint picks the resolved, highest-confidence hint."""
+    # cli_symbex imports angr/claripy at module load; skip without the extra.
+    import pytest
+    pytest.importorskip("angr")
     from memslicer.cli_symbex import _select_key_hint
 
     class G(dict):
