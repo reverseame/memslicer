@@ -15,9 +15,9 @@ from memslicer.acquirer.base import (
     AcquireResult, BaseAcquirer, UnreadableRange,
 )
 from memslicer.acquirer.bridge import (
-    DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo, ReadResult,
-    ThreadInfo, canonical_register_name, register_role, stack_pointers_of,
-    thread_pointer_register,
+    DebuggerBridge, KeyHintEvent, MemoryRange, ModuleInfo, PlatformInfo,
+    ReadResult, ThreadInfo, canonical_register_name, register_role,
+    stack_pointers_of, thread_pointer_register,
 )
 from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
@@ -42,7 +42,7 @@ from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, TargetIntrospection,
     KernelSymbolBundle, VasEntry, RegionOmissionManifest, RegionOmissionRow,
-    ThreadContext, ThreadRegister,
+    KeyHint, ThreadContext, ThreadRegister,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.protection import (
@@ -902,6 +902,12 @@ class AcquisitionEngine(BaseAcquirer):
                 cap_bitmap |= (1 << CapBit.ModuleList)
             if thread_contexts:
                 cap_bitmap |= (1 << CapBit.ThreadContexts)
+            # KeyHint blocks can only appear when the bridge armed its
+            # key-derivation hooks; the header is immutable once written, so
+            # the bit advertises the capability rather than a non-zero count.
+            key_hints_armed = getattr(self._bridge, "key_hints_armed", False) is True
+            if key_hints_armed:
+                cap_bitmap |= (1 << CapBit.CryptoHints)
 
             flags = 0
             if self._investigation:
@@ -1228,6 +1234,11 @@ class AcquisitionEngine(BaseAcquirer):
                         [d.range for d in decisions if d.kept], page_size,
                     )
 
+                    # (base, size, block_uuid) of every region written, so
+                    # live-observed KeyHint addresses can be mapped to a
+                    # region UUID + offset after the loop.
+                    written_regions: list[tuple[int, int, bytes]] = []
+
                     for idx, d in enumerate(decisions):
                         if self._abort.is_set():
                             break
@@ -1254,7 +1265,8 @@ class AcquisitionEngine(BaseAcquirer):
                             r.base, r.size, prot, r.file_path, page_size,
                             residency=self._residency_mask(d, page_size),
                         )
-                        writer.write_memory_region(region)
+                        region_uuid = writer.write_memory_region(region)
+                        written_regions.append((r.base, r.size, region_uuid))
                         region_count += 1
                         bytes_captured += data_size
                         captured = region.page_states.count(PageState.CAPTURED)
@@ -1295,6 +1307,13 @@ class AcquisitionEngine(BaseAcquirer):
                         self._emit_progress(
                             region_count, total_ranges,
                             bytes_captured, len(module_entries), idx + 1,
+                        )
+
+                    # KeyHint blocks (0x0020), after every MemoryRegion so a
+                    # hint always references an already-written region UUID.
+                    if key_hints_armed:
+                        self._write_key_hints(
+                            writer, written_regions, self._bridge.collect_key_hints(),
                         )
 
                     # RegionOmissionManifest (0x005B): only when the operator
@@ -1361,6 +1380,64 @@ class AcquisitionEngine(BaseAcquirer):
             thread_contexts=thread_contexts_written,
             threads_dropped=threads_dropped,
         )
+
+    def _write_key_hints(
+        self,
+        writer: MSLWriter,
+        written_regions: list[tuple[int, int, bytes]],
+        events: list[KeyHintEvent],
+    ) -> None:
+        """Emit KeyHint blocks for key-derivation events seen during capture.
+
+        Each event's absolute address is mapped to the captured region that
+        contains it; the KeyHint stores that region's UUID plus the byte
+        offset (spec Table 18). An event outside every captured region is
+        logged and skipped: a hint that cannot be tied to captured bytes
+        would point nowhere useful. A key buffer reused across many
+        derivation calls yields identical events, which are collapsed to one
+        block per distinct (region, offset, length, provenance).
+        """
+        written = 0
+        seen: set[tuple[bytes, int, int, str]] = set()
+        for ev in events:
+            owner = next(
+                (
+                    (base, u) for (base, size, u) in written_regions
+                    if base <= ev.address < base + size
+                ),
+                None,
+            )
+            if owner is None:
+                self._log.warning(
+                    "KeyHint at 0x%x (%s) is not inside any captured region "
+                    "-- skipping (no block written).",
+                    ev.address, ev.api or "?",
+                )
+                continue
+            base, region_uuid = owner
+            note = f"{ev.api} {ev.algorithm}".strip()
+            offset = ev.address - base
+            dedup_key = (region_uuid, offset, ev.length, note)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            writer.write_key_hint(KeyHint(
+                region_uuid=region_uuid,
+                region_offset=offset,
+                key_len=ev.length,
+                key_type=ev.key_type,
+                protocol=ev.protocol,
+                confidence=0x02,   # Confirmed: observed at a live API call
+                key_state=0x01,    # Active
+                note=note,
+            ))
+            written += 1
+
+        if written:
+            self._log.info(
+                "Wrote %d KeyHint block(s) from %d observed event(s)",
+                written, len(events),
+            )
 
     def survey_regions(self) -> RegionSurvey:
         """Plan a capture without performing it.

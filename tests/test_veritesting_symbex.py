@@ -6,7 +6,7 @@ import time
 import pytest
 
 angr = pytest.importorskip("angr")
-claripy = pytest.importorskip("claripy")
+claripy = getattr(angr, "claripy", None) or pytest.importorskip("claripy")
 
 # Add root directory to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

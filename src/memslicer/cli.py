@@ -452,6 +452,7 @@ def _create_acquirer(
     app_paths: tuple[str, ...] = (),
     resident_only: bool = False,
     capture_registers: bool = True,
+    collect_key_hints: bool = False,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -469,6 +470,14 @@ def _create_acquirer(
             device=device,
             read_timeout=read_timeout,
             logger=logger,
+            collect_key_hints=collect_key_hints,
+        )
+    elif collect_key_hints:
+        # KeyHint hooking is a Frida-only in-target interceptor; fail loudly
+        # rather than silently producing a slice with no KeyHint blocks.
+        raise click.UsageError(
+            "--key-hints requires --backend frida (in-target API hooking is "
+            "not available for the gdb/lldb backends)"
         )
     elif backend == "gdb":
         try:
@@ -544,12 +553,13 @@ def _create_acquirer(
 @click.option("--no-encrypt", is_flag=True, default=False, help="Disable encryption (overrides investigation default)")
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
+@click.option("--key-hints", "key_hints", is_flag=True, default=False, help="Hook Windows CNG key-derivation APIs (BCryptGenerateSymmetricKey, NCryptDeriveKey) during capture and record where derived key material lives as KeyHint blocks (Frida backend only)")
 @attribution_options
 def acquire(target, backend, output_path, comp, usb, device_id, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, skip_kernel_pseudo,
         max_region_size, scope, exclude_module, app_path, resident_only,
         no_registers, dry_run, investigation,
-        encrypt, no_encrypt, passphrase, hash_algo_str,
+        encrypt, no_encrypt, passphrase, hash_algo_str, key_hints,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
         include_kernel_symbols, include_kernel_modules,

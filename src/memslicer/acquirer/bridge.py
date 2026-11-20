@@ -289,6 +289,27 @@ def stack_pointers_of(threads: Iterable[ThreadInfo]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(sp for sp in pointers if sp))
 
 
+@dataclass
+class KeyHintEvent:
+    """A cryptographic-key event observed live by a bridge hook.
+
+    Reported by an optional in-target interceptor on a key-derivation API
+    (e.g. Windows CNG ``BCryptGenerateSymmetricKey``). ``address`` is the
+    absolute virtual address of the key material at the moment of the call and
+    ``length`` its byte length (0 if the hook could not determine it). The
+    engine later maps ``address`` to the owning captured MemoryRegion and emits
+    a ``KeyHint`` block (region UUID + offset). ``api`` and ``algorithm`` are
+    human-readable provenance carried into the hint's Note.
+    """
+
+    address: int
+    length: int = 0
+    key_type: int = 0     # KeyHint key_type code (0 = unknown/unspecified)
+    protocol: int = 0     # KeyHint protocol code (0 = unknown/unspecified)
+    api: str = ""         # e.g. "BCryptGenerateSymmetricKey"
+    algorithm: str = ""   # e.g. "AES" (best-effort; may be empty)
+
+
 @dataclass(frozen=True)
 class ReadResult:
     """Outcome of a single memory read, with fault detail when available.
@@ -507,6 +528,31 @@ class ThreadRegistersCapable(Protocol):
         reported with ``partial`` set. ``[]`` when the backend cannot
         enumerate threads at all -- the engine then logs that no thread
         contexts are available and writes none.
+        """
+        ...
+
+
+@runtime_checkable
+class KeyHintCapable(Protocol):
+    """Optional bridge capability: live key-derivation events (KeyHint blocks).
+
+    Bridges are not required to implement this; the engine probes for it and
+    writes no KeyHint block when it is absent.
+    """
+
+    @property
+    def key_hints_armed(self) -> bool:
+        """Whether at least one key-derivation hook is active in the target.
+
+        Known right after ``connect()``, before the file header is written,
+        so the engine uses it to decide the ``CryptoHints`` CapBitmap bit.
+        """
+        ...
+
+    def collect_key_hints(self) -> list[KeyHintEvent]:
+        """Key-derivation events observed since ``connect()``.
+
+        Implementations never raise; ``[]`` when nothing was observed.
         """
         ...
 

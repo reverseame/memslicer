@@ -507,6 +507,10 @@ Options:
   -E, --encrypt                   Enable AEAD encryption (AES-256-GCM + Argon2id).
   --no-encrypt                    Disable encryption (overrides -I default).
   --passphrase TEXT               Encryption passphrase (prompted if not provided).
+  --key-hints                     Hook Windows CNG key-derivation APIs
+                                  (BCryptGenerateSymmetricKey, NCryptDeriveKey)
+                                  during capture and record where derived key
+                                  material lives as KeyHint blocks (Frida only).
   --help                          Show this message and exit.
 ```
 
@@ -670,6 +674,14 @@ memslicer-behavior dump.msl --arg0 "S3cr3tKey!" -g block -o graph.dot
   - `ida` (default): Renders IDA Pro / Binary Ninja style disassembly tables with memory addresses, hex opcodes, assembly mnemonics, and resolved symbol comments.
   - `basic`: Simple node boxes for basic DOT renderers.
 - **`--arg0, --rcx TEXT`**: Pass an input string or memory argument in `RCX` register for analyzing functions that expect arguments.
+- **`--start ADDR`**: Override the start address (default: the captured PC).
+- **`-n, --max-steps N`**: Cap on emulated instructions (default `100000`).
+- **`-f, --format [json|dot|graphml|gexf]`**: Output format (otherwise inferred from the `-o` extension).
+- **`--premap-stack / --no-premap-stack`** (default on): a slice only captures a few pages around the
+  captured stack pointer, so deeper frames used to stop the trace with `UC_ERR_*_UNMAPPED`. The emulator
+  now backs a 64 MB window around SP with blank RW pages. Because that turns a loud fault into a quiet
+  zero, every read of such invented memory is tracked and reported (`graph.meta['synthetic_stack_reads']`
+  and in the run summary). Use `--no-premap-stack` to get the old fail-loud behaviour.
 - **Sub-Graph Module Clustering (`subgraph cluster_*`)**: Automatically groups basic blocks and API call nodes by their owning module (`notepad.exe`, `USER32.dll`, `win32u.dll`, etc.) inside dashed bounding boxes.
 - **Color-Coded Branching**:
   - **Green (`#2e7d32`)**: Conditional branch taken (`jump_true`).
@@ -692,10 +704,30 @@ python -m memslicer.cli_symbex <dump.msl> --find <TARGET_ADDR> --avoid <FAIL_ADD
 ```
 
 #### Available Options:
-- `-f, --find ADDR`: Target address(es) to reach (repeatable, hex/dec format).
-- `-a, --avoid ADDR`: Address(es) to bypass (repeatable, hex/dec format).
-- `-v, --veritesting`: Enables hybrid Static-Dynamic Symbolic Execution (Veritesting) to merge states and prevent path explosion in loops.
-- `-s, --steps N`: Step forward N symbolic instructions when no `--find` target is specified.
+- `-f, --find ADDR` / `-a, --avoid ADDR`: Address(es) to reach / bypass (repeatable, hex or decimal).
+- `--find-max-steps N`: Give up a `--find`/`--find-rax-success` search after `N` simulation steps (default `2000`, `0` = no limit).
+- `-m, --avoid-module NAME|LO-HI`: Avoid every address inside a module (by name) or an address range (repeatable).
+- `-s, --steps N`: Step forward N symbolic steps when no `--find` target is given (prints live progress).
+- `-r, --find-rax-success`: Look for paths where the function returns `RAX == 1`. Only meaningful for
+  license/key-check style targets; on generic real-world code almost any function can return 1, so prefer `--find`.
+- `-v, --veritesting`: Hybrid static/dynamic symbolic execution (Veritesting) to merge states and limit path explosion in loops.
+- `-b, --bypass-anti-analysis`: Hook common anti-debug APIs and mask PEB debug flags (see feature 3).
+- `-u / --no-auto-map-unmapped` (default on): Automatically map unmapped pages and stub missing code/APIs (see feature 4).
+- `--no-syscall-handler`: Do not hook syscall instructions with the generic stub; angr's own syscall models
+  (e.g. a symbolic-stdin `read`) are used instead (see feature 4).
+- `--raw-blob`: `DUMP` is a raw x86-64 code blob mapped at `0x0`, not an MSL slice. Without it, a file that is
+  not a valid slice is an error.
+
+**Symbolic buffer injection.** A plain run starts from the exact captured state. A symbolic buffer is written
+over captured memory only when one of these options is given:
+- `-k, --sym-bytes N`: Inject an `N`-byte buffer (default `16` when another injection option is given).
+  Printable ASCII (`0x20`-`0x7E`) followed by a NUL, like a C-string key.
+- `--binary-key`: Unconstrained raw bytes, with no trailing NUL.
+- `--buffer-addr ADDR`: Explicit address for the buffer (otherwise a `RBP-0x40` / `RSP+0x20` heuristic is used).
+- `--use-key-hints`: Place the buffer at a live-captured KeyHint (see feature 5) and adopt its key length as
+  `--sym-bytes`; no NUL is written after the key. An explicit `--buffer-addr` still wins.
+- `-e, --entry ADDR`: Override the start PC (useful when the slice was captured parked in `Sleep`/`fgets`).
+- `-c, --call-function ADDR`: Build a clean call state for the function at `ADDR`, passing the buffer as its first argument.
 
 ---
 
@@ -706,7 +738,7 @@ The CLI automatically inspects SMT solver constraints upon reaching target addre
 - **CPU Registers**: Formatted in canonical 64/32-bit hexadecimal notation (`0x...`).
 - **RAM Memory & Pointer Linkage**: Automatically maps CPU pointers to resolved memory buffers (e.g., `RCX (0xc000000000000000) ---> Points to text: 'S3cr3tKey!'`).
 - **Memory Region Classification**: Categorizes virtual addresses (Stack, Heap, Executable Image, or Symbolic Virtual Memory).
-- **Multi-Channel Detection**: Automatic tracking for STDIN, Disk Files, Network Sockets, CLI Arguments (`argv`), and Environment Variables.
+- **Multi-Channel Classification**: Symbolic inputs are grouped by the name of their symbolic variable (STDIN, files, sockets, `argv`, environment). This only applies when those inputs are actually symbolic in the state; a slice loaded from a real dump normally only has the injected buffer.
 
 #### 2. Anti-State Explosion (Veritesting)
 Reduces $2^N$ exponential path branching by collapsing intermediate conditional decision diamonds (`if-else`) into unified boolean expressions inside the Z3 solver pool.
@@ -715,6 +747,10 @@ Reduces $2^N$ exponential path branching by collapsing intermediate conditional 
 Includes dedicated SimProcedure stubs and PEB sanitization to bypass evasion checks in malware:
 - **API Stubs**: Intercepts `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, and `NtQueryInformationProcess` (`ProcessDebugPort`, `ProcessDebugFlags`).
 - **PEB Masking**: Sanitizes `BeingDebugged` (`0`) and `NtGlobalFlag` (`0`) in process memory.
+- **Works on real multi-module dumps**: angr only loads the region holding the captured PC as a real CLE
+  object, so other DLLs have no symbol table. When symbol hooking finds nothing, the APIs are resolved by
+  parsing each module's PE export table directly from captured memory (forwarders are skipped) and hooked
+  by address. Use it from the CLI with `--bypass-anti-analysis`.
 
 ```python
 from memslicer.symbex.angr_loader import load_angr
@@ -728,6 +764,36 @@ apply_anti_analysis_bypass(project, state)
 simgr = project.factory.simgr(state, veritesting=True)
 simgr.explore(find=0x14000175e, avoid=0x140001765)
 ```
+
+#### 4. Unmapped Memory Recovery & Syscall Handling (`unmapped_handler`, `syscall_handler`)
+A slice only contains what was captured, so symbolic paths regularly touch memory or code that is not in it.
+With auto-mapping on (the default), the stack is pre-mapped around SP, missing data pages are mapped on demand,
+and calls into missing code get a generic return stub. Recovery only applies to genuinely new (synthetic)
+memory, never to already-loaded code that is simply revisited. Every `syscall`/`sysenter`/`int 0x80`/`int 0x2e`/`svc`
+instruction found by a linear sweep of the loaded code is hooked (the instruction alone, so the instructions
+before it still run) with a stub that logs the call resolved per OS/arch (Windows NT and Linux tables) and
+returns 0; a state that errored on a syscall is repaired by skipping the instruction. Syscalls have **no real
+side effects**. `--no-syscall-handler` turns both off and leaves syscalls to angr.
+
+#### 5. Live KeyHints (capture → symbex)
+`memslicer acquire <pid> --backend frida --key-hints` hooks the Windows CNG key-derivation APIs
+(`BCryptGenerateSymmetricKey`, `NCryptDeriveKey`) during the capture and records where the derived key
+material lives as `KeyHint` blocks (region + offset + length). `memslicer-symbex --use-key-hints` then injects
+the symbolic buffer exactly there instead of guessing:
+
+```bash
+memslicer acquire 1234 --backend frida --os windows --key-hints -o target.msl
+memslicer-symbex target.msl --use-key-hints --steps 50
+#   [+] Using KeyHint at 0x7ff7bebf4020, key_len=32 -> --sym-bytes 32 (BCryptGenerateSymmetricKey)
+```
+
+Only keys derived **while the capture is running** are caught (hooks are armed at attach time); a one-shot
+derivation that happens before or after the capture window produces no hint. The header's `CryptoHints`
+capability bit is set whenever the hooks could be armed, even if no key was derived during the capture.
+
+#### Limitations
+Useful for targeted symbolic extraction of comparison-based logic and common Windows x64 anti-debug bypass.
+It does **not** unpack, defeat anti-VM checks, model real syscall effects or follow other processes.
 
 ---
 
@@ -860,6 +926,10 @@ memslicer-emu dump.msl --steps 5 -r
 #   ...
 ```
 
+Other useful options: `--pc ADDR` overrides the start PC, `--max-steps N` caps `--until`, `-r/--registers`
+dumps registers after stepping, `--unwind-depth N` bounds the stack scan of `--resume-from-syscall`, and
+`--no-premap-stack` turns off the blank stack window described below.
+
 It is also usable as a library for programmatic / differential analysis:
 
 ```python
@@ -949,6 +1019,19 @@ On Windows the Frida backend recovers each thread's TEB (via
 since the CPU context alone carries no segment base. On x86 the emulator installs
 a synthetic GDT for the captured base (32-bit `FS`/`GS` can't be set as a
 register), so SEH prologues that read `fs:[0]` emulate correctly.
+
+**Stack beyond the captured window.** A slice only captures a few pages around the stack pointer, so
+deeper frames used to end emulation with `UC_ERR_*_UNMAPPED`. The emulator now pre-maps a 64 MB blank RW
+window around the captured SP (`open_slice(..., premap_stack_mb=64)`, `0` disables it; `--no-premap-stack`
+on `memslicer-emu` and `memslicer-behavior`). Reads of that invented memory are tracked so they are never
+mistaken for captured data, and both CLIs print a note when any happened:
+
+```python
+emu.synthetic_ranges()        # pre-mapped [lo, hi) windows
+emu.is_synthetic(addr)        # True if addr lies in a pre-mapped window (even if the code wrote it since)
+emu.synthetic_read_count()    # reads of pre-mapped bytes the code had not written (also in behavior graph meta)
+emu.synthetic_read_sites()    # distinct instructions that made such reads
+```
 
 ### Symbolic execution (angr)
 

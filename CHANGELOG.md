@@ -75,6 +75,47 @@ All notable changes to this project will be documented in this file.
 - LLDB Thread Context blocks include vector and x87 registers at full width
   (spec Table 19b widths 16/32/64) instead of skipping registers wider than
   8 bytes.
+- `memslicer-symbex` anti-analysis bypass (`-b`/`--bypass-anti-analysis`):
+  SimProcedures for `IsDebuggerPresent`, `CheckRemoteDebuggerPresent` and
+  `NtQueryInformationProcess`, plus PEB `BeingDebugged`/`NtGlobalFlag`
+  masking. On real multi-module dumps the APIs are resolved by parsing each
+  module's PE export table from captured memory (`resolve_pe_export()`), since
+  angr only loads the PC's region as a CLE object.
+- `memslicer-symbex --veritesting` (`-v`) to merge states and limit path
+  explosion, and constraint provenance reporting (registers, pointed-to
+  memory, region classification) when a target is reached.
+- `memslicer-symbex` automatic recovery of unmapped memory and missing code
+  (`unmapped_handler`, on by default, `--no-auto-map-unmapped` to disable) and
+  OS/arch-aware syscall resolution with errored-state repair
+  (`syscall_handler`, on by default, `--no-syscall-handler` to keep angr's own
+  syscall models). The syscall stub hooks only the `syscall`/`sysenter`/
+  `int 0x80`/`int 0x2e`/`svc` instruction itself.
+- `memslicer-symbex` symbolic-buffer injection, only when asked for:
+  `-k`/`--sym-bytes N`, `--binary-key` (raw bytes, no trailing NUL),
+  `--buffer-addr ADDR`, `--use-key-hints`, `-e`/`--entry ADDR` and
+  `-c`/`--call-function ADDR`. Without any of them the state starts exactly
+  as captured. Also new: `-m`/`--avoid-module`, `-r`/`--find-rax-success`,
+  `--find-max-steps N` (default 2000, `0` = no limit) and `--raw-blob` to load
+  a raw x86-64 code blob instead of an MSL slice
+  (`memslicer.symbex.load_raw_blob()`).
+- Live KeyHints: `memslicer acquire --key-hints` (Frida, Windows) hooks CNG
+  `BCryptGenerateSymmetricKey` / `NCryptDeriveKey` during capture and writes
+  `KeyHint` blocks (0x0020) locating derived key material; the header's
+  `CryptoHints` capability bit is set whenever the hooks are armed. The
+  emulator loader parses KeyHints (a truncated one is skipped) and
+  `memslicer-symbex --use-key-hints` targets the symbolic buffer at the hinted
+  address. Only keys derived during the capture window are recorded; the gdb
+  and lldb backends reject `--key-hints`.
+- `memslicer.emu` pre-maps a 64 MB stack window around the captured SP so deep
+  frames no longer fault (`premap_stack_mb`; `--no-premap-stack` on
+  `memslicer-emu` and `memslicer-behavior` to disable). Reads of that invented
+  memory are tracked (`synthetic_ranges()` / `is_synthetic()` /
+  `synthetic_reads()` / `synthetic_read_count()` / `synthetic_read_sites()`),
+  reported as `synthetic_stack_reads` / `synthetic_stack_read_sites` in the
+  behavior graph metadata, and summarised by both CLIs.
+- `memslicer-behavior` IDA-style DOT rendering (`--style ida`), module
+  clustering and colour-coded branches, plus the `tools/graph_viewer.html`
+  interactive viewer.
 
 ### Changes
 
@@ -108,6 +149,15 @@ All notable changes to this project will be documented in this file.
   `pyproject.toml` changed without touching the `version` line, the previous
   version was read as empty and every such push to `main` attempted a PyPI
   publish.
+- `memslicer.symbex` and `memslicer-symbex` work with angr 10, which no longer
+  ships a top-level `claripy` module (it is `angr.claripy` there), and the
+  provenance inspector no longer depends on claripy's removed `leaf_asts()`.
+- `memslicer-symbex`: the generic API auto-stub no longer hooks already-loaded
+  code that is merely revisited (loops, backward jumps), which corrupted
+  execution; `GS`/`FS` segment bases captured as `gs_base`/`fs_base` are now
+  seeded instead of silently dropped; `--avoid`/`--avoid-module` now apply in
+  `--steps` mode; several anti-analysis errors (wrong fallback address,
+  missing symbolic guard) fixed; PE header reads use the target's endianness.
 
 
 ## [0.5.2] - 2026-10-25

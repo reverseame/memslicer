@@ -9,8 +9,8 @@ from memslicer.acquirer.attach_preflight import (
     PreflightResult, enforce_attach_preflight,
 )
 from memslicer.acquirer.bridge import (
-    MemoryRange, ModuleInfo, PlatformInfo, ReadResult, RegisterValue,
-    ThreadInfo, parse_fault_addr, register_width_bytes,
+    KeyHintEvent, MemoryRange, ModuleInfo, PlatformInfo, ReadResult,
+    RegisterValue, ThreadInfo, parse_fault_addr, register_width_bytes,
 )
 from memslicer.acquirer.errors import AttachError
 from memslicer.acquirer.platform_detect import detect_platform, parse_maps_text
@@ -321,7 +321,88 @@ function _makeTebResolver() {
     };
 }
 
+// ---- Live KeyHints (Windows CNG) ----
+// Each intercepted key-derivation call records the ABSOLUTE address and byte
+// length of the key material into an in-agent log; Python drains it
+// synchronously via drainKeyHints() (no async send() race) and maps each entry
+// to a captured region + offset. Hooks are only installed on request, so the
+// normal acquire path pays no interception cost.
+var _keyHintLog = [];
+
+function _installKeyHintHooks() {
+    if (Process.platform !== 'windows') {
+        return {armed: 0, errors: ['not-windows']};
+    }
+    var armed = 0;
+    var errors = [];
+
+    function emit(api, addrPtr, len) {
+        try {
+            if (!addrPtr || addrPtr.isNull()) return;
+            _keyHintLog.push({api: api, addr: addrPtr.toString(), len: len >>> 0});
+        } catch (e) {}
+    }
+
+    // BCryptGenerateSymmetricKey(hAlg, *phKey, pbKeyObject, cbKeyObject,
+    //                            pbSecret, cbSecret, dwFlags)
+    // pbSecret (arg 4) is the raw key material; cbSecret (arg 5) its length.
+    // The secret is fully formed at call entry, so onEnter suffices.
+    var pGen = _findGlobalExport('BCryptGenerateSymmetricKey');
+    if (pGen) {
+        try {
+            Interceptor.attach(pGen, {
+                onEnter: function(args) {
+                    emit('BCryptGenerateSymmetricKey', args[4], args[5].toInt32());
+                }
+            });
+            armed++;
+        } catch (e) { errors.push('BCryptGenerateSymmetricKey:' + e.message); }
+    } else {
+        errors.push('BCryptGenerateSymmetricKey:not-found');
+    }
+
+    // NCryptDeriveKey(hSharedSecret, pwszKDF, pParams, pbDerivedKey,
+    //                 cbDerivedKey, *pcbResult, dwFlags)
+    // The key is written to pbDerivedKey (arg 3) DURING the call, so read the
+    // actual length from *pcbResult (arg 5) on a successful return.
+    var pDerive = _findGlobalExport('NCryptDeriveKey');
+    if (pDerive) {
+        try {
+            Interceptor.attach(pDerive, {
+                onEnter: function(args) {
+                    this.pbDerivedKey = args[3];
+                    this.cbDerivedKey = args[4].toInt32();
+                    this.pcbResult = args[5];
+                },
+                onLeave: function(retval) {
+                    if (retval.toInt32() !== 0) return;  // only successful calls
+                    var len = this.cbDerivedKey;
+                    try {
+                        if (this.pcbResult && !this.pcbResult.isNull()) {
+                            len = this.pcbResult.readU32();
+                        }
+                    } catch (e) {}
+                    emit('NCryptDeriveKey', this.pbDerivedKey, len);
+                }
+            });
+            armed++;
+        } catch (e) { errors.push('NCryptDeriveKey:' + e.message); }
+    } else {
+        errors.push('NCryptDeriveKey:not-found');
+    }
+
+    return {armed: armed, errors: errors};
+}
+
 rpc.exports = {
+    armKeyHintHooks: function() {
+        return _installKeyHintHooks();
+    },
+    drainKeyHints: function() {
+        var out = _keyHintLog;
+        _keyHintLog = [];
+        return out;
+    },
     enumerateRanges: function(prot) {
         return Process.enumerateRanges(prot);
     },
@@ -563,6 +644,7 @@ class FridaBridge:
         device: Any | None = None,
         read_timeout: float = 10.0,
         logger: logging.Logger | None = None,
+        collect_key_hints: bool = False,
     ) -> None:
         self._target = target
         self._device = device
@@ -578,6 +660,9 @@ class FridaBridge:
         self._preflight: PreflightResult | None = None
         # Answer of the agent's residencyMethod(), fetched once per connection.
         self._residency_method: str | None = None
+        self._collect_key_hints = collect_key_hints
+        self._key_hints_armed = False
+        self._key_hint_events: list[KeyHintEvent] = []
 
     @property
     def is_remote(self) -> bool:
@@ -639,6 +724,11 @@ class FridaBridge:
         script.on("message", self._on_message)
         script.load()
         self._api = script.exports_sync
+
+        # Arm key-derivation hooks right after the agent loads, so calls made
+        # during the whole capture window are caught.
+        if self._collect_key_hints:
+            self._arm_key_hint_hooks()
 
         # Validate API
         api_check = self._api.validate_api()
@@ -1001,6 +1091,86 @@ class FridaBridge:
             return None
         return info
 
+    def _arm_key_hint_hooks(self) -> None:
+        """Install the agent's CNG key-derivation hooks; best-effort."""
+        try:
+            result = self._api.arm_key_hint_hooks()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("Failed to arm KeyHint hooks: %s", exc)
+            return
+        armed = result.get("armed", 0) if isinstance(result, dict) else 0
+        errors = result.get("errors", []) if isinstance(result, dict) else []
+        for err in errors:
+            self._log.debug("KeyHint hook note: %s", err)
+        self._key_hints_armed = armed > 0
+        if self._key_hints_armed:
+            self._log.info("KeyHint hooks armed: %d API(s)", armed)
+        else:
+            self._log.warning(
+                "KeyHint collection requested but no key-derivation API could "
+                "be hooked (%s) -- no KeyHint blocks will be written for this "
+                "capture.",
+                ", ".join(errors) or "no detail",
+            )
+
+    @property
+    def key_hints_armed(self) -> bool:
+        """Whether at least one key-derivation hook is active in the target."""
+        return self._key_hints_armed
+
+    def _to_key_hint_event(self, entry: Any) -> KeyHintEvent | None:
+        """Turn one drained JS key-hint entry into a :class:`KeyHintEvent`.
+
+        A malformed address is logged and dropped: a KeyHint pointing at the
+        wrong address is worse than none.
+        """
+        if not isinstance(entry, dict):
+            return None
+        raw_addr = entry.get("addr")
+        try:
+            addr = _parse_frida_addr(raw_addr)
+        except (TypeError, ValueError):
+            self._log.warning(
+                "Dropping key-hint with unparseable addr %r (api=%s)",
+                raw_addr, entry.get("api", "?"),
+            )
+            return None
+        if not addr:
+            return None
+        try:
+            length = int(entry.get("len", 0))
+        except (TypeError, ValueError):
+            length = 0
+        api = entry.get("api", "")
+        self._log.info(
+            "KeyHint observed: %s key at 0x%x len=%d", api or "?", addr, length,
+        )
+        return KeyHintEvent(
+            address=addr,
+            length=length,
+            api=api,
+            algorithm=entry.get("algorithm", ""),
+        )
+
+    def collect_key_hints(self) -> list[KeyHintEvent]:
+        """Drain and return key-derivation events observed since ``connect()``.
+
+        Pulls the agent's in-target log synchronously, so this returns what
+        the target derived during the capture window. Never raises.
+        """
+        if not self._key_hints_armed or self._api is None:
+            return list(self._key_hint_events)
+        try:
+            raw = self._api.drain_key_hints()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("drainKeyHints failed: %s", exc)
+            return list(self._key_hint_events)
+        for entry in raw or []:
+            ev = self._to_key_hint_event(entry)
+            if ev is not None:
+                self._key_hint_events.append(ev)
+        return list(self._key_hint_events)
+
     def _close_residency(self) -> None:
         """Release the agent's pagemap handle; best-effort."""
         close = getattr(self._api, "close_residency", None)
@@ -1015,6 +1185,7 @@ class FridaBridge:
         """Detach the Frida session."""
         self._map_spans = None
         self._residency_method = None
+        self._key_hints_armed = False
         self._close_residency()
         session = self._session
         if session is not None:

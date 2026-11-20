@@ -19,7 +19,7 @@ from __future__ import annotations
 import click
 
 from memslicer.emu.loader import load_slice
-from memslicer.emu.engine import MSLEmulator, EmuError
+from memslicer.emu.engine import MSLEmulator, EmuError, _PREMAP_STACK_MB
 
 
 def _parse_addr(value: str | None) -> int | None:
@@ -121,9 +121,13 @@ def _trace(emu: MSLEmulator, results) -> None:
               type=click.Path(file_okay=False),
               help="After stepping, write dirtied memory ranges to this dir "
                    "(recovers unpacked/decoded payloads)")
+@click.option("--premap-stack/--no-premap-stack", "premap_stack", default=True,
+              help="Back the stack with blank pages beyond what the slice "
+              "captured, so deep frames do not fault. Disable to make such "
+              "accesses fault instead of reading invented zeros. [default: on]")
 def main(dump, steps, until_addr, pc_override, resume_syscall, pop_bytes,
          image_range, unwind_depth, show_regs, max_steps, back,
-         thread_id, list_threads, dump_written_dir):
+         thread_id, list_threads, dump_written_dir, premap_stack):
     """Emulate the MSL slice DUMP."""
     image = load_slice(dump)
     _print_summary(image)
@@ -132,7 +136,8 @@ def main(dump, steps, until_addr, pc_override, resume_syscall, pop_bytes,
         _print_threads(image)
         return
     try:
-        emu = MSLEmulator(image, thread=thread_id)
+        emu = MSLEmulator(image, thread=thread_id,
+                          premap_stack_mb=_PREMAP_STACK_MB if premap_stack else 0)
     except EmuError as exc:
         raise click.ClickException(str(exc))
     if emu.thread is not None:
@@ -190,6 +195,16 @@ def main(dump, steps, until_addr, pc_override, resume_syscall, pop_bytes,
             )
             click.echo(f"  <- {emu.pc:#012x}" + (f"    [{changed}]" if changed else ""))
             prev = now
+
+    invented = emu.synthetic_read_count()
+    if invented:
+        click.echo("")
+        click.echo(
+            f"note: {invented} read(s) from {emu.synthetic_read_sites()} "
+            f"instruction(s) took values from pre-mapped stack the slice never "
+            f"captured -- those bytes are invented zero fill. Re-run with "
+            f"--no-premap-stack to make such accesses fault instead."
+        )
 
     wx = emu.self_modified_exec()
     if wx:

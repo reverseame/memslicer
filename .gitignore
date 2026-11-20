@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MemSlicer: captured dumps, built test binaries and generated outputs
+# (large / reproducible; regenerate with `python -m memslicer <PID> --backend frida`)
+*.msl
+*.exe
+/graph.json
+/feat.json
