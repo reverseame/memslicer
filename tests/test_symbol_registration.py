@@ -9,7 +9,7 @@ angr = pytest.importorskip("angr")
 from memslicer.symbex.angr_loader import (
     extract_exported_symbols,
     register_exported_symbols,
-    load_angr,
+    load_raw_blob,
 )
 
 
@@ -68,8 +68,8 @@ def test_module_prefixed_symbol_hooking():
     assert succ.globals.get("custom_hook_executed") is True
 
 
-def test_symbol_map_loading_in_angr_loader(tmp_path):
-    """Verify symbol_map argument passing in load_angr populates angr main_object symbols."""
+def test_symbol_map_loading_in_raw_blob_loader(tmp_path):
+    """Verify symbol_map argument passing in load_raw_blob populates angr main_object symbols."""
     code = b"\x48\xc7\xc0\x00\x00\x00\x00\xc3"
     dump_file = tmp_path / "slice_with_symbols.bin"
     dump_file.write_bytes(code)
@@ -79,7 +79,7 @@ def test_symbol_map_loading_in_angr_loader(tmp_path):
         "NtAllocateVirtualMemory": 0x401100,
     }
 
-    proj, state = load_angr(str(dump_file), symbol_map=symbol_map)
+    proj, state = load_raw_blob(str(dump_file), symbol_map=symbol_map)
 
     assert proj.loader.find_symbol("ExitProcess") is not None
     assert proj.loader.find_symbol("NtAllocateVirtualMemory") is not None
@@ -128,8 +128,8 @@ def test_extract_exported_symbols_scans_all_cle_objects():
     }
 
 
-def test_load_angr_auto_registers_extracted_symbols(monkeypatch, tmp_path):
-    """load_angr requests automatic export registration without a symbol_map."""
+def test_load_raw_blob_auto_registers_extracted_symbols(monkeypatch, tmp_path):
+    """load_raw_blob requests automatic export registration without a symbol_map."""
     code_path = tmp_path / "auto_symbols.bin"
     code_path.write_bytes(b"\xc3")
     captured = {}
@@ -139,6 +139,6 @@ def test_load_angr_auto_registers_extracted_symbols(monkeypatch, tmp_path):
         return 0
 
     monkeypatch.setattr("memslicer.symbex.angr_loader.register_exported_symbols", fake_register)
-    load_angr(str(code_path))
+    load_raw_blob(str(code_path))
 
     assert captured["symbols"] is None

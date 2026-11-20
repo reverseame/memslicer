@@ -1,10 +1,10 @@
-"""Unit and end-to-end tests for the refactored CLI symbex, binary key injection, FPO fallback, and symbolic RAX check."""
+"""Unit and end-to-end tests for the CLI symbex options: binary key injection, FPO fallback, RAX search, raw blobs."""
 
 import io
 import pytest
 
 angr = pytest.importorskip("angr")
-claripy = pytest.importorskip("claripy")
+claripy = getattr(angr, "claripy", None) or pytest.importorskip("claripy")
 click = pytest.importorskip("click")
 from click.testing import CliRunner
 
@@ -12,13 +12,15 @@ from memslicer.cli_symbex import main, _get_buffer_address
 
 
 def test_cli_help_options():
-    """Verify that CLI help output includes --binary-key and --avoid-module options."""
+    """The help lists the injection/avoid options, and -b is --bypass-anti-analysis as before."""
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert "--binary-key" in result.output or "-b" in result.output
-    assert "--avoid-module" in result.output or "-m" in result.output
-    assert "--find-rax-success" in result.output or "-r" in result.output
+    for opt in ("--binary-key", "--avoid-module", "--find-rax-success",
+                "--raw-blob", "--no-syscall-handler", "--find-max-steps"):
+        assert opt in result.output
+    assert "-b, --bypass-anti-analysis" in result.output
+    assert "-b, --binary-key" not in result.output
 
 
 def test_fpo_fallback_buffer_address():
@@ -54,37 +56,23 @@ def test_fpo_fallback_buffer_address():
     assert _get_buffer_address(state1, explicit_addr=0x50000000) == 0x50000000
 
 
-def test_symbolic_rax_satisfiability_check():
-    """Verify that symbolic RAX satisfiability check evaluates correctly
-    when RAX is a symbolic variable capable of being 1.
-    """
-    proj = angr.Project(io.BytesIO(b"\xc3"), main_opts={"backend": "blob", "arch": "amd64", "base_addr": 0x401000})
-    state = proj.factory.blank_state(addr=0x401000)
-
-    # Assign symbolic variable to RAX
-    sym_rax = claripy.BVS("ret_rax", 64)
-    state.regs.rax = sym_rax
-
-    # State must be satisfiable for rax == 1
-    assert state.solver.satisfiable(extra_constraints=(state.regs.rax == 1,))
-
-    # Add impossible constraint: rax == 0 AND rax == 1
-    state.add_constraints(state.regs.rax == 0)
-    assert not state.solver.satisfiable(extra_constraints=(state.regs.rax == 1,))
+def test_cli_rejects_zero_sym_bytes(tmp_path):
+    """-k 0 is a usage error instead of a crash on a zero-width BVS."""
+    dump_file = tmp_path / "zero.bin"
+    dump_file.write_bytes(b"\xc3")
+    result = CliRunner().invoke(main, [str(dump_file), "--raw-blob", "-e", "0x0", "-k", "0"])
+    assert result.exit_code == 2
+    assert "--sym-bytes" in result.output
 
 
-def test_binary_key_unconstrained_bytes_solving():
-    """Verify that raw binary key solving allows non-printable bytes (e.g. 0x00, 0xFF, 0x00, 0x12)."""
-    proj = angr.Project(io.BytesIO(b"\xc3"), main_opts={"backend": "blob", "arch": "amd64", "base_addr": 0x401000})
-    state = proj.factory.blank_state(addr=0x401000)
-
-    # 4-byte symbolic raw buffer
-    sym_buf = claripy.BVS("raw_key", 32)
-    target_pattern = claripy.BVV(0x00FF0012, 32)
-    state.add_constraints(sym_buf == target_pattern)
-
-    solved_bytes = state.solver.eval(sym_buf, cast_to=bytes)
-    assert solved_bytes == b"\x00\xff\x00\x12"
+def test_cli_non_msl_file_is_an_error_without_raw_blob(tmp_path):
+    """A file that is not an MSL slice is reported, never executed as a raw blob."""
+    dump_file = tmp_path / "bad.msl"
+    dump_file.write_bytes(b"\x48\xc7\xc0\x01\x00\x00\x00\xc3")
+    result = CliRunner().invoke(main, [str(dump_file), "-s", "1"])
+    assert result.exit_code == 1
+    assert "as an MSL slice" in result.output
+    assert "Running" not in result.output
 
 
 def test_cli_e2e_binary_key_exact_byte_recovery(tmp_path):
@@ -95,7 +83,7 @@ def test_cli_e2e_binary_key_exact_byte_recovery(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-c", "0x0",
         "--find-rax-success",
         "--binary-key",
@@ -120,7 +108,7 @@ def test_cli_e2e_find_rax_success(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "0x0",
         "--find-rax-success",
         "-k", "8"
@@ -139,7 +127,7 @@ def test_cli_e2e_fpo_key_extraction(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "0x0",
         "--find-rax-success",
         "--binary-key",
@@ -162,7 +150,7 @@ def test_cli_e2e_avoid_module_matching_and_unmatched_warning(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "0x0",
         "--avoid-module", "0x90000000",
         "--avoid-module", "nonexistent_library.dll",
@@ -182,7 +170,7 @@ def test_cli_e2e_multiple_avoid_and_avoid_module_interaction(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "0x0",
         "-a", "0x1000",
         "-a", "0x2000",
@@ -203,7 +191,7 @@ def test_cli_e2e_configurable_buffer_addr_option(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "0x0",
         "--buffer-addr", "0x50000000",
         "--find-rax-success",
@@ -225,7 +213,7 @@ def test_cli_invalid_arguments_handling(tmp_path):
 
     runner = CliRunner()
     result = runner.invoke(main, [
-        str(dump_file),
+        str(dump_file), "--raw-blob",
         "-e", "invalid_address_string"
     ])
 

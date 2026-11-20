@@ -6,7 +6,11 @@ import logging
 from typing import Any
 
 import angr
-import claripy
+
+try:
+    import claripy
+except ImportError:  # angr >= 10 ships claripy as angr.claripy only
+    from angr import claripy
 
 from memslicer.behavior.syscalls import LINUX_X86_64
 
@@ -232,6 +236,16 @@ class GenericSyscallStub(angr.SimProcedure):
             return bv_ret
 
 
+_SYSCALL_INT_VECTORS = frozenset({"0x80", "0x2e"})  # Linux i386, Windows NT
+
+
+def _is_syscall_insn(mnemonic: str, op_str: str) -> bool:
+    """Whether a capstone instruction enters the kernel."""
+    if mnemonic in ("syscall", "sysenter", "svc"):
+        return True
+    return mnemonic == "int" and op_str.strip().lower() in _SYSCALL_INT_VECTORS
+
+
 def setup_syscall_emulation(project: angr.Project, state: angr.SimState | None = None) -> None:
     """Configure project and state for direct kernel syscall handling."""
     if project is None:
@@ -256,7 +270,12 @@ def setup_syscall_emulation(project: angr.Project, state: angr.SimState | None =
         except Exception as exc:
             logger.debug("Syscall table default assignment note: %s", exc)
 
-    # Disassemble binary memory objects dynamically to identify basic block boundaries containing syscalls
+    # Hook each syscall instruction itself (its own length only), so the
+    # instructions before it in the same basic block still execute and set the
+    # syscall number / arguments. angr cuts the preceding block at the hook.
+    # The linear sweep stops at the first undecodable byte and can mistake
+    # data for code; a misidentified hook is only reached if execution lands
+    # exactly on it.
     if hasattr(project, "loader") and hasattr(project.loader, "all_objects") and hasattr(project.loader, "memory"):
         cs = getattr(project.arch, "capstone", None)
         for obj in project.loader.all_objects:
@@ -270,45 +289,26 @@ def setup_syscall_emulation(project: angr.Project, state: angr.SimState | None =
                     continue
 
                 if cs is not None:
-                    insns = list(cs.disasm(mem_bytes, min_a))
-                    block_starts = {min_a}
-                    for insn in insns:
-                        if (
-                            insn.group(1)
-                            or insn.group(2)
-                            or insn.mnemonic in ("jmp", "jne", "je", "jz", "jnz", "call", "ret", "syscall", "sysenter", "svc", "int")
-                        ):
-                            block_starts.add(insn.address + insn.size)
-                            if insn.mnemonic.startswith(("j", "call")):
-                                try:
-                                    op_str = insn.op_str.strip()
-                                    if op_str.startswith("0x"):
-                                        block_starts.add(int(op_str, 16))
-                                except Exception:
-                                    pass
-
-                    for insn in insns:
-                        if insn.mnemonic in ("syscall", "sysenter", "svc", "int"):
-                            b_start = max(a for a in block_starts if a <= insn.address)
-                            b_end = insn.address + insn.size
-                            hook_len = b_end - b_start
-                            if not project.is_hooked(b_start):
-                                project.hook(
-                                    b_start,
-                                    GenericSyscallStub(project=project, target_next_addr=b_end),
-                                    length=hook_len,
-                                )
+                    sites = [
+                        (insn.address, insn.size)
+                        for insn in cs.disasm(mem_bytes, min_a)
+                        if _is_syscall_insn(insn.mnemonic, insn.op_str)
+                    ]
                 else:
-                    # Fallback opcode search
-                    sys_offset = 0
-                    while True:
-                        idx = mem_bytes.find(b"\x0f\x05", sys_offset)
-                        if idx == -1:
-                            break
-                        target_addr = min_a + idx
-                        if not project.is_hooked(target_addr):
-                            project.hook(target_addr, GenericSyscallStub(project=project), length=2)
-                        sys_offset = idx + 2
+                    # Fallback opcode search (x86-64 ``syscall``)
+                    sites = []
+                    idx = mem_bytes.find(b"\x0f\x05")
+                    while idx != -1:
+                        sites.append((min_a + idx, 2))
+                        idx = mem_bytes.find(b"\x0f\x05", idx + 2)
+
+                for addr, size in sites:
+                    if not project.is_hooked(addr):
+                        project.hook(
+                            addr,
+                            GenericSyscallStub(project=project, target_next_addr=addr + size),
+                            length=size,
+                        )
             except Exception as exc:
                 logger.debug("Syscall scanning note for object: %s", exc)
 

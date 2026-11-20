@@ -3,7 +3,7 @@
 import pytest
 
 angr = pytest.importorskip("angr")
-claripy = pytest.importorskip("claripy")
+claripy = getattr(angr, "claripy", None) or pytest.importorskip("claripy")
 
 from memslicer.symbex.anti_analysis import mask_peb_anti_debug, apply_anti_analysis_bypass
 

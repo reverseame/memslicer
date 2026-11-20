@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 
 import angr
-import claripy
+
+try:
+    import claripy
+except ImportError:  # angr >= 10 ships claripy as angr.claripy only
+    from angr import claripy
 
 from memslicer.symbex.angr_loader import resolve_pe_export
 

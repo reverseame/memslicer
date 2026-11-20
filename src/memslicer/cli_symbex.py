@@ -10,9 +10,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 import click
-import claripy
 
-from memslicer.symbex.angr_loader import load_angr, SymbexError
+try:
+    import claripy
+except ImportError:  # angr >= 10 ships claripy as angr.claripy only
+    from angr import claripy
+
+from memslicer.symbex.angr_loader import load_angr, load_raw_blob, SymbexError
 from memslicer.symbex.anti_analysis import apply_anti_analysis_bypass
 from memslicer.symbex.syscall_handler import setup_syscall_emulation
 from memslicer.symbex.unmapped_handler import (
@@ -44,6 +48,29 @@ def classify_memory_region(addr: int) -> str:
     elif addr >= 0x140000000 or addr >= 0x400000:
         return "Executable Image"
     return "Heap"
+
+
+def _leaf_asts(ast: Any):
+    """Yield the leaf ASTs of *ast*, once each.
+
+    claripy < 10 provides ``leaf_asts()``; the claripy shipped inside angr 10
+    does not, so walk ``args`` there.
+    """
+    leaf_asts = getattr(ast, "leaf_asts", None)
+    if leaf_asts is not None:
+        yield from leaf_asts()
+        return
+    visited: dict[int, Any] = {}   # id -> node; holds nodes so ids stay unique
+    stack = [ast]
+    while stack:
+        node = stack.pop()
+        if id(node) in visited:
+            continue
+        visited[id(node)] = node
+        if node.is_leaf():
+            yield node
+        else:
+            stack.extend(a for a in node.args if hasattr(a, "is_leaf"))
 
 
 def inspect_and_print_provenance(state: Any) -> None:
@@ -144,7 +171,7 @@ def inspect_and_print_provenance(state: Any) -> None:
                 # claripy.BVS(...) here would be a new, unconstrained variable and
                 # evaluate to arbitrary bytes instead of the solved value.
                 leaf = next(
-                    (lf for lf in constraint.leaf_asts() if lf.symbolic and var in lf.variables),
+                    (lf for lf in _leaf_asts(constraint) if lf.symbolic and var in lf.variables),
                     None,
                 )
                 if leaf is None:
@@ -327,24 +354,61 @@ def _select_key_hint(state: Any) -> Any | None:
     )
 
 
+def _inject_symbolic_buffer(
+    state: Any,
+    addr: int,
+    nbytes: int,
+    *,
+    printable: bool,
+    nul_terminate: bool,
+) -> None:
+    """Overwrite *nbytes* at *addr* with a fresh symbolic buffer.
+
+    *printable* constrains every byte to ASCII 0x20-0x7E; *nul_terminate*
+    also writes a NUL right after the buffer (C-string keys only: binary keys
+    and KeyHint-located key material keep the captured byte that follows).
+    """
+    _ensure_page_mapped(
+        state, addr, access_size=nbytes + (1 if nul_terminate else 0), is_code=False,
+    )
+    sym_key = claripy.BVS("license_key", nbytes * 8)
+    if printable:
+        for byte_ast in sym_key.chop(8):
+            state.add_constraints(byte_ast >= 0x20, byte_ast <= 0x7E)
+    for i, byte_ast in enumerate(sym_key.chop(8)):
+        state.memory.store(addr + i, byte_ast)
+    if nul_terminate:
+        state.memory.store(addr + nbytes, b"\x00")
+    state.globals["injected_key_addr"] = addr
+    state.globals["injected_key_bytes"] = nbytes
+
+
+_DEFAULT_SYM_BYTES = 16
+_DEFAULT_FIND_MAX_STEPS = 2000
+
+
 @click.command()
 @click.argument("dump", type=click.Path(exists=True, dir_okay=False))
-@click.option("-e", "--entry", help="Override starting PC address for symbolic execution (e.g. 0x140001754)")
-@click.option("-c", "--call-function", "call_func", help="Setup clean function call_state at address (e.g. 0x140001754)")
-@click.option("-k", "--sym-bytes", type=int, default=16, help="Size of symbolic buffer to inject in bytes (default: 16)")
-@click.option("-b", "--binary-key", "binary_key", is_flag=True, help="Inject unconstrained raw byte buffer (not restricted to printable ASCII 0x20-0x7E)")
-@click.option("--buffer-addr", "buffer_addr_str", help="Explicit virtual address or custom fallback for injected symbolic buffer (e.g. 0x50000000)")
-@click.option("--use-key-hints", "use_key_hints", is_flag=True, help="Auto-target the symbolic buffer at a live-acquired KeyHint (0x0020) instead of the RBP-0x40/RSP+0x20 heuristic; also adopts the hint's key length as --sym-bytes when known. An explicit --buffer-addr still wins.")
+@click.option("--raw-blob", "raw_blob", is_flag=True, help="DUMP is a raw x86-64 code blob, not an MSL slice: map it at 0x0 and start at its first byte")
+@click.option("-e", "--entry", help="Override starting PC address for symbolic execution (e.g. 0x140001754); injects a symbolic buffer")
+@click.option("-c", "--call-function", "call_func", help="Setup clean function call_state at address (e.g. 0x140001754); injects a symbolic buffer")
+@click.option("-k", "--sym-bytes", type=click.IntRange(min=1), default=None, help=f"Inject a symbolic buffer of this many bytes (default with any other injection option: {_DEFAULT_SYM_BYTES}). Without an injection option the state starts exactly as captured")
+@click.option("--binary-key", "binary_key", is_flag=True, help="Inject an unconstrained raw byte buffer (not restricted to printable ASCII 0x20-0x7E, no trailing NUL)")
+@click.option("--buffer-addr", "buffer_addr_str", help="Inject the symbolic buffer at this virtual address instead of RBP-0x40/RSP+0x20 (e.g. 0x50000000)")
+@click.option("--use-key-hints", "use_key_hints", is_flag=True, help="Inject the symbolic buffer at a live-acquired KeyHint (0x0020) instead of the RBP-0x40/RSP+0x20 heuristic; also adopts the hint's key length as --sym-bytes when known. An explicit --buffer-addr still wins.")
 @click.option("-m", "--avoid-module", "avoid_modules", multiple=True, help="Module name or address range to avoid (repeatable)")
 @click.option("-r", "--find-rax-success", is_flag=True, help="Find paths where function return value (RAX) equals 1 post-return. Meaningful for license/key-check style targets; against generic real-world code almost any reachable function can trivially return 1, so a match here is not evidence of anything specific — use --find ADDR instead when you have a real target address")
 @click.option("-f", "--find", multiple=True, help="Address(es) to reach (repeatable)")
 @click.option("-a", "--avoid", multiple=True, help="Address(es) to avoid (repeatable)")
+@click.option("--find-max-steps", type=click.IntRange(min=0), default=_DEFAULT_FIND_MAX_STEPS, show_default=True, help="Give up a --find/--find-rax-success search after this many simulation steps (0 = no limit)")
 @click.option("-s", "--steps", type=int, default=0, help="Symbolic steps to run when no --find is given")
 @click.option("-v", "--veritesting", "veritesting", is_flag=True, help="Enables veritesting, mitigating state explosion")
-@click.option("--bypass-anti-analysis", "bypass_anti_analysis", is_flag=True, help="Bypasses anti-debugging APIs (IsDebuggerPresent) and PEB flags")
+@click.option("-b", "--bypass-anti-analysis", "bypass_anti_analysis", is_flag=True, help="Bypasses anti-debugging APIs (IsDebuggerPresent) and PEB flags")
 @click.option("-u/--no-auto-map-unmapped", "auto_map_unmapped", is_flag=True, default=True, help="Auto-maps unmapped memory pages and stubs missing code/APIs dynamically")
+@click.option("--no-syscall-handler", "no_syscall_handler", is_flag=True, help="Do not hook syscall instructions with the generic stub (and do not repair syscall-errored states); use angr's own syscall models instead")
 def main(
     dump,
+    raw_blob,
     entry,
     call_func,
     sym_bytes,
@@ -355,26 +419,40 @@ def main(
     find_rax_success,
     find,
     avoid,
+    find_max_steps,
     steps,
     veritesting,
     bypass_anti_analysis,
     auto_map_unmapped,
+    no_syscall_handler,
 ):
     """Load the MSL slice DUMP into angr for symbolic execution."""
     try:
-        project, state = load_angr(dump)
+        project, state = load_raw_blob(dump) if raw_blob else load_angr(dump)
     except SymbexError as exc:
         raise click.ClickException(str(exc))
 
+    syscall_emulation = not no_syscall_handler
     explicit_buf_addr = _parse_addr(buffer_addr_str) if buffer_addr_str else None
+
+    # A symbolic buffer overwrites captured memory, so it is only injected when
+    # the user asked for one; a plain run starts from the exact captured state.
+    inject = any((
+        sym_bytes is not None, explicit_buf_addr is not None, binary_key,
+        use_key_hints, entry, call_func,
+    ))
+    if sym_bytes is None:
+        sym_bytes = _DEFAULT_SYM_BYTES
 
     # --use-key-hints: prefer a live-acquired KeyHint over the blind
     # RBP-0x40/RSP+0x20 heuristic. An explicit --buffer-addr is a deliberate
     # override and still wins; otherwise the hint's resolved address seeds the
     # injection and (when known) its key length becomes --sym-bytes.
+    hint_used = False
     if use_key_hints and explicit_buf_addr is None:
         hint = _select_key_hint(state)
         if hint is not None:
+            hint_used = True
             explicit_buf_addr = hint.address
             note = f" ({hint.note})" if getattr(hint, "note", "") else ""
             if hint.key_len > 0:
@@ -395,75 +473,38 @@ def main(
             )
 
     if auto_map_unmapped:
-        enable_unmapped_memory_recovery(project=project, state=state)
+        enable_unmapped_memory_recovery(
+            project=project, state=state, syscall_emulation=syscall_emulation,
+        )
+    elif syscall_emulation:
+        setup_syscall_emulation(project=project, state=state)
 
     if bypass_anti_analysis:
         apply_anti_analysis_bypass(project=project, state=state)
 
-    setup_syscall_emulation(project=project, state=state)
-
+    mode_str = "raw binary bytes" if binary_key else "printable ASCII"
+    inject_opts = {"printable": not binary_key, "nul_terminate": not (binary_key or hint_used)}
     if call_func:
         func_addr = _parse_addr(call_func)
         key_mem_addr = _get_buffer_address(state, explicit_addr=explicit_buf_addr)
-        _ensure_page_mapped(state, key_mem_addr, access_size=sym_bytes, is_code=False)
-
-        sym_key = claripy.BVS("license_key", sym_bytes * 8)
         state = project.factory.call_state(func_addr, key_mem_addr, base_state=state)
         if auto_map_unmapped:
-            enable_unmapped_memory_recovery(project=project, state=state)
-
-        if not binary_key:
-            for byte_ast in sym_key.chop(8):
-                state.add_constraints(byte_ast >= 0x20, byte_ast <= 0x7E)
-
-        for i, byte_ast in enumerate(sym_key.chop(8)):
-            state.memory.store(key_mem_addr + i, byte_ast)
-        state.memory.store(key_mem_addr + sym_bytes, b"\x00")
-        state.globals["injected_key_addr"] = key_mem_addr
-        state.globals["injected_key_bytes"] = sym_bytes
-
-        mode_str = "raw binary bytes" if binary_key else "printable ASCII"
+            enable_unmapped_memory_recovery(
+                project=project, state=state, syscall_emulation=syscall_emulation,
+            )
+        _inject_symbolic_buffer(state, key_mem_addr, sym_bytes, **inject_opts)
         click.echo(f"[+] Prepared clean call_state at {func_addr:#x} with {sym_bytes}-byte symbolic buffer ({mode_str}) at {key_mem_addr:#x}")
 
     elif entry:
         entry_addr = _parse_addr(entry)
         state.regs.pc = entry_addr
-
         key_mem_addr = _get_buffer_address(state, explicit_addr=explicit_buf_addr)
-        _ensure_page_mapped(state, key_mem_addr, access_size=sym_bytes, is_code=False)
-
-        sym_key = claripy.BVS("license_key", sym_bytes * 8)
-        if not binary_key:
-            for byte_ast in sym_key.chop(8):
-                state.add_constraints(byte_ast >= 0x20, byte_ast <= 0x7E)
-
-        for i, byte_ast in enumerate(sym_key.chop(8)):
-            state.memory.store(key_mem_addr + i, byte_ast)
-        state.memory.store(key_mem_addr + sym_bytes, b"\x00")
-        state.globals["injected_key_addr"] = key_mem_addr
-        state.globals["injected_key_bytes"] = sym_bytes
-
-
-        mode_str = "raw binary bytes" if binary_key else "printable ASCII"
+        _inject_symbolic_buffer(state, key_mem_addr, sym_bytes, **inject_opts)
         click.echo(f"[+] Overrode PC to {entry_addr:#x} with {sym_bytes}-byte symbolic key buffer ({mode_str}) at {key_mem_addr:#x}")
 
-    elif explicit_buf_addr is not None or binary_key or sym_bytes > 0:
+    elif inject:
         key_mem_addr = _get_buffer_address(state, explicit_addr=explicit_buf_addr)
-        _ensure_page_mapped(state, key_mem_addr, access_size=sym_bytes, is_code=False)
-
-        sym_key = claripy.BVS("license_key", sym_bytes * 8)
-        if not binary_key:
-            for byte_ast in sym_key.chop(8):
-                state.add_constraints(byte_ast >= 0x20, byte_ast <= 0x7E)
-
-        for i, byte_ast in enumerate(sym_key.chop(8)):
-            state.memory.store(key_mem_addr + i, byte_ast)
-        state.memory.store(key_mem_addr + sym_bytes, b"\x00")
-        state.globals["injected_key_addr"] = key_mem_addr
-        state.globals["injected_key_bytes"] = sym_bytes
-
-
-        mode_str = "raw binary bytes" if binary_key else "printable ASCII"
+        _inject_symbolic_buffer(state, key_mem_addr, sym_bytes, **inject_opts)
         click.echo(f"[+] Prepared {sym_bytes}-byte symbolic key buffer ({mode_str}) at {key_mem_addr:#x}")
 
     click.echo(f"arch    : {project.arch.name}")
@@ -471,11 +512,6 @@ def main(
     click.echo(f"loaded  : {project.loader.min_addr:#x}-{project.loader.max_addr:#x}")
 
     simgr = project.factory.simgr(state, veritesting=veritesting)
-
-    # Determine dynamic main binary bounds to avoid hardcoded constants
-    main_obj = getattr(project.loader, "main_object", None)
-    main_min = getattr(main_obj, "min_addr", project.loader.min_addr)
-    main_max = getattr(main_obj, "max_addr", project.loader.max_addr)
 
     # Parse and resolve --avoid (-a) and --avoid-module (-m) arguments against CLE loader objects
     avoid_addrs = set(_addrs(avoid)) if avoid else set()
@@ -541,9 +577,8 @@ def main(
             click.echo(f"\n[+] Searching for target address(es): {[hex(a) for a in target_addrs]}...")
 
         step_count = 0
-        max_total_steps = 2000
 
-        while simgr.active and step_count < max_total_steps:
+        while simgr.active and (find_max_steps == 0 or step_count < find_max_steps):
             step_count += 1
 
             # 1. Check for found states BEFORE avoid filtering (so returned states aren't pruned by module bounds)
@@ -599,18 +634,9 @@ def main(
 
             simgr.step()
 
-            # Dynamic module filtering: if targets are in main binary, prune states escaping main binary bounds
-            if target_addrs and all(main_min <= t <= main_max for t in target_addrs):
-                local_active = [s for s in simgr.active if main_min <= s.addr <= main_max]
-                if local_active:
-                    escaped = [s for s in simgr.active if not (main_min <= s.addr <= main_max)]
-                    for s in escaped:
-                        simgr.active.remove(s)
-                        simgr.stashes.setdefault("pruned", []).append(s)
-
             # Auto-repair errored states
             if not simgr.active and simgr.errored and auto_map_unmapped:
-                repaired = repair_errored_states(simgr)
+                repaired = repair_errored_states(simgr, repair_syscalls=syscall_emulation)
                 if repaired:
                     click.echo(f"\n [*] Auto-repaired {repaired} errored state(s), continuing exploration...")
 
@@ -642,13 +668,13 @@ def main(
                 pass
         else:
             click.echo(f"\n [-] Target not reachable within {step_count} steps (or active states exhausted).")
-            click.echo(" [TIP] If the dump was captured during Sleep/fgets, try specifying --entry 0xDIRECCION to start at your target function.")
+            click.echo(" [TIP] If the dump was captured during Sleep/fgets, try specifying --entry 0xADDRESS to start at your target function.")
     elif steps > 0:
         click.echo(f"\n[+] Running {steps} symbolic execution steps with real-time feedback...")
         for step_i in range(1, steps + 1):
             if not simgr.active:
                 if simgr.errored and auto_map_unmapped:
-                    repaired = repair_errored_states(simgr)
+                    repaired = repair_errored_states(simgr, repair_syscalls=syscall_emulation)
                     if repaired:
                         click.echo(f"\n [*] Auto-repaired {repaired} errored state(s) at step {step_i}...")
                     else:

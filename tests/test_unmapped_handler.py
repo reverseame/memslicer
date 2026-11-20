@@ -4,7 +4,7 @@ import io
 import pytest
 
 angr = pytest.importorskip("angr")
-claripy = pytest.importorskip("claripy")
+claripy = getattr(angr, "claripy", None) or pytest.importorskip("claripy")
 
 from memslicer.symbex.unmapped_handler import (
     SimGenericAPIStub,

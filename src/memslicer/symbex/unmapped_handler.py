@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import logging
+
 import angr
-import claripy
+
+try:
+    import claripy
+except ImportError:  # angr >= 10 ships claripy as angr.claripy only
+    from angr import claripy
 
 logger = logging.getLogger(__name__)
 
@@ -414,19 +419,25 @@ def _on_instruction(state: angr.SimState) -> None:
 # 3. PUBLIC INITIALIZATION & RECOVERY FUNCTIONS
 # ----------------------------------------------------------------------
 
-def enable_unmapped_memory_recovery(project: angr.Project, state: angr.SimState, premap_stack_mb: int = 64) -> None:
+def enable_unmapped_memory_recovery(
+    project: angr.Project,
+    state: angr.SimState,
+    premap_stack_mb: int = 64,
+    syscall_emulation: bool = True,
+) -> None:
     """Hooks mem_read, mem_write, and instruction breakpoints on state to auto-map pages,
-    configures direct kernel syscall emulation, and pre-maps a stack region (default 64MB).
+    pre-maps a stack region (default 64MB) and, unless *syscall_emulation* is
+    False, configures direct kernel syscall emulation (which replaces angr's own
+    syscall models).
     """
-    from memslicer.symbex.syscall_handler import setup_syscall_emulation
-
     state.project = project
     state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
     state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS)
     state.options.add(angr.options.BYPASS_UNSUPPORTED_SYSCALL)
 
-    # Configure direct kernel syscall handling & stubs
-    setup_syscall_emulation(project, state)
+    if syscall_emulation:
+        from memslicer.symbex.syscall_handler import setup_syscall_emulation
+        setup_syscall_emulation(project, state)
 
     if premap_stack_mb > 0:
         premap_stack_region(state, region_size_mb=premap_stack_mb)
@@ -437,10 +448,15 @@ def enable_unmapped_memory_recovery(project: angr.Project, state: angr.SimState,
     logger.info("[unmapped_handler] Unmapped memory recovery enabled on state at 0x%x", state.addr)
 
 
-def repair_errored_states(simgr: angr.SimulationManager, max_repairs_per_state: int = 3) -> int:
+def repair_errored_states(
+    simgr: angr.SimulationManager,
+    max_repairs_per_state: int = 3,
+    repair_syscalls: bool = True,
+) -> int:
     """Inspects simgr.errored for segfaults/memory errors or unsupported syscalls,
-    maps missing pages across full access range or repairs syscall states,
-    and moves repaired states back to simgr.active ONLY if all required repairs succeed.
+    maps missing pages across full access range or repairs syscall states
+    (skipped when *repair_syscalls* is False), and moves repaired states back
+    to simgr.active ONLY if all required repairs succeed.
     Returns the number of repaired states.
     """
     from memslicer.symbex.syscall_handler import repair_syscall_errored_state
@@ -456,7 +472,7 @@ def repair_errored_states(simgr: angr.SimulationManager, max_repairs_per_state: 
         category, fault_addr, access_size = classify_state_error(error_record)
 
         # Handle unsupported syscall repair
-        if category == "unsupported_syscall" and state is not None:
+        if repair_syscalls and category == "unsupported_syscall" and state is not None:
             if repair_syscall_errored_state(state, error_record.error):
                 simgr.errored.remove(error_record)
                 simgr.active.append(state)

@@ -4,7 +4,7 @@ import logging
 import pytest
 
 angr = pytest.importorskip("angr")
-claripy = pytest.importorskip("claripy")
+claripy = getattr(angr, "claripy", None) or pytest.importorskip("claripy")
 
 import memslicer.symbex.unmapped_handler as unmapped_module
 from memslicer.symbex.unmapped_handler import (

@@ -29,6 +29,26 @@ class SymbexError(RuntimeError):
     """Raised when a slice cannot be loaded into angr."""
 
 
+def _import_angr():
+    """Return ``(angr, claripy)``, or raise :class:`SymbexError` without angr.
+
+    angr 10 no longer ships a top-level ``claripy`` module; it is reachable
+    as ``angr.claripy`` there.
+    """
+    try:
+        import angr
+    except ImportError as exc:
+        raise SymbexError(
+            "symbolic execution requires the 'symbex' extra: "
+            "pip install memslicer[symbex]"
+        ) from exc
+    try:
+        import claripy
+    except ImportError:
+        from angr import claripy
+    return angr, claripy
+
+
 def _region_at(image: SliceImage, addr: int):
     for r in image.regions:
         if r.base <= addr < r.base + r.size:
@@ -66,25 +86,13 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
     thread to seed from (its tid or an :class:`EmuThread`); the default is the
     Current thread.
     """
-    try:
-        import angr
-        import claripy
-    except ImportError as exc:
-        raise SymbexError(
-            "symbolic execution requires the 'symbex' extra: "
-            "pip install memslicer[symbex]"
-        ) from exc
+    angr, claripy = _import_angr()
 
-    try:
-        image = image or load_slice(path)
-    except Exception:
+    if image is None:
         try:
-            project = angr.Project(path, main_opts={"backend": "blob", "arch": "AMD64"}, auto_load_libs=False)
-            state = project.factory.entry_state()
-            register_exported_symbols(project, symbol_map)
-            return project, state
+            image = load_slice(path)
         except Exception as exc:
-            raise SymbexError(f"Failed to load '{path}' as MSL slice or binary executable: {exc}") from exc
+            raise SymbexError(f"cannot load '{path}' as an MSL slice: {exc}") from exc
 
     if image.arch not in _ANGR_ARCH:
         arch_name = getattr(image.arch, "name", str(image.arch))
@@ -129,8 +137,11 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
         for paddr, data in r.pages.items():
             if not (0 <= paddr <= 0xFFFFFFFFFFFFFFFF):
                 raise SymbexError(f"Out-of-bounds page address: 0x{paddr:x}")
-            if len(data) != 4096:
-                raise SymbexError(f"Invalid page size ({len(data)} bytes) at 0x{paddr:x}")
+            if len(data) != r.page_size:
+                raise SymbexError(
+                    f"Invalid page size ({len(data)} bytes, region page size "
+                    f"{r.page_size}) at 0x{paddr:x}"
+                )
             try:
                 state.memory.store(paddr, data, disable_actions=True, inspect=False)
             except Exception as exc:
@@ -185,6 +196,29 @@ def load_angr(path: str, image: SliceImage | None = None, thread=None, symbol_ma
     # an unresolved hint rather than have it silently vanish.
     state.globals["msl_key_hints"] = list(getattr(image, "key_hints", []) or [])
 
+    return project, state
+
+
+def load_raw_blob(path: str, arch: str = "AMD64", base_addr: int = 0,
+                  symbol_map: dict | None = None):
+    """Return ``(project, state)`` for a raw code blob (not an MSL slice).
+
+    The whole file is mapped at *base_addr* as *arch* code and the state
+    starts at its first byte. Only used when explicitly requested
+    (``memslicer-symbex --raw-blob``); :func:`load_angr` never falls back to
+    it, so a corrupt slice is reported instead of executed as code.
+    """
+    angr, _ = _import_angr()
+    try:
+        project = angr.Project(
+            path,
+            main_opts={"backend": "blob", "arch": arch, "base_addr": base_addr},
+            auto_load_libs=False,
+        )
+    except Exception as exc:
+        raise SymbexError(f"Failed to load '{path}' as a raw blob: {exc}") from exc
+    state = project.factory.entry_state()
+    register_exported_symbols(project, symbol_map)
     return project, state
 
 
@@ -428,14 +462,7 @@ def handoff_to_angr(emu):
     memory (after however many concrete steps it has run), positioned at the
     current PC.
     """
-    try:
-        import angr
-        import claripy
-    except ImportError as exc:
-        raise SymbexError(
-            "symbolic execution requires the 'symbex' extra: "
-            "pip install memslicer[symbex]"
-        ) from exc
+    angr, claripy = _import_angr()
 
     image = emu.image
     if image.arch not in _ANGR_ARCH:
