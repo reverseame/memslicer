@@ -9,7 +9,7 @@ allow-direct-references = true
 
 [project]
 name = "memslicer"
-version = "0.2.7"
+version = "0.5.2"
 description = "MSL memory dump tool with pluggable debugger backends (Frida, GDB, LLDB)"
 requires-python = ">= 3.10"
 license = "Apache-2.0"
@@ -62,6 +62,7 @@ graph = [
 
 [tool.ruff.lint]
 ignore = [
+    "B017",
     "BLE001",
     "C408",
     "DTZ007",
@@ -89,6 +90,8 @@ ignore = [
     "SIM102",
     "SIM103",
     "SIM115",
+    "SIM117",
+    "TRY201",
     "UP",
     "UP007",
     "UP035",
@@ -99,6 +102,11 @@ ignore = [
 # Several test modules bootstrap sys.path (insert ../src) before importing
 # memslicer, so their package imports intentionally follow module-level code.
 "tests/*" = ["E402"]
+# Upstream modules, kept byte-identical to MemorySlice/memslicer: closures
+# built in loops are consumed immediately, and EncryptionParams is a
+# string-only annotation (imported lazily in __init__).
+"src/memslicer/msl/writer.py" = ["B023", "F821"]
+"tests/test_frida_remote_collector.py" = ["F811"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -106,6 +114,7 @@ markers = [
     "requires_linux: skipped unless sys.platform.startswith('linux')",
     "requires_darwin: skipped unless sys.platform == 'darwin'",
     "requires_windows: skipped unless sys.platform == 'win32'",
+    "requires_frida_runtime: skipped unless a local Frida system session is available",
 ]
 
 [tool.hatch.build.targets.wheel]

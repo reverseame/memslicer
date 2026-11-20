@@ -1,30 +1,482 @@
 """Streaming MSL file writer."""
 from __future__ import annotations
 
+import logging
 import struct
 import uuid
 import warnings
-from typing import TYPE_CHECKING, BinaryIO
+from typing import BinaryIO, Callable
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
-    BLOCK_HEADER_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
-    BlockType, CompAlgo, PageState,
+    BLOCK_HEADER_SIZE, HASH_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
+    CONTINUATION, FLAG_ENCRYPTED, BlockType, CompAlgo, PageState,
+    PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX, valid_page_size,
+    RegionType, OmissionReason, VasNameSource, ThreadState,
+    EXTENSION_FORBIDDEN_TYPES,
 )
-
-if TYPE_CHECKING:
-    from memslicer.msl.encryption import EncryptionParams
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
     RelatedDump, KernelSymbolBundle, PhysicalMemoryMap, ConnectivityTable,
-    KernelModuleList, ModuleBuildIdManifest, TargetIntrospection,
-    PersistenceManifest, ThreadContext,
+    KernelModuleList, ModuleBuildIdManifest, ModuleBuildIdRow,
+    TargetIntrospection, PersistenceManifest, RegionOmissionManifest,
+    RegionOmissionRow, VasEntry, EndOfCapture, EndOfExtension,
+    ThreadContext, ThreadRegister,
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
-from memslicer.utils.padding import pad_bytes, encode_string
+from memslicer.utils.padding import pad8, pad_bytes, encode_string, encode_string_bounded
 from memslicer.utils.timestamps import now_ns
+
+_log = logging.getLogger("memslicer")
+
+_U64_MASK = (1 << 64) - 1
+
+
+def _u64_wire(value: int) -> int:
+    """Map a signed Python int onto the unsigned 64-bit wire field.
+
+    Some counters the kernel exposes are signed by definition even though
+    the format stores them in an unsigned ``Value(8)`` field.  The standing
+    example is ``/proc/net/snmp`` ``Tcp.MaxConn``: RFC 2012 defines
+    ``tcpMaxConn`` as an INTEGER where ``-1`` means "no fixed limit", and
+    every Linux kernel reports exactly that -- so every investigation
+    capture on a Linux host carried a value ``struct.pack("<Q")`` refuses.
+
+    Two's complement keeps the evidence intact: ``-1`` becomes
+    ``0xFFFFFFFFFFFFFFFF`` on the wire and a reader that knows the counter
+    is signed recovers ``-1`` exactly.  Saturating or dropping the row
+    would record something the target never said.
+
+    Args:
+        value: Any Python int, possibly negative.
+
+    Returns:
+        ``value`` reduced modulo 2**64, always packable as ``<Q``.
+    """
+    return value & _U64_MASK
+
+
+_OMISSION_STR_MAX = 0xFFFF
+_OMISSION_ROW_HEAD = struct.Struct("<QQBBBBHH")
+
+
+def _encode_omission_string(value: str, field_name: str) -> bytes:
+    """UTF-8 encode a RegionOmissionManifest string field.
+
+    The on-disk length field is a u16 and the string carries no NUL
+    terminator, so an embedded NUL or an oversized value is refused
+    instead of silently corrupting the row boundary.
+
+    Args:
+        value: The string to encode.
+        field_name: Used in the error message only.
+
+    Returns:
+        The raw UTF-8 bytes, not yet padded.
+
+    Raises:
+        ValueError: if *value* contains NUL or exceeds 65535 bytes.
+    """
+    if "\x00" in value:
+        raise ValueError(f"RegionOmissionManifest {field_name} contains NUL")
+    raw = value.encode("utf-8")
+    if len(raw) > _OMISSION_STR_MAX:
+        raise ValueError(
+            f"RegionOmissionManifest {field_name} too long: "
+            f"{len(raw)} > {_OMISSION_STR_MAX}"
+        )
+    return raw
+
+
+def parse_region_omission_manifest(payload: bytes) -> RegionOmissionManifest:
+    """Parse a RegionOmissionManifest (0x005B) block payload.
+
+    Inverse of :meth:`MSLWriter.write_region_omission_manifest`; see
+    that method for the on-disk layout. Unknown ``region_type`` or
+    ``reason`` values are kept as plain ints so a newer writer's rows
+    survive an older reader.
+
+    Args:
+        payload: Decompressed block payload (as yielded by
+            :func:`memslicer.msl.iterator.iterate_blocks`).
+
+    Returns:
+        The reconstructed manifest.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 16:
+        raise ValueError("RegionOmissionManifest payload truncated")
+    row_count, _reserved = struct.unpack_from("<II", payload, 0)
+    scope_len, patterns_len, _reserved2 = struct.unpack_from("<HHI", payload, 8)
+    offset = 16
+    scope, offset = _read_omission_string(payload, offset, scope_len)
+    patterns_raw, offset = _read_omission_string(payload, offset, patterns_len)
+    patterns = patterns_raw.split("\n") if patterns_raw else []
+    rows: list[RegionOmissionRow] = []
+    for _ in range(row_count):
+        row, offset = _read_omission_row(payload, offset)
+        rows.append(row)
+    return RegionOmissionManifest(scope=scope, exclude_patterns=patterns, rows=rows)
+
+
+def _read_omission_string(
+    payload: bytes, offset: int, length: int,
+) -> tuple[str, int]:
+    """Read a pad8 UTF-8 field; return ``(text, offset_after_padding)``."""
+    end = offset + length
+    if end > len(payload):
+        raise ValueError("RegionOmissionManifest string field truncated")
+    text = payload[offset:end].decode("utf-8")
+    return text, offset + pad8(length)
+
+
+def _read_omission_row(payload: bytes, offset: int) -> tuple[RegionOmissionRow, int]:
+    """Read one row at *offset*; return ``(row, offset_after_row)``."""
+    if offset + _OMISSION_ROW_HEAD.size > len(payload):
+        raise ValueError("RegionOmissionManifest row truncated")
+    (base_addr, size, protection, region_type, reason, _r1,
+     name_len, _r2) = _OMISSION_ROW_HEAD.unpack_from(payload, offset)
+    offset += _OMISSION_ROW_HEAD.size
+    name, offset = _read_omission_string(payload, offset, name_len)
+    row = RegionOmissionRow(
+        base_addr=base_addr, size=size, protection=protection,
+        region_type=_enum_or_int(RegionType, region_type),
+        reason=_enum_or_int(OmissionReason, reason),
+        name=name,
+    )
+    return row, offset
+
+
+def _stream_position(output: BinaryIO) -> int | None:
+    """Return the current offset of a seekable *output*, else ``None``.
+
+    Pipes and other non-seekable streams report ``None`` so the writer
+    knows it cannot patch the header later.
+    """
+    try:
+        if not output.seekable():
+            return None
+        return output.tell()
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _enum_or_int(enum_cls, value: int):
+    """Return ``enum_cls(value)``, or the bare int for an unknown value."""
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return value
+
+
+def _packed_or_none(
+    table: str, label: str, pack: Callable[[], bytes],
+) -> bytes | None:
+    """Run a row packer, turning an unrepresentable value into a logged drop.
+
+    One row carrying a value outside its field's range must not cost the
+    whole capture: raising here loses the memory the examiner actually
+    came for, dropping the row loses one line of a system table.  The
+    drop is logged so the examiner can see in the ``.msl.log`` that the
+    recorded table is shorter than what the target held.
+
+    Args:
+        table: Table name as the spec calls it, for the log line.
+        label: Short identification of the row (pid, iface, counter ...).
+        pack: Zero-argument callable producing the packed row.
+
+    Returns:
+        The packed row, or ``None`` when ``struct`` rejected a value.
+    """
+    try:
+        return pack()
+    except struct.error as exc:
+        _log.warning("%s: dropping row %s (%s)", table, label, exc)
+        return None
+
+
+_VAS_PATH_MAX = 0xFFFF
+# BaseAddr(8) RegionSize(8) Protection(1) RegionType(1) PathLen(2)
+# NameSource(1) Reserved(3) -- spec Section 5.8.
+_VAS_ENTRY_HEAD = struct.Struct("<QQBBHB3x")
+
+
+def _vas_path_bytes(name: str) -> bytes:
+    """Return the NUL-terminated UTF-8 VAS path, or ``b""`` if unusable.
+
+    Unusable means empty, containing a NUL, not UTF-8 encodable, or longer
+    than the u16 ``path_len`` allows once the terminator is added.
+    """
+    if not name or "\x00" in name:
+        return b""
+    try:
+        raw = name.encode("utf-8") + b"\x00"
+    except UnicodeEncodeError:
+        return b""
+    return raw if len(raw) <= _VAS_PATH_MAX else b""
+
+
+def _pack_vas_entry(entry: VasEntry) -> bytes | None:
+    """Pack one :class:`VasEntry` (24-byte head + padded NUL-terminated path).
+
+    Returns ``None`` (logged) when an address or size does not fit u64.
+    """
+    path = _vas_path_bytes(entry.mapped_path)
+    head = _packed_or_none("VASMap", f"base 0x{entry.base_addr:x}", lambda: (
+        _VAS_ENTRY_HEAD.pack(
+            entry.base_addr, entry.region_size,
+            int(entry.protection) & 0xFF, int(entry.region_type) & 0xFF,
+            len(path), int(entry.name_source) & 0xFF,
+        )
+    ))
+    return None if head is None else head + pad_bytes(path)
+
+
+def parse_vas_map(payload: bytes) -> list[VasEntry]:
+    """Parse a VAS Map (0x1001) block payload.
+
+    Inverse of :meth:`MSLWriter.write_vas_map`. Honours a non-zero
+    ``entry_size`` (fixed-stride entries) as the spec allows. Unknown
+    ``region_type`` values are kept as plain ints.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 8:
+        raise ValueError("VASMap payload truncated")
+    count, entry_size = struct.unpack_from("<II", payload, 0)
+    offset = 8
+    entries: list[VasEntry] = []
+    for _ in range(count):
+        entry, advance = _read_vas_entry(payload, offset)
+        entries.append(entry)
+        offset += entry_size if entry_size else advance
+    return entries
+
+
+def _read_vas_entry(payload: bytes, offset: int) -> tuple[VasEntry, int]:
+    """Read one entry at *offset*; return ``(entry, bytes_consumed)``."""
+    if offset + _VAS_ENTRY_HEAD.size > len(payload):
+        raise ValueError("VASMap entry truncated")
+    base, size, prot, rtype, path_len, source = _VAS_ENTRY_HEAD.unpack_from(payload, offset)
+    start = offset + _VAS_ENTRY_HEAD.size
+    if start + path_len > len(payload):
+        raise ValueError("VASMap entry path truncated")
+    raw = payload[start:start + path_len].split(b"\x00", 1)[0]
+    entry = VasEntry(
+        base_addr=base, region_size=size, protection=prot,
+        region_type=_enum_or_int(RegionType, rtype),
+        mapped_path=raw.decode("utf-8", errors="replace"),
+        name_source=_enum_or_int(VasNameSource, source),
+    )
+    return entry, _VAS_ENTRY_HEAD.size + pad8(path_len)
+
+
+# FileHash(32) AcqEnd(8) BlockCount(4) Reserved(4) -- spec Section 4.5.
+_EOC_LEGACY_SIZE = 40
+_EOC_SIZE = 48
+# SegmentHash(32) WrittenAt(8) BlockCount(4) Reserved(4) ProducerLen(2)
+# Reserved(6) -- spec Section 4.6; Producer (pad8) follows.
+_EOX_HEAD = struct.Struct("<32sQIIH6x")
+# ThreadID(8) StartTime(8) Flags(2) ThreadState(1) Arch(1) RegCount(4)
+# NameLen(2) Reserved(6) -- spec Table 19a; ThreadName (pad8) follows.
+_TC_HEAD = struct.Struct("<QQHBBIH6x")
+# NameLen(1) Width(1) Flags(2) Reserved(4) -- spec Table 19b; Name (pad8)
+# and Value (pad8) follow.
+_TC_REG_HEAD = struct.Struct("<BBH4x")
+_MODULE_BUILD_ID_ROW = 64
+
+
+def parse_end_of_capture(payload: bytes) -> EndOfCapture:
+    """Parse an End-of-Capture (0x0FFF) payload.
+
+    Accepts the legacy 40-byte form (BlockCount unknown, reported as 0)
+    and the 1.1 form with BlockCount at ``+0x28``.
+
+    Raises:
+        ValueError: if the payload is shorter than the legacy form.
+    """
+    if len(payload) < _EOC_LEGACY_SIZE:
+        raise ValueError("EndOfCapture payload truncated")
+    acq_end_ns = struct.unpack_from("<Q", payload, 0x20)[0]
+    block_count = (
+        struct.unpack_from("<I", payload, 0x28)[0]
+        if len(payload) >= 0x2C else 0
+    )
+    return EndOfCapture(
+        file_hash=bytes(payload[:HASH_SIZE]), acq_end_ns=acq_end_ns,
+        block_count=block_count,
+    )
+
+
+def parse_end_of_extension(payload: bytes) -> EndOfExtension:
+    """Parse an End-of-Extension (0x0FFE) payload.
+
+    Inverse of :meth:`MSLWriter.finalize_extension`.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < _EOX_HEAD.size:
+        raise ValueError("EndOfExtension payload truncated")
+    segment_hash, written_at, count, _reserved, producer_len = (
+        _EOX_HEAD.unpack_from(payload, 0)
+    )
+    start = _EOX_HEAD.size
+    if start + producer_len > len(payload):
+        raise ValueError("EndOfExtension producer truncated")
+    producer = _decode_nul_string(payload[start:start + producer_len])
+    return EndOfExtension(
+        segment_hash=segment_hash, written_at_ns=written_at,
+        block_count=count, producer=producer,
+    )
+
+
+def parse_module_build_id_manifest(payload: bytes) -> ModuleBuildIdManifest:
+    """Parse a ModuleBuildIdManifest (0x005A) payload.
+
+    Inverse of :meth:`MSLWriter.write_module_build_id_manifest` (fixed
+    64-byte rows after a ``Count(4) Reserved(4)`` preamble).
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 8:
+        raise ValueError("ModuleBuildIdManifest payload truncated")
+    count = struct.unpack_from("<I", payload, 0)[0]
+    if 8 + count * _MODULE_BUILD_ID_ROW > len(payload):
+        raise ValueError("ModuleBuildIdManifest rows truncated")
+    rows = [
+        _read_module_build_id_row(payload, 8 + i * _MODULE_BUILD_ID_ROW)
+        for i in range(count)
+    ]
+    return ModuleBuildIdManifest(rows=rows)
+
+
+def _read_module_build_id_row(payload: bytes, offset: int) -> ModuleBuildIdRow:
+    """Decode one 64-byte manifest row at *offset*."""
+    base, build_id_len, source, flags, _reserved = struct.unpack_from(
+        "<QBBBB", payload, offset,
+    )
+    build_id = bytes(payload[offset + 12:offset + 32][:build_id_len])
+    disk_hash = bytes(payload[offset + 32:offset + 64])
+    return ModuleBuildIdRow(
+        base_addr=base, build_id_len=build_id_len, build_id_source=source,
+        flags=flags, build_id=build_id, disk_hash=disk_hash,
+    )
+
+
+def parse_thread_context(payload: bytes) -> ThreadContext:
+    """Parse a Thread Context (0x0011) payload.
+
+    Inverse of :meth:`MSLWriter.write_thread_context`.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < _TC_HEAD.size:
+        raise ValueError("ThreadContext payload truncated")
+    tid, start_ns, flags, state, arch, reg_count, name_len = (
+        _TC_HEAD.unpack_from(payload, 0)
+    )
+    offset = _TC_HEAD.size
+    name = _decode_nul_string(_slice_checked(payload, offset, name_len, "ThreadName"))
+    offset += pad8(name_len)
+    registers: list[ThreadRegister] = []
+    for _ in range(reg_count):
+        register, offset = _read_thread_register(payload, offset)
+        registers.append(register)
+    return ThreadContext(
+        thread_id=tid, start_time_ns=start_ns, flags=flags,
+        state=_enum_or_int(ThreadState, state), arch=arch, name=name,
+        registers=registers,
+    )
+
+
+def _read_thread_register(payload: bytes, offset: int) -> tuple[ThreadRegister, int]:
+    """Read one Table 19b register entry; return ``(register, next_offset)``."""
+    if offset + _TC_REG_HEAD.size > len(payload):
+        raise ValueError("ThreadContext register truncated")
+    name_len, width, flags = _TC_REG_HEAD.unpack_from(payload, offset)
+    offset += _TC_REG_HEAD.size
+    name = _decode_nul_string(_slice_checked(payload, offset, name_len, "register name"))
+    offset += pad8(name_len)
+    value = _slice_checked(payload, offset, width, "register value")
+    offset += pad8(width)
+    return ThreadRegister(name=name, width=width, flags=flags, value=value), offset
+
+
+def _slice_checked(payload: bytes, offset: int, length: int, what: str) -> bytes:
+    """Return ``payload[offset:offset+length]``, refusing to run past the end."""
+    if offset + length > len(payload):
+        raise ValueError(f"ThreadContext {what} truncated")
+    return bytes(payload[offset:offset + length])
+
+
+def _decode_nul_string(raw: bytes) -> str:
+    """Decode a NUL-terminated UTF-8 field, tolerating a missing terminator."""
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def _bounded_or_absent(value: str) -> tuple[bytes, int]:
+    """Encode an optional string, or report absence as a zero-length field.
+
+    Returns:
+        ``(b"", 0)`` for an empty value, otherwise the bounded encoding.
+    """
+    if not value:
+        return b"", 0
+    return encode_string_bounded(value)
+
+
+def _warn_if_truncated(field: str, original: str, stored_len: int) -> None:
+    """Log when a string did not fit the length field the format gives it.
+
+    Truncating beats aborting the capture, but it is still evidence lost, so
+    it must never happen quietly -- the examiner has to be able to see in the
+    log that the recorded value is shorter than what the target held.
+
+    Args:
+        field: Field name as the spec calls it, for the log line.
+        original: The string before encoding.
+        stored_len: Pre-padding length actually written, terminator included.
+    """
+    if not original:
+        return
+    raw_len = len(original.encode("utf-8")) + 1
+    if stored_len < raw_len:
+        _log.warning(
+            "%s truncated from %d to %d bytes to fit the format's length field",
+            field, raw_len, stored_len,
+        )
+
+
+_REG_NAME_MAX = 0xFF  # u8 NameLen, terminator included
+_REG_WIDTH_MAX = 0xFF  # u8 Width
+
+
+def _pack_thread_register(reg: ThreadRegister) -> bytes:
+    """Pack one Table 19b register entry (name lowercased, value pad8).
+
+    Raises:
+        ValueError: see :meth:`MSLWriter.write_thread_context`.
+    """
+    raw_name = reg.name.lower().encode("utf-8") + b"\x00"
+    if len(raw_name) <= 1 or len(raw_name) > _REG_NAME_MAX:
+        raise ValueError(f"register name {reg.name!r} must be 1..254 bytes")
+    if not 1 <= reg.width <= _REG_WIDTH_MAX:
+        raise ValueError(f"register {reg.name!r} width {reg.width} not in 1..255")
+    if len(reg.value) != reg.width:
+        raise ValueError(
+            f"register {reg.name!r} value holds {len(reg.value)} bytes, "
+            f"width says {reg.width}"
+        )
+    head = _TC_REG_HEAD.pack(len(raw_name), reg.width, reg.flags)
+    return head + pad_bytes(raw_name) + pad_bytes(reg.value)
 
 
 class MSLWriter:
@@ -46,15 +498,32 @@ class MSLWriter:
         comp_algo: CompAlgo = CompAlgo.NONE,
         encryption_key: bytes | None = None,
         encryption_params: "EncryptionParams | None" = None,
+        *,
+        _resume_chain: IntegrityChain | None = None,
+        _resume_block_index: int = 0,
+        _resume_after_eoc: bool = False,
+        _zero_prev_hash: bool = False,
     ) -> None:
         self._output = output
         self._header = header
         self._comp_algo = comp_algo
-        self._chain = IntegrityChain(hash_algo=header.hash_algo)
-        self._block_index: int = 0
+        self._chain = _resume_chain or IntegrityChain(hash_algo=header.hash_algo)
+        self._block_index: int = _resume_block_index
         self._encrypted = bool(encryption_key)
+        # PrevHash is zero in encrypted containers (spec Section 4.4), and
+        # also in a sealed segment's plaintext (spec Section 10.8).
+        self._zero_prev_hash: bool = self._encrypted or _zero_prev_hash
         self._encryption_params = None
         self._encryptor = None
+        # Segment bookkeeping (spec Section 4.6): once the EoC is written
+        # only extension segments may follow, each opened explicitly.
+        self._eoc_written: bool = _resume_after_eoc
+        self._in_extension: bool = False
+        self._segment_blocks: int = 0
+        self._sealed: bool = False
+        # Where the header starts in a seekable output (None otherwise);
+        # the CipherLen patch needs it (spec Section 10.7).
+        self._header_offset: int | None = None
 
         # Pre-compute compression flags (constant per writer instance)
         if comp_algo != CompAlgo.NONE:
@@ -64,12 +533,18 @@ class MSLWriter:
 
         if self._encrypted:
             from memslicer.msl.encryption import (
-                EncryptionParams, StreamingEncryptor,
+                EncryptionParams, StreamingEncryptor, aad_from_header,
+                pack_encryption_extension,  # noqa: F811 — used in _write_header
             )
             if encryption_params is None:
                 encryption_params = EncryptionParams()
             self._encryption_params = encryption_params
             self._encryption_key = encryption_key
+
+        if _resume_chain is not None:
+            # Continuing an existing file: its header is already on disk
+            # and already folded into the supplied chain.
+            return
 
         self._write_header()
 
@@ -77,8 +552,98 @@ class MSLWriter:
             self._encryptor = StreamingEncryptor(
                 key=self._encryption_key,
                 nonce=self._encryption_params.nonce,
-                aad=self._header_bytes,
+                aad=aad_from_header(self._header_bytes),
             )
+
+    @classmethod
+    def resume(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        chain: IntegrityChain,
+        block_index: int,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that appends blocks to an existing, unencrypted file.
+
+        No file header is written. ``chain`` must already have been fed
+        the existing file's header and every block that precedes the
+        append point (spec Section 4.4), so the next block's PrevHash and
+        the EndOfCapture FileHash continue the original chain.
+        ``block_index`` is the number of blocks already in the file; it
+        keeps block-position checks (e.g. ProcessIdentity in Block 0)
+        accurate.
+
+        Args:
+            output: Stream positioned where the next block belongs.
+            header: Header of the existing file (supplies ``hash_algo``).
+            chain: Integrity chain seeded from the existing bytes.
+            block_index: Count of blocks already in the file.
+            comp_algo: Compression for the appended blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=chain, _resume_block_index=block_index,
+        )
+
+    @classmethod
+    def extend(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        chain: IntegrityChain,
+        block_index: int,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that appends extension segments to a finished file.
+
+        Like :meth:`resume`, but the capture segment is treated as closed:
+        :meth:`finalize` refuses to write a second EndOfCapture and blocks
+        are accepted only between :meth:`begin_extension` and
+        :meth:`finalize_extension` (spec Section 4.6). ``chain`` must have
+        been fed the header, every capture-segment block including the
+        EoC, and every existing extension segment, so the chain continues
+        linearly across segments.
+
+        Args:
+            output: Stream positioned at the end of the last valid segment.
+            header: Header of the existing file (supplies ``hash_algo``).
+            chain: Integrity chain seeded from every existing byte.
+            block_index: Count of blocks already in the file.
+            comp_algo: Compression for the appended blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=chain, _resume_block_index=block_index,
+            _resume_after_eoc=True,
+        )
+
+    @classmethod
+    def for_sealed_segment(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that builds the plaintext of one sealed segment.
+
+        A sealed extension segment (spec Section 10.8) encrypts exactly one
+        extension segment whose ``PrevHash`` fields are all zero. Write it
+        with :meth:`begin_extension`, the permitted blocks and
+        :meth:`finalize_extension`; ``output`` (e.g. a ``BytesIO``) then
+        holds the bytes to pass to :func:`memslicer.msl.sealed.seal_segment`.
+        No file header is written.
+
+        Args:
+            output: Stream that receives the plaintext segment.
+            header: Header of the target file (supplies ``hash_algo``).
+            comp_algo: Compression for the segment's blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=IntegrityChain(hash_algo=header.hash_algo),
+            _resume_after_eoc=True, _zero_prev_hash=True,
+        )
 
     # ------------------------------------------------------------------
     # File header
@@ -118,8 +683,12 @@ class MSLWriter:
             header_bytes = base_header
 
         self._header_bytes = header_bytes  # saved for AAD
+        self._header_offset = _stream_position(self._output)
         self._output.write(header_bytes)
-        self._chain.feed_header(header_bytes)
+        # FileHash covers CipherLen as zero (spec Section 10.7), even when
+        # the caller supplied a non-zero value up front.
+        from memslicer.msl.encryption import zero_cipher_len
+        self._chain.feed_header(zero_cipher_len(header_bytes))
 
     # ------------------------------------------------------------------
     # Process Identity (Block 0)
@@ -133,19 +702,24 @@ class MSLWriter:
                 f"but block_index={self._block_index}",
                 stacklevel=2,
             )
-        exe_path_raw = proc_id.exe_path.encode("utf-8") + b"\x00" if proc_id.exe_path else b"\x00"
-        cmd_line_raw = proc_id.cmd_line.encode("utf-8") + b"\x00" if proc_id.cmd_line else b""
-
-        exe_path_encoded = encode_string(proc_id.exe_path) if proc_id.exe_path else pad_bytes(b"\x00")
-        cmd_line_encoded = encode_string(proc_id.cmd_line) if proc_id.cmd_line else b""
+        # ExePath is always present -- an unknown path is a lone NUL, so
+        # ExePathLen is never 0. CmdLine is the opposite: spec Table 17 gives
+        # CmdLineLen the value 0 for "unavailable", and then no bytes follow.
+        exe_path_encoded, exe_path_len = encode_string_bounded(proc_id.exe_path)
+        if proc_id.cmd_line:
+            cmd_line_encoded, cmd_line_len = encode_string_bounded(proc_id.cmd_line)
+        else:
+            cmd_line_encoded, cmd_line_len = b"", 0
+        _warn_if_truncated("ExePath", proc_id.exe_path, exe_path_len)
+        _warn_if_truncated("CmdLine", proc_id.cmd_line, cmd_line_len)
 
         payload = struct.pack(
             "<IIQHHI",
             proc_id.ppid,
             proc_id.session_id,
             proc_id.start_time_ns,
-            len(exe_path_raw),
-            len(cmd_line_raw),
+            exe_path_len,
+            cmd_line_len,
             0,  # Reserved
         )
         payload += exe_path_encoded
@@ -169,7 +743,13 @@ class MSLWriter:
         """Write a complete block and update the integrity chain.
 
         Returns the block's UUID.
+
+        Raises:
+            ValueError: if the block is not allowed where the writer
+                currently is (spec Section 4.6): evidence blocks inside an
+                extension segment, or any block after the EoC outside one.
         """
+        self._check_segment_rules(block_type)
         if block_uuid is None:
             block_uuid = uuid.uuid4().bytes
         if parent_uuid is None:
@@ -183,10 +763,10 @@ class MSLWriter:
             uncompressed_size = len(padded_payload)
             comp_algo = CompAlgo((flags & COMPALGO_MASK) >> 1)
             compressed_data = compress(padded_payload, comp_algo)
-            # On-disk: UncompressedSize(8B) + CompressedData, padded to 8B
-            on_disk_payload = pad_bytes(
-                struct.pack("<Q", uncompressed_size) + compressed_data
-            )
+            # On-disk: UncompressedSize(8B) + CompressedData, NOT padded.
+            # Spec Section 4.2.1 Table 9: BlockLength = 80 + 8 +
+            # len(CompressedData); lz4 also rejects trailing padding.
+            on_disk_payload = struct.pack("<Q", uncompressed_size) + compressed_data
         else:
             on_disk_payload = padded_payload
 
@@ -202,7 +782,7 @@ class MSLWriter:
 
         # Spec Section 4.4: PrevHash MUST be zero when Encrypted is set
         prev_hash = (
-            b"\x00" * 32 if self._encrypted
+            b"\x00" * 32 if self._zero_prev_hash
             else self._chain.prev_hash
         )
 
@@ -228,7 +808,23 @@ class MSLWriter:
             self._output.write(on_disk_payload)
         self._chain.feed_block_parts(block_header, on_disk_payload)
         self._block_index += 1
+        if self._in_extension:
+            self._segment_blocks += 1
         return block_uuid
+
+    def _check_segment_rules(self, block_type: BlockType) -> None:
+        """Refuse a block the current segment position does not admit."""
+        if self._in_extension:
+            if int(block_type) in EXTENSION_FORBIDDEN_TYPES:
+                raise ValueError(
+                    f"block type 0x{int(block_type):04X} is evidence and may "
+                    "not appear in an extension segment (spec Section 4.6)"
+                )
+        elif self._eoc_written:
+            raise ValueError(
+                "capture segment is closed; call begin_extension() before "
+                "writing further blocks"
+            )
 
     # ------------------------------------------------------------------
     # Memory region
@@ -246,6 +842,8 @@ class MSLWriter:
         + PageSizeLog2(1) + Reserved(5) + Timestamp(8)
         + PageStateMap(var, pad8) + PageData(var)
         """
+        num_pages = len(region.page_states)
+
         # Build PageStateMap: 2 bits per page, MSB-first packing, padded to 8B
         page_state_map = self._encode_page_state_map(region.page_states)
 
@@ -253,9 +851,21 @@ class MSLWriter:
         # (compression is handled by _write_block per spec Section 4.2.1)
         raw_page_data = b"".join(region.page_data_chunks)
 
-        # Validate page_size is a power of 2
-        if region.page_size <= 0 or (region.page_size & (region.page_size - 1)) != 0:
-            raise ValueError(f"page_size must be a power of 2, got {region.page_size}")
+        # Spec Table 13 admits only powers of two, within the range one byte of
+        # PageSizeLog2 can carry. valid_page_size owns that rule, so producers
+        # can reject a bad page size before a capture runs on it rather than
+        # discovering it here. The branch below only picks which diagnostic to
+        # report -- it does not decide whether the value is acceptable.
+        if not valid_page_size(region.page_size):
+            if region.page_size <= 0 or (region.page_size & (region.page_size - 1)):
+                raise ValueError(
+                    f"page_size must be a power of 2, got {region.page_size}"
+                )
+            raise ValueError(
+                f"PageSizeLog2 {region.page_size.bit_length() - 1} outside valid "
+                f"range [{PAGE_SIZE_LOG2_MIN}, {PAGE_SIZE_LOG2_MAX}] "
+                f"(page_size={region.page_size})"
+            )
 
         # Spec Table 13: RegionSize MUST be a multiple of PageSize
         if region.region_size % region.page_size != 0:
@@ -272,13 +882,21 @@ class MSLWriter:
                 f"region_size/page_size ({expected_pages})"
             )
 
-        page_size_log2 = region.page_size.bit_length() - 1
-
-        if not (10 <= page_size_log2 <= 40):
+        # Spec Table 24: a Captured page carries exactly PageSize bytes and
+        # every other state carries none, so the page data must be precisely
+        # captured_pages * page_size long. Anything else would put bytes at
+        # offsets the page-state map does not claim.
+        captured_pages = region.page_states.count(PageState.CAPTURED)
+        expected_data = captured_pages * region.page_size
+        if len(raw_page_data) != expected_data:
             raise ValueError(
-                f"PageSizeLog2 {page_size_log2} outside valid range [10, 40] "
-                f"(page_size={region.page_size})"
+                f"page_data length ({len(raw_page_data)}) does not match "
+                f"{captured_pages} captured pages x page_size "
+                f"{region.page_size} ({expected_data})"
             )
+
+        # Already range-checked by valid_page_size above.
+        page_size_log2 = region.page_size.bit_length() - 1
 
         payload = struct.pack("<QQ", region.base_addr, region.region_size)
         payload += struct.pack(
@@ -302,10 +920,42 @@ class MSLWriter:
     # ------------------------------------------------------------------
 
     def write_module_list(self, modules: list[ModuleEntry]) -> bytes:
-        """Write a ModuleListIndex block with manifest entries and HAS_CHILDREN flag,
-        then individual ModuleEntry blocks as children.
+        """Write a ModuleListIndex block followed immediately by its children.
 
-        Returns the index block's UUID.
+        Convenience wrapper over :meth:`write_module_list_index` and
+        :meth:`write_module_entries` for callers that do not care where the
+        children land. The acquisition engine does care -- spec Section 2.1
+        reserves Block 2 for System Context in investigation mode, so it
+        defers the children until after the memory regions instead.
+
+        Args:
+            modules: Modules to announce and then emit.
+
+        Returns:
+            The index block's UUID.
+        """
+        index_uuid, module_uuids = self.write_module_list_index(modules)
+        self.write_module_entries(modules, index_uuid, module_uuids)
+        return index_uuid
+
+    def write_module_list_index(
+        self, modules: list[ModuleEntry],
+    ) -> tuple[bytes, list[bytes]]:
+        """Write only the ModuleListIndex block, announcing its children.
+
+        The child UUIDs are generated here rather than when the children are
+        written, so the manifest can name blocks that do not exist on disk
+        yet. That is what lets the entries be emitted later in the file.
+
+        Args:
+            modules: Modules to list. May be empty, in which case the block
+                carries a zero count and no HAS_CHILDREN flag -- the block is
+                still written, so Block 1 is a Module List either way and the
+                positions the spec fixes do not shift with module presence.
+
+        Returns:
+            ``(index_uuid, module_uuids)``. Pass both to
+            :meth:`write_module_entries` to emit the children.
         """
         if self._block_index != 1:
             warnings.warn(
@@ -333,14 +983,31 @@ class MSLWriter:
             manifest += path_padded                                 # var Path (pad8)
 
         index_uuid = self._write_block(
-            BlockType.ModuleListIndex, manifest, flags=HAS_CHILDREN,
+            BlockType.ModuleListIndex, manifest,
+            flags=HAS_CHILDREN if modules else 0,
         )
+        return index_uuid, module_uuids
 
-        # Write each module as a child block with pre-assigned UUID
+    def write_module_entries(
+        self,
+        modules: list[ModuleEntry],
+        index_uuid: bytes,
+        module_uuids: list[bytes],
+    ) -> None:
+        """Emit the ModuleEntry children a ModuleListIndex already announced.
+
+        Each child is written with the UUID the manifest promised, so the
+        index stays valid no matter how far downstream this is called.
+
+        Args:
+            modules: The same modules passed to
+                :meth:`write_module_list_index`, in the same order.
+            index_uuid: UUID of the index block, recorded as each child's
+                parent.
+            module_uuids: The child UUIDs that method returned.
+        """
         for mod, mod_uuid in zip(modules, module_uuids):
             self._write_module_entry(mod, parent_uuid=index_uuid, block_uuid=mod_uuid)
-
-        return index_uuid
 
     def _write_module_entry(self, mod: ModuleEntry, parent_uuid: bytes, block_uuid: bytes | None = None) -> bytes:
         """Write a single ModuleEntry block.
@@ -382,54 +1049,6 @@ class MSLWriter:
         return self._write_block(
             BlockType.ModuleEntry, b"".join(parts), parent_uuid=parent_uuid,
             block_uuid=block_uuid,
-        )
-
-    # ------------------------------------------------------------------
-    # Thread Context (Block 0x0011, spec Section 5.7)
-    # ------------------------------------------------------------------
-
-    def write_thread_context(
-        self, thread: ThreadContext, parent_uuid: bytes | None = None
-    ) -> bytes:
-        """Write a ThreadContext block. Returns block UUID.
-
-        One block per captured thread. Carries the thread's register file
-        so a consumer can reconstruct CPU state for emulation/stepping.
-        """
-        name_raw = thread.name.encode("utf-8") + b"\x00" if thread.name else b""
-        name_encoded = encode_string(thread.name) if thread.name else b""
-
-        # Table 19a: Arch is one byte; ArchType codes above 0xFF are not
-        # representable and MUST be written as 0 (= file header ArchType).
-        arch = thread.arch if 0 < thread.arch <= 0xFF else 0
-        payload = struct.pack(
-            "<QQHBBIH6s",
-            thread.thread_id,        # 8B ThreadID
-            thread.start_time_ns,    # 8B StartTime
-            thread.flags,            # 2B Flags (Current/Crashed/Suspended/Partial)
-            int(thread.state),       # 1B ThreadState
-            arch,                    # 1B Arch (0 = same as file header)
-            len(thread.registers),   # 4B RegCount
-            len(name_raw),           # 2B NameLen (incl. null), 0 if absent
-            b"\x00" * 6,             # 6B Reserved2
-        )
-        payload += name_encoded
-
-        for reg in thread.registers:
-            reg_name_raw = reg.name.encode("utf-8") + b"\x00"
-            entry = struct.pack(
-                "<BBHI",
-                len(reg_name_raw),   # 1B NameLen (incl. null)
-                len(reg.value),      # 1B Width (value width in bytes)
-                reg.flags,           # 2B Flags (PC/SP/FP/FLAGS/TLS/LR)
-                0,                    # 4B Reserved
-            )
-            entry += encode_string(reg.name)   # Name, UTF-8, pad8
-            entry += pad_bytes(reg.value)      # Value, pad8
-            payload += entry
-
-        return self._write_block(
-            BlockType.ThreadContext, payload, parent_uuid=parent_uuid,
         )
 
     # ------------------------------------------------------------------
@@ -477,34 +1096,48 @@ class MSLWriter:
 
     def write_process_table(self, processes: list[ProcessEntry], parent_uuid: bytes) -> bytes:
         """Write ProcessTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 21
-        payload = struct.pack("<II", len(processes), 0)
+        # Entries are packed first so EntryCount can describe what actually
+        # made it in: a row carrying a value the format cannot represent is
+        # dropped, and the count must not promise it.
+        entries: list[bytes] = []
         for proc in processes:
-            exe_raw = proc.exe_name.encode("utf-8") + b"\x00" if proc.exe_name else b""
-            cmd_raw = proc.cmd_line.encode("utf-8") + b"\x00" if proc.cmd_line else b""
-            user_raw = proc.user.encode("utf-8") + b"\x00" if proc.user else b""
+            # Every one of these is a uint16 length, and cmd_line in
+            # particular is unbounded on Linux. This table covers every
+            # process on the host, so a single outlier must not be able to
+            # abort the capture.
+            exe_enc, exe_len = _bounded_or_absent(proc.exe_name)
+            cmd_enc, cmd_len = _bounded_or_absent(proc.cmd_line)
+            user_enc, user_len = _bounded_or_absent(proc.user)
+            _warn_if_truncated("ProcessTable.CmdLine", proc.cmd_line, cmd_len)
 
-            entry = struct.pack(
-                "<III B3s QQ HHH2s",
-                proc.pid,
-                proc.ppid,
-                proc.uid,
-                0x01 if proc.is_target else 0x00,
-                b"\x00" * 3,           # Reserved
-                proc.start_time,
-                proc.rss,
-                len(exe_raw),
-                len(cmd_raw),
-                len(user_raw),
-                b"\x00" * 2,           # Reserved2
-            )
-            if exe_raw:
-                entry += pad_bytes(exe_raw)
-            if cmd_raw:
-                entry += pad_bytes(cmd_raw)
-            if user_raw:
-                entry += pad_bytes(user_raw)
-            payload += entry
+            try:
+                entry = struct.pack(
+                    "<III B3s QQ HHH2s",
+                    proc.pid,
+                    proc.ppid,
+                    proc.uid,
+                    0x01 if proc.is_target else 0x00,
+                    b"\x00" * 3,           # Reserved
+                    proc.start_time,
+                    proc.rss,
+                    exe_len,
+                    cmd_len,
+                    user_len,
+                    b"\x00" * 2,           # Reserved2
+                )
+            except struct.error as exc:
+                # One unrepresentable row must not cost the whole capture.
+                # Dropping it loses a line of the process table; raising
+                # here loses the memory the examiner actually came for.
+                _log.warning(
+                    "ProcessTable: dropping pid %s (%s): %s",
+                    proc.pid, proc.exe_name or "?", exc,
+                )
+                continue
+            entry += exe_enc + cmd_enc + user_enc
+            entries.append(entry)
+
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.ProcessTable, payload, parent_uuid=parent_uuid,
@@ -516,24 +1149,35 @@ class MSLWriter:
 
     def write_connection_table(self, connections: list[ConnectionEntry], parent_uuid: bytes) -> bytes:
         """Write ConnectionTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 22
-        payload = struct.pack("<II", len(connections), 0)
+        # Entries are packed first so EntryCount describes what actually made
+        # it in (same rule as write_process_table): a row the format cannot
+        # represent is dropped and logged, never promised by the count.
+        entries: list[bytes] = []
         for conn in connections:
-            entry = struct.pack(
-                "<IBBB1s 16s H2s 16s H2s",
-                conn.pid,
-                conn.family,
-                conn.protocol,
-                conn.state,
-                b"\x00",               # Reserved
-                conn.local_addr,
-                conn.local_port,
-                b"\x00" * 2,           # Reserved2
-                conn.remote_addr,
-                conn.remote_port,
-                b"\x00" * 2,           # Reserved3
+            entry = _packed_or_none(
+                "ConnectionTable",
+                f"pid {conn.pid} local_port {conn.local_port}",
+                lambda: struct.pack(
+                    "<IBBB1s 16s H2s 16s H2s",
+                    conn.pid,
+                    conn.family,
+                    conn.protocol,
+                    conn.state,
+                    b"\x00",               # Reserved
+                    conn.local_addr,
+                    conn.local_port,
+                    b"\x00" * 2,           # Reserved2
+                    conn.remote_addr,
+                    conn.remote_port,
+                    b"\x00" * 2,           # Reserved3
+                ),
             )
-            payload += entry
+            if entry is None:
+                continue
+            entries.append(entry)
+
+        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 22
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.ConnectionTable, payload, parent_uuid=parent_uuid,
@@ -544,23 +1188,39 @@ class MSLWriter:
     # ------------------------------------------------------------------
 
     def write_handle_table(self, handles: list[HandleEntry], parent_uuid: bytes) -> bytes:
-        """Write HandleTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 23
-        payload = struct.pack("<II", len(handles), 0)
+        """Write HandleTable block. ParentUUID must reference SystemContext.
+
+        ``FD`` is a uint32; a collector that has no descriptor number for a
+        row (lsof ``cwd``/``txt``/``mem`` on macOS) must hand over
+        ``0xFFFFFFFF``, not ``-1``.  A negative fd is unrepresentable and
+        the row is dropped and logged rather than aborting the capture.
+        """
+        # Entries are packed first so EntryCount describes what actually made
+        # it in (same rule as write_process_table).
+        entries: list[bytes] = []
         for h in handles:
             path_raw = h.path.encode("utf-8") + b"\x00" if h.path else b""
-            entry = struct.pack(
-                "<IIB1sH4s",
-                h.pid,
-                h.fd,
-                h.handle_type,
-                b"\x00",               # Reserved
-                len(path_raw),
-                b"\x00" * 4,           # Reserved2
+            entry = _packed_or_none(
+                "HandleTable",
+                f"pid {h.pid} fd {h.fd}",
+                lambda: struct.pack(
+                    "<IIB1sH4s",
+                    h.pid,
+                    h.fd,
+                    h.handle_type,
+                    b"\x00",               # Reserved
+                    len(path_raw),
+                    b"\x00" * 4,           # Reserved2
+                ),
             )
+            if entry is None:
+                continue
             if path_raw:
                 entry += pad_bytes(path_raw)
-            payload += entry
+            entries.append(entry)
+
+        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 23
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.HandleTable, payload, parent_uuid=parent_uuid,
@@ -754,6 +1414,17 @@ class MSLWriter:
 
         Row bodies pack tight; no internal padding. Unknown row_types
         are skippable via ``row_len``.
+
+        Row 0x07 (SNMP counter) stores ``Value`` as an unsigned 8-byte
+        field, but the kernel reports some MIB entries signed --
+        ``Tcp.MaxConn`` is ``-1`` ("no fixed limit", RFC 2012) on every
+        Linux kernel.  Such values are written two's-complement
+        (``-1`` -> ``0xFFFFFFFFFFFFFFFF``) via :func:`_u64_wire`, so the
+        evidence survives verbatim and a reader aware of the counter's
+        signedness recovers it exactly.
+
+        Any other row whose value the format cannot hold is dropped and
+        logged; ``row_count`` is computed from the rows actually packed.
         """
         rows: list[bytes] = []
 
@@ -761,71 +1432,71 @@ class MSLWriter:
             encoded = s.encode("utf-8")
             return struct.pack("<H", len(encoded)) + encoded
 
+        def _append_row(row_type: int, label: str, build_body: Callable[[], bytes]) -> None:
+            # One bad row must not cost the whole capture (see _packed_or_none).
+            body = _packed_or_none("ConnectivityTable", label, build_body)
+            if body is None:
+                return
+            rows.append(struct.pack("<BH", row_type, len(body)) + body)
+
         for r in table.ipv4_routes:
-            body = (
+            _append_row(0x01, f"ipv4_route {r.iface}", lambda: (
                 _str_field(r.iface)
                 + r.dest + r.gateway + r.mask
                 + struct.pack("<HII", r.flags, r.metric, r.mtu)
-            )
-            rows.append(struct.pack("<BH", 0x01, len(body)) + body)
+            ))
 
         for r in table.ipv6_routes:
-            body = (
+            _append_row(0x02, f"ipv6_route {r.iface}", lambda: (
                 _str_field(r.iface)
                 + r.dest
                 + struct.pack("<B", r.dest_prefix)
                 + r.next_hop
                 + struct.pack("<II", r.metric, r.flags)
-            )
-            rows.append(struct.pack("<BH", 0x02, len(body)) + body)
+            ))
 
         for r in table.arp_entries:
-            body = (
+            _append_row(0x03, f"arp {r.iface}", lambda: (
                 struct.pack("<B", r.family)
                 + r.ip
                 + struct.pack("<HH", r.hw_type, r.flags)
                 + r.hw_addr
                 + _str_field(r.iface)
-            )
-            rows.append(struct.pack("<BH", 0x03, len(body)) + body)
+            ))
 
         for r in table.packet_sockets:
-            body = struct.pack(
+            _append_row(0x04, f"packet socket inode {r.inode}", lambda: struct.pack(
                 "<IQHIIQ",
                 r.pid, r.inode, r.proto, r.iface_index, r.user, r.rmem,
-            )
-            rows.append(struct.pack("<BH", 0x04, len(body)) + body)
+            ))
 
         for r in table.netdev_stats:
-            body = (
+            _append_row(0x05, f"netdev {r.iface}", lambda: (
                 _str_field(r.iface)
                 + struct.pack(
                     "<QQQQQQQQ",
                     r.rx_bytes, r.rx_packets, r.rx_errs, r.rx_drop,
                     r.tx_bytes, r.tx_packets, r.tx_errs, r.tx_drop,
                 )
-            )
-            rows.append(struct.pack("<BH", 0x05, len(body)) + body)
+            ))
 
         for r in table.sockstat_families:
-            body = struct.pack("<BIIQ", r.family, r.in_use, r.alloc, r.mem)
-            rows.append(struct.pack("<BH", 0x06, len(body)) + body)
+            _append_row(0x06, f"sockstat family {r.family}", lambda: struct.pack(
+                "<BIIQ", r.family, r.in_use, r.alloc, r.mem,
+            ))
 
         for r in table.snmp_counters:
-            body = (
+            # Signed MIB values (Tcp.MaxConn = -1) go on the wire as
+            # two's complement; see the docstring and _u64_wire.
+            _append_row(0x07, f"snmp {r.mib}.{r.counter}", lambda: (
                 _str_field(r.mib)
                 + _str_field(r.counter)
-                + struct.pack("<Q", r.value)
-            )
-            rows.append(struct.pack("<BH", 0x07, len(body)) + body)
+                + struct.pack("<Q", _u64_wire(r.value))
+            ))
 
-        total_rows = (
-            len(table.ipv4_routes) + len(table.ipv6_routes)
-            + len(table.arp_entries) + len(table.packet_sockets)
-            + len(table.netdev_stats) + len(table.sockstat_families)
-            + len(table.snmp_counters)
-        )
-        payload = struct.pack("<II", total_rows, 0) + b"".join(rows)
+        # Count what was actually packed, not what was offered: a dropped
+        # row must not be promised by the preamble.
+        payload = struct.pack("<II", len(rows), 0) + b"".join(rows)
         return self._write_block(BlockType.ConnectivityTable, payload)
 
     # ------------------------------------------------------------------
@@ -837,7 +1508,7 @@ class MSLWriter:
         rows_bytes: list[bytes] = []
         for r in table.rows:
             name_bytes = r.name.encode("utf-8")
-            row = (
+            row = _packed_or_none("KernelModuleList", f"module {r.name}", lambda: (
                 struct.pack("<H", len(name_bytes))
                 + name_bytes
                 + struct.pack(
@@ -845,9 +1516,12 @@ class MSLWriter:
                     r.size, r.refcount, r.state, r.taint,
                     r.base, r.flags, 0,
                 )
-            )
+            ))
+            if row is None:
+                continue
             rows_bytes.append(row)
-        payload = struct.pack("<II", len(table.rows), 0) + b"".join(rows_bytes)
+        # Count the rows actually packed, so a dropped row is never promised.
+        payload = struct.pack("<II", len(rows_bytes), 0) + b"".join(rows_bytes)
         return self._write_block(BlockType.KernelModuleList, payload)
 
     # ------------------------------------------------------------------
@@ -984,6 +1658,104 @@ class MSLWriter:
         )
 
     # ------------------------------------------------------------------
+    # RegionOmissionManifest (Block 0x005B — non-spec extension)
+    # ------------------------------------------------------------------
+
+    def write_region_omission_manifest(
+        self, manifest: RegionOmissionManifest,
+    ) -> bytes:
+        """Write a RegionOmissionManifest block (0x005B). Returns block UUID.
+
+        Lists regions the acquirer deliberately skipped so a reader can
+        tell a partial dump from an incomplete one. Little-endian; all
+        strings UTF-8 without NUL terminator, each padded to 8 bytes.
+
+        .. code-block:: text
+
+            Payload header:
+                row_count:    u32
+                reserved:     u32
+                scope_len:    u16
+                patterns_len: u16
+                reserved:     u32
+                scope:        bytes[scope_len]     pad8
+                patterns:     bytes[patterns_len]  pad8  (joined with "\\n")
+            Row:
+                base_addr:   u64
+                size:        u64
+                protection:  u8
+                region_type: u8
+                reason:      u8
+                reserved:    u8
+                name_len:    u16
+                reserved:    u16
+                name:        bytes[name_len]  pad8
+
+        Raises:
+            ValueError: if a string does not fit its u16 length field.
+        """
+        scope_bytes = _encode_omission_string(manifest.scope, "scope")
+        patterns_bytes = _encode_omission_string(
+            "\n".join(manifest.exclude_patterns), "exclude_patterns",
+        )
+        rows_bytes = [self._pack_omission_row(r) for r in manifest.rows]
+        payload = (
+            struct.pack("<II", len(rows_bytes), 0)
+            + struct.pack("<HHI", len(scope_bytes), len(patterns_bytes), 0)
+            + pad_bytes(scope_bytes)
+            + pad_bytes(patterns_bytes)
+            + b"".join(rows_bytes)
+        )
+        return self._write_block(BlockType.RegionOmissionManifest, payload)
+
+    @staticmethod
+    def _pack_omission_row(row: RegionOmissionRow) -> bytes:
+        """Pack one :class:`RegionOmissionRow` (fixed 24-byte head + name)."""
+        name_bytes = _encode_omission_string(row.name, "name")
+        head = struct.pack(
+            "<QQBBBBHH",
+            row.base_addr, row.size,
+            row.protection, int(row.region_type), int(row.reason), 0,
+            len(name_bytes), 0,
+        )
+        return head + pad_bytes(name_bytes)
+
+    # ------------------------------------------------------------------
+    # VAS Map (Block 0x1001)
+    # ------------------------------------------------------------------
+
+    def write_vas_map(self, entries: list[VasEntry]) -> bytes:
+        """Write a VAS Map block (0x1001): the full address-space layout.
+
+        Uses the writer's normal compression flags. Returns the block UUID.
+
+        .. code-block:: text
+
+            Payload header:
+                entry_count: u32
+                entry_size:  u32      # 0 = variable-length entries
+            Entry:
+                base_addr:   u64
+                region_size: u64
+                protection:  u8
+                region_type: u8
+                path_len:    u16      # incl. NUL; 0 when no path
+                reserved:    4 bytes
+                path:        bytes[path_len]  NUL-terminated, pad8
+
+        A name that contains a NUL, is not encodable as UTF-8 or does not
+        fit the u16 length (NUL included) is dropped -- the entry is kept
+        with an empty path, never failing the capture.
+        """
+        packed = [_pack_vas_entry(e) for e in entries]
+        rows = [p for p in packed if p is not None]
+        # Count the entries actually packed, so a dropped one is never promised.
+        payload = struct.pack("<II", len(rows), 0) + b"".join(rows)
+        return self._write_block(
+            BlockType.VASMap, payload, flags=self._comp_flags,
+        )
+
+    # ------------------------------------------------------------------
     # PersistenceManifest (P1.6.4, Block 0x0056)
     # ------------------------------------------------------------------
 
@@ -1024,14 +1796,17 @@ class MSLWriter:
         rows_bytes: list[bytes] = []
         for r in manifest.rows:
             path_bytes = r.path.encode("utf-8")
-            row = (
+            row = _packed_or_none("PersistenceManifest", f"path {r.path}", lambda: (
                 struct.pack("<BBH", r.source, 0, len(path_bytes))
                 + path_bytes
                 + struct.pack("<QQI", r.mtime_ns, r.size, r.mode)
-            )
+            ))
+            if row is None:
+                continue
             rows_bytes.append(row)
+        # Count the rows actually packed, so a dropped row is never promised.
         payload = (
-            struct.pack("<II", len(manifest.rows), 0)
+            struct.pack("<II", len(rows_bytes), 0)
             + b"".join(rows_bytes)
         )
         return self._write_block(BlockType.PersistenceManifest, payload)
@@ -1040,27 +1815,225 @@ class MSLWriter:
     # End of capture
     # ------------------------------------------------------------------
 
-    def finalize(self) -> None:
+    def finalize(self, *, seal: bool = True) -> None:
         """Write End-of-Capture block and flush.
 
+        The EoC records the exact capture-segment block count (itself
+        included, spec Section 4.5), so the header may stay at 0.
+
         When encrypted: flushes all buffered blocks as AEAD ciphertext
-        and appends the 16-byte authentication tag.
+        and appends the 16-byte authentication tag. Pass ``seal=False``
+        to keep the AEAD open so extension segments can be written
+        inside it (spec Section 4.6); call :meth:`seal` afterwards.
+
+        Raises:
+            ValueError: if an EndOfCapture was already written.
         """
+        if self._eoc_written:
+            raise ValueError("EndOfCapture already written")
+        if self._block_index == 0:
+            # Nothing was written, so the EoC below is about to land in
+            # Block 0 -- the slot the spec reserves for ProcessIdentity.
+            warnings.warn(
+                "Spec violation: finalizing a capture with no blocks; "
+                "EndOfCapture will occupy Block 0 instead of ProcessIdentity",
+                stacklevel=2,
+            )
         file_hash = self._chain.finalize()
         acq_end_ns = now_ns()
 
-        # EoC payload: FileHash(32) + AcqEnd(8) + Reserved(8) = 48 bytes
-        payload = file_hash + struct.pack("<Q8s", acq_end_ns, b"\x00" * 8)
+        # EoC payload: FileHash(32) + AcqEnd(8) + BlockCount(4) + Reserved(4)
+        # = 48 bytes; BlockCount includes the EoC itself.
+        payload = file_hash + struct.pack(
+            "<QII", acq_end_ns, self._block_index + 1, 0,
+        )
 
         self._write_block(BlockType.EndOfCapture, payload)
+        self._eoc_written = True
 
-        if self._encrypted and self._encryptor is not None:
-            # Encrypt the entire block stream and write ciphertext + tag
-            ciphertext, tag = self._encryptor.finalize()
-            self._output.write(ciphertext)
-            self._output.write(tag)
-
+        if seal and self._encrypted:
+            self.seal()
         self._output.flush()
+
+    def seal(self) -> None:
+        """Encrypt the buffered block stream and write ciphertext + tag.
+
+        Only meaningful for encrypted writers; :meth:`finalize` calls it
+        unless asked not to. Nothing can be written after sealing.
+
+        Raises:
+            ValueError: if the writer is not encrypted, the EoC has not
+                been written, an extension segment is open, or the
+                container was already sealed.
+        """
+        if not self._encrypted or self._encryptor is None:
+            raise ValueError("seal() applies to encrypted writers only")
+        if not self._eoc_written:
+            raise ValueError("finalize() must precede seal()")
+        if self._in_extension:
+            raise ValueError("extension segment still open")
+        if self._sealed:
+            raise ValueError("container already sealed")
+        ciphertext, tag = self._encryptor.finalize()
+        self._check_preset_cipher_len(len(ciphertext))
+        self._output.write(ciphertext)
+        self._output.write(tag)
+        self._sealed = True
+        self._patch_cipher_len(len(ciphertext))
+        self._output.flush()
+
+    def _check_preset_cipher_len(self, cipher_len: int) -> None:
+        """Refuse to seal when a caller-supplied ``CipherLen`` is wrong.
+
+        A non-zero value written up front (spec Section 10.7 allows it)
+        must equal the real ciphertext length, or readers would look for
+        the tag in the wrong place.
+        """
+        preset = self._encryption_params.cipher_len
+        if preset and preset != cipher_len:
+            raise ValueError(
+                f"EncryptionParams.cipher_len {preset} != actual ciphertext "
+                f"length {cipher_len}"
+            )
+
+    def _patch_cipher_len(self, cipher_len: int) -> None:
+        """Record ``CipherLen`` at header offset 0x78 once the tag is written.
+
+        Spec Section 10.7: the sealing producer patches the field once,
+        and only on seekable output. A non-seekable stream (a pipe) keeps
+        0, which readers handle by taking the tag from the end of the file.
+        The stream is left positioned at its end.
+        """
+        from memslicer.msl.encryption import CIPHER_LEN_OFFSET
+
+        if self._encryption_params.cipher_len or self._header_offset is None:
+            return
+        end = self._output.tell()
+        self._output.seek(self._header_offset + CIPHER_LEN_OFFSET)
+        self._output.write(struct.pack("<Q", cipher_len))
+        self._output.seek(end)
+
+    # ------------------------------------------------------------------
+    # Extension segments (spec Section 4.6)
+    # ------------------------------------------------------------------
+
+    def begin_extension(self) -> None:
+        """Open an extension segment after the EndOfCapture.
+
+        Blocks written until :meth:`finalize_extension` form one segment
+        whose hash the terminator records.
+
+        Raises:
+            ValueError: if the EoC has not been written, a segment is
+                already open, or an encrypted container is sealed.
+        """
+        if not self._eoc_written:
+            raise ValueError("begin_extension() requires a written EndOfCapture")
+        if self._in_extension:
+            raise ValueError("extension segment already open")
+        if self._sealed:
+            raise ValueError("container already sealed")
+        self._chain.start_segment()
+        self._segment_blocks = 0
+        self._in_extension = True
+
+    def finalize_extension(
+        self, producer: str, written_at_ns: int | None = None,
+    ) -> bytes:
+        """Terminate the open extension segment with an EndOfExtension block.
+
+        The SegmentHash is taken over every segment block written so far,
+        before the terminator itself is written. Returns the terminator's
+        block UUID.
+
+        .. code-block:: text
+
+            segment_hash: 32 bytes
+            written_at:   u64 ns
+            block_count:  u32      # segment blocks incl. this terminator
+            reserved:     u32
+            producer_len: u16      # incl. NUL; 0 = none
+            reserved:     6 bytes
+            producer:     bytes[producer_len] NUL-terminated, pad8
+
+        Raises:
+            ValueError: if no segment is open or it holds no blocks.
+        """
+        if not self._in_extension:
+            raise ValueError("no extension segment open")
+        if self._segment_blocks == 0:
+            raise ValueError("extension segment holds no blocks")
+        payload = self._end_of_extension_payload(producer, written_at_ns)
+        block_uuid = self._write_block(BlockType.EndOfExtension, payload)
+        self._chain.end_segment()
+        self._in_extension = False
+        return block_uuid
+
+    def _end_of_extension_payload(
+        self, producer: str, written_at_ns: int | None,
+    ) -> bytes:
+        """Build the EndOfExtension payload for the open segment."""
+        producer_bytes, producer_len = _bounded_or_absent(producer)
+        _warn_if_truncated("Producer", producer, producer_len)
+        written_at = now_ns() if written_at_ns is None else written_at_ns
+        head = _EOX_HEAD.pack(
+            self._chain.segment_digest(), written_at,
+            self._segment_blocks + 1, 0, producer_len,
+        )
+        return head + producer_bytes
+
+    # ------------------------------------------------------------------
+    # Thread Context (Block 0x0011, spec Tables 19a/19b)
+    # ------------------------------------------------------------------
+
+    def write_thread_context(
+        self, tc: ThreadContext, parent_uuid: bytes | None = None,
+    ) -> bytes:
+        """Write a Thread Context block. Returns the block UUID.
+
+        .. code-block:: text
+
+            Payload header (Table 19a, 32 bytes):
+                thread_id:    u64
+                start_time:   u64 ns
+                flags:        u16      # TC_FLAG_* bits
+                thread_state: u8       # ThreadState
+                arch:         u8       # 0 = header ArchType
+                reg_count:    u32
+                name_len:     u16      # incl. NUL; 0 = none
+                reserved:     6 bytes
+                thread_name:  bytes[name_len] NUL-terminated, pad8 (omitted when 0)
+            Register entry (Table 19b):
+                name_len:     u8       # incl. NUL
+                width:        u8       # value size in bytes
+                flags:        u16      # REG_ROLE_* bits
+                reserved:     4 bytes
+                name:         bytes[name_len] NUL-terminated, pad8, lowercase
+                value:        bytes[width] in file byte order, pad8
+
+        Raises:
+            ValueError: if ``state`` or ``arch`` does not fit its u8 field
+                (``ArchType.Unknown`` is not representable; use 0 for the
+                header ArchType), if a register name is empty or longer
+                than the u8 length admits, its width is outside 1..255, or
+                its value does not hold exactly ``width`` bytes.
+        """
+        if not 0 <= int(tc.state) <= 0xFF or not 0 <= int(tc.arch) <= 0xFF:
+            raise ValueError(
+                f"ThreadContext state {int(tc.state)} / arch {int(tc.arch)} "
+                "must fit u8 (spec Table 19a)"
+            )
+        name_bytes, name_len = _bounded_or_absent(tc.name)
+        _warn_if_truncated("ThreadName", tc.name, name_len)
+        head = _TC_HEAD.pack(
+            tc.thread_id, tc.start_time_ns, tc.flags, int(tc.state),
+            int(tc.arch), len(tc.registers), name_len,
+        )
+        registers = b"".join(_pack_thread_register(r) for r in tc.registers)
+        return self._write_block(
+            BlockType.ThreadContext, head + name_bytes + registers,
+            parent_uuid=parent_uuid,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
