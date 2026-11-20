@@ -7,20 +7,8 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- Align Thread Context blocks with spec 1.1.1 (Section 5.7): register names
-  follow the canonical mnemonics of Table 19g (ARM64 `fp`/`lr`/`cpsr` are
-  written as `x29`/`x30`/`pstate`, x86_64 `eflags` as `rflags`); the TLS
-  base (`fs_base`/`gs_base`/`tpidr_el0`/... per OS) and link register carry
-  the new Table 19b role flags; `Suspended` is set when registers were read
-  from a stopped thread (GDB/LLDB, never Frida) and `Partial` when a register
-  could not be read; thread states `Uninterruptible`/`Halted`/`Zombie`; the
-  per-thread `Arch` byte (+0x13) is written and read. The emulator loader
-  normalises `fp`/`lr` in slices from 1.1.0 producers (consumer rule 29).
-- Capture per-thread CPU register state into Thread Context blocks
-  (0x0011, spec Section 5.7) so a slice can be emulated/stepped by a
-  consumer. Supported on the Frida, GDB and LLDB backends; the
-  `ThreadContexts` capability bit is set when registers are captured.
-  Disable with `--no-registers`. Bumps the MSL format version to 1.1.
+- The emulator loader normalises `fp`/`lr` register names in slices from
+  1.1.0 producers (spec consumer rule 29).
 - New `memslicer-emu` tool (and `memslicer.emu` library) that emulates a
   slice with Unicorn + Capstone: maps the captured regions, seeds registers
   from the Thread Context, and single-steps execution. Install with the
@@ -81,7 +69,13 @@ All notable changes to this project will be documented in this file.
   - Graph export to GraphML and GEXF (dependency-free) and to a `networkx`
     `MultiDiGraph` (optional `graph` extra), plus a fixed-key per-graph feature
     vector (`--features`) for ML/triage pipelines.
-- `memslicer-symbex` anti-analysis bypass (`--bypass-anti-analysis`):
+- Frida captures on Windows x86/x64 record each thread's TEB (via
+  `NtQueryInformationThread`) as `gs_base` (x64) / `fs_base` (x86) in the
+  Thread Context block; a `CpuContext` carries no segment base.
+- LLDB Thread Context blocks include vector and x87 registers at full width
+  (spec Table 19b widths 16/32/64) instead of skipping registers wider than
+  8 bytes.
+- `memslicer-symbex` anti-analysis bypass (`-b`/`--bypass-anti-analysis`):
   SimProcedures for `IsDebuggerPresent`, `CheckRemoteDebuggerPresent` and
   `NtQueryInformationProcess`, plus PEB `BeingDebugged`/`NtGlobalFlag`
   masking. On real multi-module dumps the APIs are resolved by parsing each
@@ -93,38 +87,390 @@ All notable changes to this project will be documented in this file.
 - `memslicer-symbex` automatic recovery of unmapped memory and missing code
   (`unmapped_handler`, on by default, `--no-auto-map-unmapped` to disable) and
   OS/arch-aware syscall resolution with errored-state repair
-  (`syscall_handler`). New options `--entry`, `--call-function`,
-  `--sym-bytes`, `--binary-key`, `--buffer-addr`, `--avoid-module` and
-  `--find-rax-success`.
-- Live KeyHints: `memslicer --key-hints` (Frida, Windows) hooks CNG
+  (`syscall_handler`, on by default, `--no-syscall-handler` to keep angr's own
+  syscall models). The syscall stub hooks only the `syscall`/`sysenter`/
+  `int 0x80`/`int 0x2e`/`svc` instruction itself.
+- `memslicer-symbex` symbolic-buffer injection, only when asked for:
+  `-k`/`--sym-bytes N`, `--binary-key` (raw bytes, no trailing NUL),
+  `--buffer-addr ADDR`, `--use-key-hints`, `-e`/`--entry ADDR` and
+  `-c`/`--call-function ADDR`. Without any of them the state starts exactly
+  as captured. Also new: `-m`/`--avoid-module`, `-r`/`--find-rax-success`,
+  `--find-max-steps N` (default 2000, `0` = no limit) and `--raw-blob` to load
+  a raw x86-64 code blob instead of an MSL slice
+  (`memslicer.symbex.load_raw_blob()`).
+- Live KeyHints: `memslicer acquire --key-hints` (Frida, Windows) hooks CNG
   `BCryptGenerateSymmetricKey` / `NCryptDeriveKey` during capture and writes
-  `KeyHint` blocks (0x0020) locating derived key material; the emulator loader
-  parses them and `memslicer-symbex --use-key-hints` targets the symbolic
-  buffer at the hinted address. Only keys derived during the capture window are
-  recorded.
+  `KeyHint` blocks (0x0020) locating derived key material; the header's
+  `CryptoHints` capability bit is set whenever the hooks are armed. The
+  emulator loader parses KeyHints (a truncated one is skipped) and
+  `memslicer-symbex --use-key-hints` targets the symbolic buffer at the hinted
+  address. Only keys derived during the capture window are recorded; the gdb
+  and lldb backends reject `--key-hints`.
 - `memslicer.emu` pre-maps a 64 MB stack window around the captured SP so deep
-  frames no longer fault (`premap_stack_mb`, `memslicer-behavior
-  --no-premap-stack` to disable). Reads of that invented memory are tracked
-  (`synthetic_ranges()` / `is_synthetic()` / `synthetic_reads()`) and reported
-  as `synthetic_stack_reads` in the behavior graph metadata.
+  frames no longer fault (`premap_stack_mb`; `--no-premap-stack` on
+  `memslicer-emu` and `memslicer-behavior` to disable). Reads of that invented
+  memory are tracked (`synthetic_ranges()` / `is_synthetic()` /
+  `synthetic_reads()` / `synthetic_read_count()` / `synthetic_read_sites()`),
+  reported as `synthetic_stack_reads` / `synthetic_stack_read_sites` in the
+  behavior graph metadata, and summarised by both CLIs.
 - `memslicer-behavior` IDA-style DOT rendering (`--style ida`), module
   clustering and colour-coded branches, plus the `tools/graph_viewer.html`
   interactive viewer.
 
+### Changes
+
+- Synced with upstream `MemorySlice/memslicer` 0.5.2. Thread Context capture
+  (Frida/GDB/LLDB), the spec 1.1.1 MSL writer/reader and the investigation-mode
+  CapBitmap fix now come from upstream; this fork's earlier implementations of
+  them are dropped.
+- Thread Context register names are the canonical mnemonics of spec Table
+  19g (producer rule 42): ARM64 `fp`/`lr`/`cpsr`/`tpidr` are written as
+  `x29`/`x30`/`pstate`/`tpidr_el0`, ARM32 `r13`-`r15` as `sp`/`lr`/`pc` and
+  x86_64 `eflags` as `rflags`.
+- The TLS register role is set only on the register the target OS uses as
+  thread pointer (Table 19g: `fs_base` on Linux/Android/FreeBSD x86_64,
+  `gs_base` on Windows/macOS x64, `tpidrro_el0` on Apple ARM64, `x18` on
+  Windows ARM64, ...), not on every segment base.
+
 ### Bug Fixes
 
+- GDB backend: `show architecture` output in the form
+  `The target architecture is set automatically (currently i386)` (newer and
+  Windows GDB builds, unquoted architecture name) is now parsed. Previously
+  platform detection raised `Cannot parse GDB architecture output` and the
+  gdb backend was unusable there.
+- CI: the publish workflow only publishes on a real version bump. When
+  `pyproject.toml` changed without touching the `version` line, the previous
+  version was read as empty and every such push to `main` attempted a PyPI
+  publish.
+- `memslicer.symbex` and `memslicer-symbex` work with angr 10, which no longer
+  ships a top-level `claripy` module (it is `angr.claripy` there), and the
+  provenance inspector no longer depends on claripy's removed `leaf_asts()`.
 - `memslicer-symbex`: the generic API auto-stub no longer hooks already-loaded
   code that is merely revisited (loops, backward jumps), which corrupted
   execution; `GS`/`FS` segment bases captured as `gs_base`/`fs_base` are now
   seeded instead of silently dropped; `--avoid`/`--avoid-module` now apply in
   `--steps` mode; several anti-analysis errors (wrong fallback address,
   missing symbolic guard) fixed; PE header reads use the target's endianness.
-- Investigation mode: the `SystemProcessTable` / `SystemNetworkTable` /
-  `SystemHandleTable` capability bits are now written to the on-disk file
-  header. They were previously set on the header object only after it had
-  already been serialized into the BLAKE3 chain, so they never reached disk
-  and consumers under-reported the captured system tables. The tables are now
-  collected before the header is built.
+
+
+## [0.5.2] - 2026-10-25
+
+### Changes
+
+- fixes in the tests
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- minor improvements and alignments to the latest version of .msl specification
+- serveral fixes (investigator mode; acquisiton notion for Thread Context blocks; changes regarding the new specification)
+- start making and improving memslicer to acquire only certain memory regions which are most likely relevant
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- fixed issue for the investigator mode
+
+## [0.5.0] - 2026-10-23
+
+### Changes
+
+- serveral fixes (investigator mode; acquisiton notion for Thread Context blocks; changes regarding the new specification)
+- start making and improving memslicer to acquire only certain memory regions which are most likely relevant
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- fixed issue for the investigator mode
+
+## [0.4.0] - 2026-09-14
+
+### Changes
+
+- fixes of memslicer to be aligned with the specification
+
+## [Unreleased]
+
+### Added
+
+- Every capture ends with a VAS Map block (0x1001) listing every enumerated
+  range. New `MSLWriter.write_vas_map`, `parse_vas_map` and `VasEntry`.
+- `tests/tools/make_android_fixture.py` generates a small Android `.msl`
+  fixture; `tests/data/region_name_vectors.json` holds the MemDiver vectors.
+
+- `-D/--device <id>` selects a specific Frida device when several are
+  attached (ids as printed by `frida-ls-devices`); `-U` keeps taking the
+  first USB device. `-D` is a Frida-only option and cannot be combined
+  with `-R`.
+
+- `memslicer verify <file> [--passphrase P]` checks a slice's integrity: the
+  spec §4.4 PrevHash chain (Block 0 hashes the file header, block i hashes the
+  on-disk bytes of block i-1) and the EndOfCapture FileHash, using the file's
+  HashAlgo (BLAKE3, SHA-256 or SHA-512/256). Encrypted slices are decrypted
+  (AEAD tag check; the passphrase is prompted for if not given), their
+  PrevHash fields must be zero and the FileHash is checked over the plaintext.
+  A missing EndOfCapture, a legacy zero Block-0 PrevHash and trailing bytes
+  after the last segment are reported as warnings.
+  Exits 0 when the slice is VALID, 1 when it is INVALID or cannot be read.
+- `memslicer` is now a command group with `acquire` and `verify`
+  subcommands. `memslicer <target> ...` still works and runs `acquire`; a
+  process literally named `acquire` or `verify` must be given as
+  `memslicer acquire <name>` (or by PID).
+- `--scope full|app|heap|stack` (comma-combinable, alias `heapstack`) limits
+  capture to app-owned, heap or stack regions; modules and VAS Map stay full.
+- `--exclude-module PATTERN` (repeatable glob on name, path or anon label)
+  skips its regions; `--app-path PREFIX` marks files app-owned for `app`.
+- `--resident-only` skips anonymous pages that are neither present nor swapped
+  (they read as zero); file-backed mappings are never pruned.
+- New PageState `NotResident` (value 3, spec 1.1 Table 24) marks pages
+  `--resident-only` skips; readers must treat value 3 as a 0-byte page.
+- New extension block `RegionOmissionManifest` (0x005B) lists every region
+  `--scope`/`--exclude-module` omitted; absent when nothing was omitted.
+- `--dry-run` enumerates and classifies the target's regions, prints what the
+  current options would capture and exits without writing a file.
+- The capture summary gains `Scope`, `Exclude`, `Omitted` and `Resident` lines
+  when scope, exclusions or residency pruning were in effect.
+- Slices are written as MSL 1.1 (header version `0x0101`); the EoC carries the
+  exact block count, the header count stays 0.
+- Extension segments closed by `EndOfExtension` (0x0FFE); `memslicer-enrich`
+  appends a segment instead of replacing the EoC.
+- `memslicer verify` checks the header and EoC block counts and every extension
+  segment (chain, `SegmentHash`, `BlockCount`).
+- VAS Map entries carry `NameSource` (spec Section 5.8).
+- Thread Context blocks (0x0011) with per-thread registers on Frida, GDB and
+  LLDB; `--no-registers` disables them; the summary gains a `Threads` line.
+- New `MSLWriter.extend`, `MSLWriter.begin_extension`,
+  `MSLWriter.finalize_extension` and `MSLWriter.write_thread_context`.
+- MSL 1.1.1 `CipherLen` (header `0x78`, formerly `Reserved3`): encrypted
+  slices written to a seekable file record the primary ciphertext length,
+  patched once after the tag (pipes keep 0). `EncryptionParams.cipher_len`,
+  `aad_from_header`, `zero_cipher_len` and `primary_ciphertext_span`.
+- `decrypt_container` returns the plaintext plus the primary tag and the
+  offset of any bytes after it (`post_tag_offset`).
+- `hkdf_blake3` and `derive_segment_key` (spec Section 10.8 segment subkeys),
+  pinned to MemDiver's implementation by test vectors.
+- Sealed extension segments (spec 1.1.1, Section 10.8, Table 27a): new
+  `memslicer.msl.sealed` with `SealHeader` (magic stored as the bytes
+  `"MSLS"`), `seal_segment` (write primitive) and `open_sealed_segments`
+  (read/verify), plus `MSLWriter.for_sealed_segment` to build the
+  zero-PrevHash plaintext segment. `decrypt_container` now verifies the
+  sealed segments after the primary tag (`sealed_segments`, `sealed_end`,
+  `trailing_bytes`, `last_tag`, `cek`); `iterate_blocks` yields their blocks
+  after the in-stream extension segments (`BlockRecord.seal_index`).
+  `memslicer verify` reports the verified sealed segments
+  (`VerifyReport.sealed_segments`, `sealed_trailing_bytes`, `sealed=N` in
+  the summary) and warns only about bytes after the last of them.
+- `memslicer-enrich` enriches encrypted slices (`--passphrase`, prompted
+  with hidden input when omitted): the build-id manifest is appended as a
+  sealed extension segment (spec 1.1.1, Section 10.8) in one write after the
+  last verified sealed segment; the primary ciphertext and tag are untouched
+  and `--in-place` appends to the original directly. Enrichers see the
+  blocks of earlier sealed segments too. Slices without `CipherLen`
+  (pre-1.1.1 or written to a non-seekable stream), with trailing data after
+  the last verified sealed segment, or with a wrong passphrase are refused
+  and left unchanged. New `iterate_container_blocks` iterates an already
+  decrypted container without deriving the key again.
+
+### Changes
+
+- The AEAD AAD is the header with `CipherLen` zeroed (spec 1.1.1, Section
+  10.2) and the EoC FileHash hashes `CipherLen` as zero. Readers locate the
+  tag via `CipherLen` (EOF-16 when 0) and reject an out-of-bounds value;
+  files with `CipherLen=0` (all earlier memslicer slices) read unchanged.
+- A header BlockCount that disagrees with the blocks on disk is now a
+  `memslicer verify` error, not a warning.
+- `memslicer-enrich` exits without writing when there is nothing to enrich.
+
+### Bug Fixes
+
+- `/proc/<pid>/maps` names containing spaces or a ` (deleted)` suffix are no
+  longer truncated at the first space in the region record and the VAS Map.
+- `[anon:...]` heaps and stacks (`scudo:*`, `stack_and_tls:*`) now get the
+  right RegionType and volatility order, not generic anonymous memory.
+- memslicer can read its own LZ4-compressed slices again; they used to fail
+  with `LZ4BlockError`. The writer padded `UncompressedSize + CompressedData`
+  to 8 bytes, contrary to spec §4.2.1 Table 9
+  (BlockLength = 80 + 8 + len(CompressedData)), and lz4 rejects the trailing
+  padding. Compressed payloads are no longer padded; the reader still accepts
+  slices written by memslicer <= 0.4.4 by trimming up to 7 trailing zero bytes
+  and retrying.
+- `memslicer-enrich` keeps the slice's integrity chain intact. The appended
+  manifest and EndOfCapture were chained from a throwaway header and always
+  hashed with BLAKE3, so enriched slices had a broken PrevHash chain and a
+  wrong FileHash. The tail now continues the original chain and hash
+  algorithm, and enriched slices pass `memslicer verify`. New
+  `MSLWriter.resume(...)`.
+
+- Investigation captures no longer abort with `'Q' format requires 0 <= number …`
+  on Linux hosts ([#3](https://github.com/MemorySlice/memslicer/issues/3)).
+  `/proc/net/snmp` reports `Tcp.MaxConn` as -1 (signed per RFC 2012); it is
+  now stored as two's-complement u64, and a connectivity, connection, handle,
+  kernel-module or persistence row that cannot be packed is dropped and logged
+  instead of ending the capture.
+- Remote Frida targets (`-U`, `-R`) collect investigation data on the device
+  through the Frida agent. The host's `/proc` was being read for the device's
+  PID, which is where the `/proc/<pid>/stat` warnings in #3 came from. GDB and
+  LLDB remote targets record empty system tables with a warning instead of
+  host data.
+- The on-device investigation agent works with Frida 16 and Frida 17
+  frida-servers. It detects the runtime API at load time (`Module` export
+  lookup, bundled `Java`/`ObjC` bridges, `File` reads) rather than assuming
+  one version; on Frida 17 the static `Module` helpers and the bridges are
+  gone, and `File.read` never existed, so every `/proc` read came back empty.
+- macOS investigation captures no longer abort at the handle table. lsof
+  `cwd`/`rtd`/`txt`/`mem` rows have no descriptor number and are written as
+  `0xFFFFFFFF`, not -1.
+- macOS process identity is correct under non-English locales and for long
+  paths. `ps` is now run with `LC_ALL=C` (a localized `lstart` such as
+  `Di. 20 Okt. …` left `exe_path='Di.'` and a zero start time), the executable
+  path comes from a separate `comm=` query (combined with `args=` it is cut to
+  16 characters), and the command line no longer repeats that truncated token.
+- On-device reads of `/proc/<pid>/cmdline` work again: the GumJS text readers
+  reject embedded NUL bytes, so the agent reads bytes and decodes UTF-8 itself.
+  Process start times on Android use bionic's `_SC_CLK_TCK` (6, not glibc's 2).
+  Android package names are derived only for app processes, not native ones.
+- A collector that raises while the slice is being written (connectivity,
+  kernel modules, persistence, system info) no longer leaves a truncated file;
+  the block is skipped and its table bit stays clear.
+- A failed capture writes the traceback to the `.msl.log` and prints the log
+  path; with `-v` the traceback also reaches the console.
+- `memslicer-sysctx -U/-R` no longer reports the acquisition host as the
+  device; it warns and emits an empty context.
+- Investigation captures put System Context in Block 2, per spec Section 2.1.
+  ModuleEntry children occupied it; they now follow the memory regions.
+- macOS investigation captures no longer abort at the process table. `ps`
+  prints uids signed, and `nobody` (-2) would not fit the uint32 UID field.
+- Encrypted slices can be read back. `iterate_blocks` takes a passphrase and
+  reads HeaderSize from 0x09 instead of assuming 64.
+- Encryption flag conflicts are refused, not silently resolved. `--passphrase`
+  without `-E`/`-I` used to write an unencrypted capture and say nothing.
+- Process Identity is always Block 0. A collector that raised left the
+  `finally` to emit End-of-Capture there instead, silently.
+- Investigation captures set the system-table capability bits (12-14) again.
+  They were OR-ed in after the header had been written, so never reached disk.
+- A command line over 64 KiB no longer aborts the capture. The `uint16`
+  `CmdLineLen` was packed untruncated; long values are now cut and logged.
+- Attach failures now name their cause and the fix, instead of printing
+  `unable to access /proc/<PID>/mem: Permission denied`
+  ([#2](https://github.com/MemorySlice/memslicer/issues/2)). memslicer never
+  changes `ptrace_scope` itself — it recommends the change and leaves it to the
+  examiner.
+- Kernel pseudo-mappings (`[vvar]`, `[vvar_vclock]`, `[vsyscall]`) are recorded
+  `UNMAPPED` rather than failed, so Linux 6.13+ captures no longer report
+  ~99.9% completeness. `[vdso]` is still captured.
+- Short reads are no longer recorded as fully captured, which had shifted page
+  data out of step with the page-state map.
+- GDB: remote captures no longer come back empty — mapping permissions were
+  discarded, so every region was filtered out as unreadable.
+- GDB: `^error` replies are detected again. A failing `-target-attach` raised
+  nothing, and the capture continued against a process it had not attached to.
+- GDB: partly-unreadable reads no longer write bytes at the wrong address.
+- GDB: console output is unescaped, so mapped paths keep their names and
+  architecture detection works.
+- GDB: mapping permissions are no longer glued onto the mapped path.
+- GDB: `Yes (*)` in `info sharedlibrary` is no longer taken for a library path.
+- GDB: non-ASCII characters in paths survive MI's octal escaping.
+- GDB: a read after GDB has exited degrades to failed pages instead of aborting
+  the capture.
+- GDB: an unparseable read reply is no longer reported as a proven unreadable
+  address.
+- GDB: remote targets no longer read the local machine's `/proc/<pid>/maps`.
+  The PID recorded in the capture now comes from GDB.
+- GDB: the OS recorded for a remote target is the target's, read from
+  `show osabi`, not this machine's. A Linux host dumping a remote macOS or
+  Windows target had been writing `Linux` into the capture header.
+- GDB: the page size recorded for a remote target is the target's, read from
+  `AT_PAGESZ` in `info auxv`, not this machine's. Only `PageSizeLog2` is stored
+  in the file and the page-state map is sized to match, so the wrong value had
+  produced a capture that was self-consistent and wrong, with nothing in it to
+  say so.
+- LLDB: the page size for a remote target is asked of the target
+  (`getconf PAGESIZE` over the platform connection) instead of assumed to be
+  4096. aarch64 kernels with 16K or 64K pages had been recorded with a
+  page-state map several times too fine.
+- GDB and LLDB: when the target's page size cannot be established, the log now
+  says so instead of assuming 4096 silently.
+- GDB: module paths containing spaces are no longer truncated at the first one.
+  `/usr/lib/My App/libfoo.so` had been recorded as `/usr/lib/My`, with a base
+  and size that still looked valid.
+- GDB: `disconnect()` closes GDB's pipes, joins its output reader, and reaps the
+  process after `kill()`. The thread, the pipes and a stale queue entry had all
+  outlived the connection.
+- GDB: remote Android targets are detected as Android and get the
+  reduced-capability warning, rather than being recorded as plain Linux.
+- GDB: a console command carrying a `"` or `\` is escaped before it is wrapped
+  for MI, instead of ending the quoted string early and leaving the rest to be
+  read as further arguments. Every current caller passes a fixed literal, so
+  this closes a trap rather than a live fault.
+- GDB: an unreadable `/proc/<pid>/maps` no longer aborts the capture. The file
+  is listed for any live PID, including ones the user cannot read.
+- GDB: `disconnect()` no longer raises when the process refuses both
+  `terminate()` and `kill()`. It is called from callers' `finally` blocks,
+  where raising would have masked the acquisition error that got it there.
+- GDB: a `info sharedlibrary` row with no path can no longer take the following
+  line as its own, which had recorded GDB's own footnote text as a module path.
+- GDB and LLDB: an empty `--remote` is treated as local. It had attached
+  locally while every platform probe took the remote path. The investigation
+  collector in `cli.py` used the old rule too, and had disagreed with the
+  attribution recorded for the same capture.
+- GDB: a `--remote` value carrying whitespace or a quote is escaped before it
+  reaches `-target-select`, instead of arriving as extra MI arguments.
+- LLDB: the local page size is validated like the remote one. `sysconf`
+  reports `-1` for "indeterminate" rather than raising, and that had been
+  accepted and carried into the capture.
+- LLDB: remote Android targets are detected as Android, from the target's own
+  `/proc/<pid>/maps`.
+- LLDB: the Python bindings are located with `lldb -P` rather than by guessing
+  directory layouts. The backend had refused to start on a machine set up with
+  `xcode-select --install` — CommandLineTools keeps LLDB in
+  `Library/PrivateFrameworks`, which none of the guessed paths covered — and on
+  Homebrew LLVM and distribution packages.
+- LLDB: bindings that are found but cannot be loaded no longer report as "not
+  available". That failure means the interpreter is not the one LLDB was built
+  against, and the message now says so, naming the directory and the running
+  interpreter, instead of advising an install that is already present. The
+  search also continues past a directory whose bindings will not load, so a
+  second LLDB build that would have worked is still found.
+- LLDB: a failing platform-shell probe can no longer fail the attach. The
+  bindings raise types outside any documented contract, and the probe is
+  best-effort with a caller that already handles "no answer".
+- LLDB: the remote Android check reads the first 32 KiB of the target's maps
+  rather than the whole file, matching the local path. A browser or JVM target
+  had pulled megabytes across the connection during attach.
+- LLDB: a page-aligned short read is no longer mistaken for a map edge, which
+  had silently lost readable pages.
+- LLDB: a wholly unreadable region no longer triggers repeated whole-span reads.
+- LLDB: region lookups are ignored unless they contain the address asked about,
+  and are cleared on `disconnect()`.
+
+### Changes
+
+- A capture whose page size had to be assumed says so in the file. The bridges
+  record `page_size_assumed_4k` alongside the collector's own warnings, so the
+  uncertainty is no longer visible only in the log — a region carries just
+  `PageSizeLog2` and a page-state map sized to match, which agree with each
+  other whether or not the number was ever measured.
+- The page sizes the MSL format accepts are defined once, in
+  `msl.constants.valid_page_size`. The writer enforced the rule and the
+  acquisition backends restated it, so a change to one could have left the
+  backends discarding page sizes the format had started accepting.
+- GDB: `info proc mappings` is fetched once per capture rather than twice.
+  Platform detection and region enumeration both need it, and for a browser or
+  JVM it runs to hundreds of kilobytes crossing the connection each time.
+- Failed reads split at the reported fault boundary instead of one read per
+  page. A 20 MB chunk with one bad page takes about 3 reads, not 5121.
+- GDB and LLDB now report where a read failed, so they get that splitting too.
+  Neither passes on an address that merely echoes the one it was asked about.
+- GDB caps a single MI read at 1 MiB and splits larger requests.
+- GDB read replies are no longer logged in full; the companion `.msl.log` had
+  been growing to roughly twice the size of the dump it documents.
+- GDB reply parsing is about 9x faster per megabyte read.
+- LLDB caches the last region lookup, saving a debug-server round trip per
+  failed page.
+- LLDB `read_memory` and `enumerate_*` before `connect()` raise a clear error
+  instead of `AttributeError`.
+- Region names from `/proc/<pid>/maps` are now available on the Frida backend,
+  so `[heap]` and `[stack]` are classified as they already were on GDB and LLDB.
+- New `Missing :` summary section and `.msl.log` report naming every unreadable
+  address range with its mapping name.
+- New quality tier `EXCELLENT` for captures with zero failed pages.
+- New `--skip-kernel-pseudo` flag to skip kernel pseudo-mappings outright.
+- New exit code `3` — the attach was refused and nothing on the target was
+  touched. Distinguishes that from a capture that started and failed (`1`).
+- The Yama `ptrace_scope` check is shared by all three backends; the Frida
+  bridge gained the check it never had.
 
 
 ## [0.2.7] - 2026-04-20

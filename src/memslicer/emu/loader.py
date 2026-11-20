@@ -10,8 +10,8 @@ import struct
 from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
-    ArchType, BlockType, OSType, PageState, REG_FLAG_PC, REG_FLAG_SP,
-    THREAD_FLAG_CURRENT,
+    ArchType, BlockType, OSType, PageState, REG_ROLE_PC, REG_ROLE_SP,
+    TC_FLAG_CURRENT,
 )
 from memslicer.msl.iterator import iterate_blocks
 from memslicer.utils.padding import pad8
@@ -197,11 +197,11 @@ def _parse_thread(payload: bytes, file_arch: ArchType) -> EmuThread:
         value = int.from_bytes(payload[voff:voff + width], "little")
         regs.append(EmuReg(
             name=name, value=value, width=width,
-            is_pc=bool(rflags & REG_FLAG_PC),
-            is_sp=bool(rflags & REG_FLAG_SP),
+            is_pc=bool(rflags & REG_ROLE_PC),
+            is_sp=bool(rflags & REG_ROLE_SP),
         ))
         off = voff + pad8(width)
-    return EmuThread(tid=tid, is_current=bool(flags & THREAD_FLAG_CURRENT),
+    return EmuThread(tid=tid, is_current=bool(flags & TC_FLAG_CURRENT),
                      arch=arch, registers=regs)
 
 

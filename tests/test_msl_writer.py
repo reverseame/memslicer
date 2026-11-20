@@ -1,5 +1,6 @@
 """Tests for MSL writer - verifies binary format correctness."""
 import io
+import logging
 import struct
 import uuid
 
@@ -7,17 +8,12 @@ import blake3
 import pytest
 
 from memslicer.msl.constants import (
-    BLOCK_HEADER_SIZE,
-    BLOCK_MAGIC,
-    FILE_MAGIC,
-    HEADER_SIZE,
-    ArchType,
-    BlockType,
-    OSType,
-    PageState,
-    RegionType,
+    FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE,
+    BlockType, CompAlgo, OSType, ArchType, PageState, RegionType,
 )
-from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry
+from memslicer.msl.types import (
+    FileHeader, MemoryRegion, ModuleEntry, ConnectionEntry, HandleEntry,
+)
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.timestamps import now_ns
 
@@ -26,7 +22,7 @@ from memslicer.utils.timestamps import now_ns
 def header():
     return FileHeader(
         endianness=1,
-        version=(1, 0),
+        version=(1, 1),
         flags=0,
         cap_bitmap=0x03,
         dump_uuid=uuid.uuid4().bytes,
@@ -50,7 +46,7 @@ class TestMinimalMSL:
 
     def test_header_size_64(self, header):
         buf = io.BytesIO()
-        MSLWriter(buf, header)
+        writer = MSLWriter(buf, header)
         # Before finalize, header is already written
         assert buf.tell() == HEADER_SIZE
 
@@ -76,9 +72,9 @@ class TestMinimalMSL:
         writer.finalize()
 
         data = buf.getvalue()
-        # Version is uint16 LE with major in high byte: v1.0 = 0x0100 → LE bytes [0x00, 0x01]
+        # Version is uint16 LE with major in high byte: v1.1 = 0x0101 → LE bytes [0x01, 0x01]
         version = struct.unpack_from("<H", data, 10)[0]
-        assert version == 0x0100  # major=1, minor=0
+        assert version == 0x0101  # major=1, minor=1
 
     def test_eoc_block_starts_at_64(self, header):
         buf = io.BytesIO()
@@ -274,6 +270,50 @@ class TestIntegrityChain:
         assert data[prev_hash_1_offset:prev_hash_1_offset + 32] == blake3.blake3(block0_bytes).digest()
 
 
+class TestPageDataLengthValidation:
+    """Spec Table 24: page data is exactly PageSize bytes per Captured page."""
+
+    def _region(self, states: list[PageState], data: bytes) -> MemoryRegion:
+        return MemoryRegion(
+            base_addr=0x1000,
+            region_size=len(states) * 4096,
+            protection=1,
+            region_type=RegionType.Anon,
+            page_size=4096,
+            timestamp_ns=now_ns(),
+            page_states=states,
+            page_data_chunks=[data],
+        )
+
+    def test_exact_data_is_accepted(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region(
+            [PageState.CAPTURED, PageState.FAILED, PageState.CAPTURED],
+            b"\xa5" * (2 * 4096),
+        )
+        writer.write_memory_region(region)
+
+    def test_trailing_partial_page_is_rejected(self, header):
+        """The shape the Android capture produced: four Captured pages but
+        0x500 bytes short of four pages of data."""
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.CAPTURED] * 4, b"\xa5" * (0x4000 - 0x500))
+        with pytest.raises(ValueError, match="does not match 4 captured pages"):
+            writer.write_memory_region(region)
+
+    def test_surplus_data_is_rejected(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.CAPTURED], b"\xa5" * (4096 + 1))
+        with pytest.raises(ValueError, match="page_data length"):
+            writer.write_memory_region(region)
+
+    def test_data_for_a_failed_page_is_rejected(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.FAILED], b"\xa5" * 4096)
+        with pytest.raises(ValueError, match="0 captured pages"):
+            writer.write_memory_region(region)
+
+
 class TestPageSizeLog2Validation:
     """Test PageSizeLog2 validation in write_memory_region."""
 
@@ -343,3 +383,113 @@ class TestPageSizeLog2Validation:
         writer.write_memory_region(region)
         writer.finalize()
         assert buf.tell() > HEADER_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Per-row drop guard for ConnectionTable / HandleTable (GitHub issue #3)
+# ---------------------------------------------------------------------------
+
+
+def _first_block_payload(buf: io.BytesIO) -> tuple[int, bytes]:
+    """Return ``(block_type, payload)`` of the first block after the header."""
+    data = buf.getvalue()
+    magic, btype, _flags, block_len = struct.unpack_from("<4sHHI", data, HEADER_SIZE)
+    assert magic == BLOCK_MAGIC
+    payload = data[HEADER_SIZE + BLOCK_HEADER_SIZE:HEADER_SIZE + block_len]
+    return btype, payload
+
+
+_HANDLE_FIXED = struct.Struct("<IIB1sH4s")
+
+
+def _parse_handle_entries(payload: bytes) -> list[tuple[int, int, int, str]]:
+    """Parse HandleTable entries into ``(pid, fd, handle_type, path)``."""
+    entry_count, _reserved = struct.unpack_from("<II", payload, 0)
+    offset = 8
+    out = []
+    for _ in range(entry_count):
+        pid, fd, htype, _r, path_len, _r2 = _HANDLE_FIXED.unpack_from(payload, offset)
+        offset += _HANDLE_FIXED.size
+        path = payload[offset:offset + path_len].rstrip(b"\x00").decode("utf-8")
+        offset += (path_len + 7) & ~7
+        out.append((pid, fd, htype, path))
+    return out
+
+
+class TestHandleTableDropGuard:
+    """HandleTable.FD is uint32: a collector sentinel of -1 used to abort
+    every macOS ``-I`` capture at the handle table."""
+
+    def test_negative_fd_is_dropped_and_logged(self, header, caplog):
+        handles = [
+            HandleEntry(pid=1, fd=-1, handle_type=0x02, path="/Users/user"),
+            HandleEntry(pid=1, fd=3, handle_type=0x01, path="/tmp/data.txt"),
+        ]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_handle_table(handles, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+        btype, payload = _first_block_payload(buf)
+        assert btype == BlockType.HandleTable
+        entries = _parse_handle_entries(payload)
+        assert entries == [(1, 3, 0x01, "/tmp/data.txt")]
+        assert "HandleTable: dropping row pid 1 fd -1" in caplog.text
+
+    def test_fd_all_ones_sentinel_packs(self, header):
+        handles = [HandleEntry(pid=1, fd=0xFFFFFFFF, handle_type=0x02, path="/")]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        writer.write_handle_table(handles, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+        _, payload = _first_block_payload(buf)
+        entries = _parse_handle_entries(payload)
+        assert entries == [(1, 0xFFFFFFFF, 0x02, "/")]
+
+    def test_entry_count_zero_when_every_row_dropped(self, header, caplog):
+        handles = [HandleEntry(pid=1, fd=-1), HandleEntry(pid=1, fd=-2)]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_handle_table(handles, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+        _, payload = _first_block_payload(buf)
+        entry_count, _ = struct.unpack_from("<II", payload, 0)
+        assert entry_count == 0
+        assert len(payload) == 8
+        assert caplog.text.count("dropping row") == 2
+
+
+class TestConnectionTableDropGuard:
+    _ENTRY_SIZE = struct.calcsize("<IBBB1s 16s H2s 16s H2s")
+
+    def test_port_out_of_range_is_dropped_and_count_matches(self, header, caplog):
+        connections = [
+            ConnectionEntry(pid=10, local_port=70000),   # > uint16
+            ConnectionEntry(pid=11, local_port=8080),
+        ]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_connection_table(connections, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+        btype, payload = _first_block_payload(buf)
+        assert btype == BlockType.ConnectionTable
+        entry_count, _ = struct.unpack_from("<II", payload, 0)
+        assert entry_count == 1
+        assert len(payload) == 8 + self._ENTRY_SIZE
+        pid, = struct.unpack_from("<I", payload, 8)
+        assert pid == 11
+        assert "ConnectionTable: dropping row pid 10 local_port 70000" in caplog.text
+
+    def test_valid_rows_are_untouched(self, header, caplog):
+        connections = [ConnectionEntry(pid=1, local_port=1), ConnectionEntry(pid=2, local_port=65535)]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_connection_table(connections, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+        _, payload = _first_block_payload(buf)
+        entry_count, _ = struct.unpack_from("<II", payload, 0)
+        assert entry_count == 2
+        assert "dropping row" not in caplog.text

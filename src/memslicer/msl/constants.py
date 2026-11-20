@@ -7,6 +7,12 @@ from enum import IntEnum
 # ---------------------------------------------------------------------------
 FILE_MAGIC: bytes = b"MEMSLICE"   # 8 bytes
 BLOCK_MAGIC: bytes = b"MSLC"     # 4 bytes
+# Sealed extension segment header magic (spec Section 10.8, Table 27a).
+# The spec writes it as 0x4D534C53 ("MSLS"), the same convention as
+# BLOCK_MAGIC (0x4D534C43, "MSLC"): the hex value is the ASCII bytes read
+# in file order, so the on-disk bytes are 4D 53 4C 53 = b"MSLS" (NOT a
+# little-endian u32 pack of 0x4D534C53, which would write "SLSM").
+SEAL_MAGIC: bytes = b"MSLS"      # 4 bytes
 
 # ---------------------------------------------------------------------------
 # Sizes
@@ -14,7 +20,39 @@ BLOCK_MAGIC: bytes = b"MSLC"     # 4 bytes
 HEADER_SIZE: int = 64
 ENCRYPTED_HEADER_SIZE: int = 128
 BLOCK_HEADER_SIZE: int = 80
+SEAL_HEADER_SIZE: int = 64        # sealed segment header (spec Table 27a)
 HASH_SIZE: int = 32
+
+# ---------------------------------------------------------------------------
+# Page geometry
+# ---------------------------------------------------------------------------
+# A region header stores only PageSizeLog2, in one byte, and the page-state map
+# is sized to match it. The format therefore admits exactly the page sizes that
+# are powers of two within this range.
+PAGE_SIZE_LOG2_MIN: int = 10
+PAGE_SIZE_LOG2_MAX: int = 40
+
+
+def valid_page_size(value: int) -> bool:
+    """Whether *value* is a page size this format can represent.
+
+    The rule belongs to the format, so it lives here rather than with any one
+    producer. Acquisition backends use it to reject a probe that answered
+    something impossible; :mod:`memslicer.msl.writer` enforces it on the way
+    out. Both consult this function so the two cannot drift -- a widened range
+    that only the writer knew about would leave backends discarding page sizes
+    the format had started accepting.
+
+    Args:
+        value: Candidate page size in bytes.
+
+    Returns:
+        ``True`` when *value* is a power of two whose base-2 logarithm lies in
+        ``[PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX]``.
+    """
+    if value <= 0 or (value & (value - 1)) != 0:
+        return False
+    return PAGE_SIZE_LOG2_MIN <= value.bit_length() - 1 <= PAGE_SIZE_LOG2_MAX
 
 # ---------------------------------------------------------------------------
 # Block flags
@@ -37,23 +75,6 @@ FLAG_REDACTED: int = 0x0008        # bit 3
 # Format version
 # ---------------------------------------------------------------------------
 VERSION: tuple[int, int] = (1, 1)
-
-# ---------------------------------------------------------------------------
-# Thread Context flags (spec Section 5.7)
-# ---------------------------------------------------------------------------
-# Thread-level Flags field (Table 19a)
-THREAD_FLAG_CURRENT: int = 0x0001    # bit 0: resumption thread (PC of interest)
-THREAD_FLAG_CRASHED: int = 0x0002    # bit 1
-THREAD_FLAG_SUSPENDED: int = 0x0004  # bit 2: registers read from a stopped thread
-THREAD_FLAG_PARTIAL: int = 0x0008    # bit 3: register file incomplete
-
-# Per-register Flags field (Table 19b)
-REG_FLAG_PC: int = 0x0001     # bit 0: program counter
-REG_FLAG_SP: int = 0x0002     # bit 1: stack pointer
-REG_FLAG_FP: int = 0x0004     # bit 2: frame pointer
-REG_FLAG_FLAGS: int = 0x0008  # bit 3: flags/status register
-REG_FLAG_TLS: int = 0x0010    # bit 4: thread pointer / TLS base
-REG_FLAG_LR: int = 0x0020     # bit 5: link register
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +149,7 @@ class BlockType(IntEnum):
     PhysicalMemoryMap = 0x0059
     ModuleBuildIdManifest = 0x005A
     RegionOmissionManifest = 0x005B
+    # Terminator of an extension segment (spec Section 4.6).
     EndOfExtension = 0x0FFE
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
@@ -135,17 +157,17 @@ class BlockType(IntEnum):
     AnalysisFindings = 0x1B70   # spec 1.1.2, Section 5.12: schema-tagged JSON, extension segments only
 
 
-class ThreadState(IntEnum):
-    """Scheduling state of a captured thread (spec Section 5.7, Table 19a)."""
-
-    Unknown = 0x00
-    Running = 0x01
-    Sleeping = 0x02
-    Stopped = 0x03
-    Waiting = 0x04
-    Uninterruptible = 0x05
-    Halted = 0x06
-    Zombie = 0x07
+# ---------------------------------------------------------------------------
+# Extension segments (spec Section 4.6)
+# ---------------------------------------------------------------------------
+# Evidence block types that MUST NOT appear inside an extension segment: the
+# capture segment is the evidence, a segment appended later may only carry
+# derived views (manifests, key hints, structural blocks).
+EXTENSION_FORBIDDEN_TYPES: frozenset[int] = frozenset(
+    {0x0001, 0x0002, 0x0030, 0x0040, 0x0FFF}
+    | set(range(0x0010, 0x0016))
+    | set(range(0x0050, 0x0059))
+)
 
 
 class CompAlgo(IntEnum):
@@ -162,6 +184,58 @@ class PageState(IntEnum):
     CAPTURED = 0
     FAILED = 1
     UNMAPPED = 2
+    # Mapped anonymous page that was never touched at read time: its
+    # content is zero and it contributes 0 bytes of PageData, exactly
+    # like FAILED / UNMAPPED. Spec Table 24 amendment pending; readers
+    # MUST treat this value as a 0-byte state rather than reject it.
+    NOT_RESIDENT = 3
+
+
+class OmissionReason(IntEnum):
+    """Why the acquirer deliberately skipped a region (Block 0x005B).
+
+    Values 3 and above are reserved for future reasons.
+    """
+
+    MODULE_EXCLUDE = 1
+    SCOPE = 2
+
+
+class VasNameSource(IntEnum):
+    """How a VAS Map entry's MappedPath was obtained (spec Section 5.8)."""
+
+    UNSPECIFIED = 0      # consumer infers: capture segment of a live file -> LIVE
+    LIVE = 1             # enumerated from the running target
+    SOURCE_METADATA = 2  # taken from an imported source format's metadata
+    SYNTHESIZED = 3      # derived by a tool, not reported by the target
+
+
+class ThreadState(IntEnum):
+    """Scheduler state of a thread (Thread Context block, spec Table 19a)."""
+
+    UNKNOWN = 0
+    RUNNING = 1
+    SLEEPING = 2
+    STOPPED = 3
+    WAITING = 4
+    UNINTERRUPTIBLE = 5
+    HALTED = 6
+    ZOMBIE = 7
+
+
+# Thread Context ``Flags`` bits (spec Table 19a).
+TC_FLAG_CURRENT: int = 0x0001    # thread that triggered the capture
+TC_FLAG_CRASHED: int = 0x0002    # thread that faulted
+TC_FLAG_SUSPENDED: int = 0x0004  # registers read from a stopped thread
+TC_FLAG_PARTIAL: int = 0x0008    # register set is incomplete
+
+# Thread register ``Flags`` role bits (spec Table 19b).
+REG_ROLE_PC: int = 0x0001     # program counter
+REG_ROLE_SP: int = 0x0002     # stack pointer
+REG_ROLE_FP: int = 0x0004     # frame pointer
+REG_ROLE_FLAGS: int = 0x0008  # status / flags register
+REG_ROLE_TLS: int = 0x0010    # thread pointer / TLS base
+REG_ROLE_LR: int = 0x0020     # link register
 
 
 class RegionType(IntEnum):

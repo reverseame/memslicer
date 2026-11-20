@@ -46,6 +46,36 @@ def _make_mock_lldb():
     return mock_lldb, mock_debugger, mock_target, mock_process
 
 
+def _skipped_preflight():
+    """Build a real, skipped-and-ok PreflightResult for a mocked attach.
+
+    A genuine :class:`PreflightResult` rather than a MagicMock, so
+    ``probable_cause()`` still returns a plain string when ``connect()``
+    consults it.
+    """
+    from memslicer.acquirer.attach_preflight import (
+        AttachEnvironment, PreflightResult,
+    )
+
+    return PreflightResult(env=AttachEnvironment(skip_reason="not-linux"))
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_attach_preflight():
+    """Keep the shared attach preflight out of every mocked connect().
+
+    The tests attach to PID 1234, which does not exist. On macOS the cheap
+    gate in ``attach_preflight`` short-circuits on ``not-linux``, but on a
+    Linux runner the real preflight would inspect ``/proc/1234`` and refuse.
+    Individual tests may still patch the same name to assert on refusals.
+    """
+    with patch(
+        "memslicer.acquirer.lldb_bridge.enforce_attach_preflight",
+        return_value=_skipped_preflight(),
+    ):
+        yield
+
+
 def _create_and_connect(target=1234):
     """Create an LLDBBridge instance, mock lldb, and call connect().
 
@@ -53,6 +83,7 @@ def _create_and_connect(target=1234):
     """
     mock_lldb, mock_debugger, mock_target, mock_process = _make_mock_lldb()
 
+    # The preflight is already neutralised module-wide by the autouse fixture.
     with patch.dict(sys.modules, {"lldb": mock_lldb}):
         from memslicer.acquirer.lldb_bridge import LLDBBridge
 
@@ -739,3 +770,1254 @@ class TestLLDBBridgePreflightChecks:
             bridge._check_ptrace_scope()
 
         bridge._log.warning.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Helpers -- read_memory_ex
+# ---------------------------------------------------------------------------
+
+def _set_read_outcome(mock_lldb, mock_process, *, success, data, detail=""):
+    """Point the shared SBError and ReadMemory at one canned read outcome."""
+    error = MagicMock()
+    error.Success.return_value = success
+    error.GetCString.return_value = detail
+    mock_lldb.SBError.return_value = error
+    mock_process.ReadMemory.return_value = data
+    return error
+
+
+def _set_region_query_failed(mock_process):
+    """Make GetMemoryRegionInfo report that it could not answer."""
+    err = MagicMock()
+    err.Fail.return_value = True
+    mock_process.GetMemoryRegionInfo.return_value = err
+
+
+def _set_region(
+    mock_lldb, mock_process, *, mapped=True, readable=True, base=0, end=0,
+):
+    """Make GetMemoryRegionInfo answer with a single canned region."""
+    region = MagicMock()
+    region.IsMapped.return_value = mapped
+    region.IsReadable.return_value = readable
+    region.GetRegionBase.return_value = base
+    region.GetRegionEnd.return_value = end
+    mock_lldb.SBMemoryRegionInfo.return_value = region
+
+    err = MagicMock()
+    err.Fail.return_value = False
+    mock_process.GetMemoryRegionInfo.return_value = err
+    return region
+
+
+# ---------------------------------------------------------------------------
+# Tests -- read_memory_ex: whole reads and short reads
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeReadMemoryExLength:
+    """Tests for the all-or-nothing length contract of read_memory_ex()."""
+
+    def test_full_read_returns_the_span(self):
+        """A complete read yields the bytes and reports no fault."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        expected = b"\xde\xad\xbe\xef" * 4
+        _set_read_outcome(
+            mock_lldb, mock_process, success=True, data=expected,
+        )
+
+        result = bridge.read_memory_ex(0x140000, 16)
+
+        assert result.data == expected
+        assert result.fault_addr is None
+        assert result.error == ""
+        assert bridge.read_memory(0x140000, 16) == expected
+
+    def test_page_aligned_short_read_reports_no_boundary(self):
+        """A page-aligned partial is not evidence of a map edge.
+
+        LLDB accumulates reads in chunks of its maximum packet size, which is
+        itself a multiple of the page size, so a transport truncation lands on
+        a page boundary just as a real map edge does. Trusting it marks a page
+        FAILED that the caller then never attempts -- measured at two readable
+        pages lost per truncation.
+        """
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        bridge._platform_info = PlatformInfo(
+            arch=ArchType.x86_64, os=OSType.macOS, pid=9999, page_size=4096,
+        )
+        _set_region_query_failed(mock_process)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=True, data=b"\x00" * 4096,
+        )
+
+        result = bridge.read_memory_ex(0x140000, 8192)
+
+        assert result.data is None
+        assert result.fault_addr is None
+        assert result.error == "short read: 4096/8192 bytes"
+
+    def test_unaligned_short_read_reports_no_boundary(self):
+        """A partial that stops mid-page is a truncation, not a map edge."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        bridge._platform_info = PlatformInfo(
+            arch=ArchType.x86_64, os=OSType.macOS, pid=9999, page_size=4096,
+        )
+        _set_region_query_failed(mock_process)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=True, data=b"\x00" * 100,
+        )
+
+        result = bridge.read_memory_ex(0x140000, 8192)
+
+        assert result.data is None
+        assert result.fault_addr is None
+
+
+# ---------------------------------------------------------------------------
+# Tests -- read_memory_ex: region-info derived fault addresses
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeReadMemoryExRegionInfo:
+    """Tests for fault addresses derived from SBMemoryRegionInfo."""
+
+    def test_unmapped_region_reports_no_boundary(self):
+        """A wholly unreadable region leaves no readable prefix to salvage.
+
+        Naming the span start as the fault makes the caller re-ask for the
+        whole shrinking remainder once per page: 538 MB requested against 4 MB
+        for the same zero bytes captured. Saying nothing reads it page by page.
+        """
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(mock_lldb, mock_process, mapped=False, end=0x9000)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 0x2000)
+
+        assert result.data is None
+        assert result.fault_addr is None
+
+    def test_unreadable_region_reports_no_boundary(self):
+        """A mapped but unreadable region is the same case as an unmapped one."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(
+            mock_lldb, mock_process, mapped=True, readable=False, end=0x9000,
+        )
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 0x2000)
+
+        assert result.fault_addr is None
+
+    def test_region_ending_inside_the_span_reports_its_end(self):
+        """A readable region that stops short of the span names the boundary."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(mock_lldb, mock_process, end=0x2000)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 0x2000)
+
+        assert result.fault_addr == 0x2000
+
+    def test_region_covering_the_span_reports_no_boundary(self):
+        """One readable region across the whole span offers no boundary."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(mock_lldb, mock_process, end=0x9000)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 0x2000)
+
+        assert result.fault_addr is None
+
+    def test_region_query_exception_is_swallowed(self):
+        """A GetMemoryRegionInfo that raises still yields a ReadResult."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        mock_process.GetMemoryRegionInfo.side_effect = RuntimeError(
+            "process is not alive",
+        )
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 4096)
+
+        assert result.data is None
+        assert result.fault_addr is None
+
+
+# ---------------------------------------------------------------------------
+# Tests -- read_memory_ex: error-text fallback
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeReadMemoryExErrorText:
+    """Tests for the fault address scraped from LLDB error text."""
+
+    def test_echoed_request_address_is_discarded(self):
+        """Error text that merely echoes the requested address adds nothing."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region_query_failed(mock_process)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed for 0x1000",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 4096)
+
+        assert result.fault_addr is None
+        assert result.error == "memory read failed for 0x1000"
+
+    def test_interior_address_in_error_text_is_kept(self):
+        """Error text naming an address inside the span is a real boundary."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region_query_failed(mock_process)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="unable to read memory at 0x1800",
+        )
+
+        result = bridge.read_memory_ex(0x1000, 4096)
+
+        assert result.fault_addr == 0x1800
+        assert result.error == "unable to read memory at 0x1800"
+
+    def test_none_error_string_does_not_raise(self):
+        """LLDB returning a null error string still yields usable error text."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region_query_failed(mock_process)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None, detail=None,
+        )
+
+        result = bridge.read_memory_ex(0x1000, 4096)
+
+        assert result.data is None
+        assert result.fault_addr is None
+        assert result.error
+
+
+# ---------------------------------------------------------------------------
+# Tests -- calls made before connect()
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeBeforeConnect:
+    """Tests that an unconnected bridge fails plainly instead of by accident."""
+
+    @staticmethod
+    def _unconnected_bridge():
+        """Build an LLDBBridge that has never been connected."""
+        mock_lldb, *_ = _make_mock_lldb()
+        with patch.dict(sys.modules, {"lldb": mock_lldb}):
+            from memslicer.acquirer.lldb_bridge import LLDBBridge
+
+            return LLDBBridge(target=1234, logger=MagicMock())
+
+    def test_read_memory_ex_reports_the_missing_connect(self):
+        """read_memory_ex returns a ReadResult naming connect() as the fix."""
+        bridge = self._unconnected_bridge()
+
+        result = bridge.read_memory_ex(0x1000, 4096)
+
+        assert result.data is None
+        assert result.fault_addr is None
+        assert "connect" in result.error
+
+    def test_read_memory_returns_none(self):
+        """read_memory degrades to None rather than raising."""
+        bridge = self._unconnected_bridge()
+
+        assert bridge.read_memory(0x1000, 4096) is None
+
+    def test_enumerate_ranges_raises_runtime_error(self):
+        """enumerate_ranges raises RuntimeError, not AttributeError."""
+        bridge = self._unconnected_bridge()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            bridge.enumerate_ranges()
+
+    def test_enumerate_modules_raises_runtime_error(self):
+        """enumerate_modules raises RuntimeError, not AttributeError."""
+        bridge = self._unconnected_bridge()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            bridge.enumerate_modules()
+
+
+# ---------------------------------------------------------------------------
+# Tests -- attach preflight
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeAttachPreflight:
+    """connect() runs the shared attach preflight before touching the target."""
+
+    def test_refusal_propagates_and_never_attaches(self):
+        """A preflight refusal aborts connect() before AttachToProcessWithID."""
+        from memslicer.acquirer.errors import AttachPreflightError
+
+        mock_lldb, _dbg, mock_target, _proc = _make_mock_lldb()
+        refusal = AttachPreflightError(
+            "cannot attach to PID 1234: Yama ptrace_scope is 3",
+            remediation=["reboot with kernel.yama.ptrace_scope=0"],
+        )
+
+        with patch.dict(sys.modules, {"lldb": mock_lldb}), \
+             patch("memslicer.acquirer.lldb_bridge.enforce_attach_preflight",
+                   side_effect=refusal):
+            from memslicer.acquirer.lldb_bridge import LLDBBridge
+
+            bridge = LLDBBridge(target=1234, logger=MagicMock())
+            with pytest.raises(AttachPreflightError) as excinfo:
+                bridge.connect()
+
+        assert excinfo.value is refusal
+        mock_target.AttachToProcessWithID.assert_not_called()
+        assert bridge._process is None
+
+
+class TestLLDBBridgeRegionCache:
+    """Region lookups are a round trip to the debug server, so they are cached."""
+
+    def test_repeated_failures_in_one_region_query_it_once(self):
+        """A span degrading to page-by-page reads must not re-ask per page."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+        _set_read_outcome(mock_lldb, mock_process, success=False, data=None)
+        _set_region(
+            mock_lldb, mock_process, readable=True, base=0x1000, end=0x2000,
+        )
+
+        for offset in range(0, 0x1000, 0x400):
+            bridge.read_memory_ex(0x1000 + offset, 0x4000)
+
+        assert mock_process.GetMemoryRegionInfo.call_count == 1
+
+    def test_address_outside_the_cached_region_is_re_queried(self):
+        """The cache holds one region, so leaving it must miss."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+        _set_read_outcome(mock_lldb, mock_process, success=False, data=None)
+        _set_region(
+            mock_lldb, mock_process, readable=True, base=0x1000, end=0x2000,
+        )
+
+        bridge.read_memory_ex(0x1000, 0x4000)
+        bridge.read_memory_ex(0x9000, 0x4000)
+
+        assert mock_process.GetMemoryRegionInfo.call_count == 2
+
+
+class TestLLDBBridgeRegionContainment:
+    """A region answer is only evidence about addresses it contains."""
+
+    def test_region_not_containing_the_address_is_rejected(self):
+        """A stub answering with the next region, or a degenerate empty one,
+        must not be read as proof about the address that was asked about."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(
+            mock_lldb, mock_process, mapped=False, base=0, end=0,
+        )
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+            detail="memory read failed",
+        )
+
+        result = bridge.read_memory_ex(0xDEADBEEF000, 0x2000)
+
+        assert result.fault_addr is None
+
+    def test_non_containing_answer_is_not_cached(self):
+        """A rejected answer must not be stored, or the cache goes dead."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        _set_region(mock_lldb, mock_process, base=0, end=0)
+        _set_read_outcome(
+            mock_lldb, mock_process, success=False, data=None,
+        )
+
+        bridge.read_memory_ex(0xDEADBEEF000, 0x2000)
+
+        assert bridge._region_cache is None
+
+
+class TestLLDBBridgeDisconnectClearsState:
+    """Nothing that describes the old process may outlive the detach."""
+
+    def test_enumerate_modules_refuses_after_disconnect(self):
+        """The target belongs to a destroyed debugger; calling into it would
+        report "no modules" rather than refusing."""
+        bridge, _lldb, _dbg, _tgt, _proc = _create_and_connect()
+
+        bridge.disconnect()
+
+        with pytest.raises(RuntimeError, match="connect"):
+            bridge.enumerate_modules()
+
+    def test_region_cache_is_dropped_on_disconnect(self):
+        """A reused bridge must not answer from the old process's map."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+        _set_region(mock_lldb, mock_process, base=0x1000, end=0x9000)
+        _set_read_outcome(mock_lldb, mock_process, success=False, data=None)
+        bridge.read_memory_ex(0x1000, 0x2000)
+        assert bridge._region_cache is not None
+
+        bridge.disconnect()
+
+        assert bridge._region_cache is None
+
+
+# ---------------------------------------------------------------------------
+# Tests -- remote platform probing
+# ---------------------------------------------------------------------------
+
+def _connect_remote(
+    remote="192.168.1.5:1234",
+    triple="aarch64-unknown-linux-gnu",
+    shell_outputs=None,
+    shell_fails=False,
+    logger=None,
+    extra_patches=(),
+):
+    """Connect a bridge to a mocked remote platform that answers shells.
+
+    The mock grows two things ``_make_mock_lldb`` does not have: an
+    ``SBPlatformShellCommand`` whose ``GetOutput()`` replays *shell_outputs*
+    keyed by the command text, and a ``Run()`` that hands back an SBError-like
+    object. A command with no entry in *shell_outputs* answers with "" -- the
+    same "nothing came back" a real platform gives for an unsupported probe.
+
+    Returns (bridge, mock_lldb, mock_platform, logger).
+    """
+    mock_lldb, _mock_debugger, mock_target, _mock_process = _make_mock_lldb()
+    mock_target.GetTriple.return_value = triple
+
+    mock_platform = MagicMock()
+    mock_connect_error = MagicMock()
+    mock_connect_error.Fail.return_value = False
+    mock_platform.ConnectRemote.return_value = mock_connect_error
+    mock_lldb.SBPlatform.return_value = mock_platform
+    mock_lldb.SBPlatformConnectOptions.return_value = MagicMock()
+
+    outputs = dict(shell_outputs or {})
+
+    def _build_shell(command):
+        shell = MagicMock()
+        shell.GetOutput.return_value = outputs.get(command, "")
+        return shell
+
+    def _run_shell(_shell):
+        error = MagicMock()
+        error.Fail.return_value = shell_fails
+        error.GetCString.return_value = "shell command unsupported"
+        return error
+
+    mock_lldb.SBPlatformShellCommand.side_effect = _build_shell
+    mock_platform.Run.side_effect = _run_shell
+
+    logger = logger or MagicMock()
+
+    with patch.dict(sys.modules, {"lldb": mock_lldb}):
+        for extra in extra_patches:
+            extra.start()
+        try:
+            from memslicer.acquirer.lldb_bridge import LLDBBridge
+
+            bridge = LLDBBridge(target=1234, remote=remote, logger=logger)
+            bridge.connect()
+        finally:
+            for extra in extra_patches:
+                extra.stop()
+
+    return bridge, mock_lldb, mock_platform, logger
+
+
+def _warned_about(logger, *fragments):
+    """Whether any warning the bridge logged mentions all *fragments*."""
+    for call in logger.warning.call_args_list:
+        text = " ".join(str(arg) for arg in call.args)
+        if all(fragment in text for fragment in fragments):
+            return True
+    return False
+
+
+class TestLLDBBridgeRemotePageSize:
+    """A remote target's page size must come from that target, not this host."""
+
+    def test_page_size_read_from_remote_platform(self):
+        """A 64K-page device recorded as 4096 gets a page-state map that is
+        sixteen times too fine, and nothing in the file says so."""
+        bridge, mock_lldb, _platform, _logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "65536\n"},
+        )
+
+        assert bridge._platform_info.page_size == 65536
+        mock_lldb.SBPlatformShellCommand.assert_any_call("getconf PAGESIZE")
+
+    def test_host_sysconf_is_not_consulted_for_a_remote_target(self):
+        """This machine's page size describes the wrong computer."""
+        host_sysconf = MagicMock(return_value=16384)
+
+        bridge, _lldb, _platform, _logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "65536\n"},
+            extra_patches=(patch("os.sysconf", host_sysconf),),
+        )
+
+        host_sysconf.assert_not_called()
+        assert bridge._platform_info.page_size == 65536
+
+    def test_shell_failure_keeps_the_arch_default_and_warns(self):
+        """A silent fall back to 4096 would look exactly like a real answer."""
+        bridge, _lldb, _platform, logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "65536\n"},
+            shell_fails=True,
+        )
+
+        assert bridge._platform_info.page_size == 4096
+        assert _warned_about(logger, "page size")
+
+    def test_non_numeric_shell_output_is_rejected(self):
+        """A shell echoing 'not found' must not become the page size."""
+        bridge, _lldb, _platform, logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "sh: getconf: not found\n"},
+        )
+
+        assert bridge._platform_info.page_size == 4096
+        assert _warned_about(logger, "page size")
+
+    def test_implausible_page_size_is_rejected(self):
+        """A value that is not a power of two would reach the MSL writer as a
+        PageSizeLog2 no reader can tell is wrong."""
+        bridge, _lldb, _platform, logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "3000\n"},
+        )
+
+        assert bridge._platform_info.page_size == 4096
+        assert _warned_about(logger, "page size")
+
+
+class TestLLDBBridgeRemoteOSRefinement:
+    """The remote OS must be read off the remote /proc, not assumed."""
+
+    def test_android_detected_from_remote_proc_maps(self):
+        """An Android device reported as plain Linux hides the ART caveat the
+        operator needs before trusting the capture."""
+        bridge, _lldb, _platform, logger = _connect_remote(
+            shell_outputs={
+                "getconf PAGESIZE": "4096\n",
+                "head -c 32768 /proc/9999/maps": (
+                    "70000000-70001000 r-xp 00000000 00:00 0 "
+                    "/system/lib64/libart.so\n"
+                ),
+            },
+        )
+
+        assert bridge._platform_info.os == OSType.Android
+        assert _warned_about(logger, "Consider using the Frida backend")
+
+    def test_ios_keeps_the_arm64_default_without_a_shell_round_trip(self):
+        """debugserver serves no platform shell; asking anyway would stall the
+        attach on a connection that can never answer."""
+        bridge, mock_lldb, _platform, _logger = _connect_remote(
+            remote="ios://10.0.0.2:1234",
+            triple="arm64-apple-ios17.0.0",
+        )
+
+        assert bridge._platform_info.page_size == 16384
+        mock_lldb.SBPlatformShellCommand.assert_not_called()
+
+
+class TestLLDBBridgePlatformLifetime:
+    """The SBPlatform exists only for as long as a remote target does."""
+
+    def test_local_bridge_never_holds_a_platform(self):
+        """Without a platform, _platform_shell short-circuits; a stray one
+        would send this host's questions down a channel that does not exist."""
+        bridge, _lldb, _dbg, _tgt, _proc = _create_and_connect()
+
+        assert bridge._platform is None
+
+    def test_remote_bridge_holds_the_connected_platform(self):
+        """connect() must keep the platform; it is the only channel that can
+        answer questions about the remote machine."""
+        bridge, _lldb, mock_platform, _logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "4096\n"},
+        )
+
+        assert bridge._platform is mock_platform
+
+    def test_disconnect_drops_the_platform(self):
+        """The platform's connection went with the destroyed debugger; keeping
+        it would let a reused bridge shell into a dead session."""
+        bridge, _lldb, _platform, _logger = _connect_remote(
+            shell_outputs={"getconf PAGESIZE": "4096\n"},
+        )
+        assert bridge._platform is not None
+
+        bridge.disconnect()
+
+        assert bridge._platform is None
+
+
+# ---------------------------------------------------------------------------
+# Tests -- locating the LLDB Python bindings
+# ---------------------------------------------------------------------------
+
+def _run_results(**by_command):
+    """A subprocess.run stand-in answering per executable name."""
+    def _run(argv, **_kwargs):
+        result = MagicMock()
+        result.stdout = by_command.get(argv[0], "")
+        return result
+    return _run
+
+
+class TestLLDBBindingCandidates:
+    """The bindings must be found wherever the installer actually put them.
+
+    Guessing directory layouts misses the install that `xcode-select --install`
+    produces, so the backend refuses to start on a machine set up exactly the
+    way its own error message recommends.
+    """
+
+    def test_lldb_dash_p_is_asked_first(self):
+        """It is the only source that does not assume a layout."""
+        from memslicer.acquirer.lldb_bridge import _lldb_binding_candidates
+
+        with patch("subprocess.run", _run_results(
+            lldb="/opt/homebrew/opt/llvm/libexec/python3.12/site-packages\n",
+        )):
+            candidates = _lldb_binding_candidates()
+
+        assert candidates[0] == (
+            "/opt/homebrew/opt/llvm/libexec/python3.12/site-packages"
+        )
+
+    def test_command_line_tools_layout_is_covered(self):
+        """CommandLineTools keeps LLDB in PrivateFrameworks and has no
+        Contents/SharedFrameworks at all."""
+        from memslicer.acquirer.lldb_bridge import _lldb_binding_candidates
+
+        with patch("subprocess.run", _run_results(
+            **{"xcode-select": "/Library/Developer/CommandLineTools\n"},
+        )):
+            candidates = _lldb_binding_candidates()
+
+        assert (
+            "/Library/Developer/CommandLineTools/Library/PrivateFrameworks"
+            "/LLDB.framework/Resources/Python"
+        ) in candidates
+
+    def test_full_xcode_layout_is_covered(self):
+        """Xcode puts them a level above the developer directory."""
+        from memslicer.acquirer.lldb_bridge import _lldb_binding_candidates
+
+        with patch("subprocess.run", _run_results(
+            **{"xcode-select": "/Applications/Xcode.app/Contents/Developer\n"},
+        )):
+            candidates = _lldb_binding_candidates()
+
+        assert (
+            "/Applications/Xcode.app/Contents/SharedFrameworks"
+            "/LLDB.framework/Resources/Python"
+        ) in candidates
+
+    def test_warning_line_before_the_path_is_tolerated(self):
+        """Some builds print to stdout before the path; the caller's isdir
+        check picks the real directory out of what is offered."""
+        from memslicer.acquirer.lldb_bridge import _lldb_binding_candidates
+
+        with patch("subprocess.run", _run_results(
+            lldb="warning: something\n/real/bindings\n",
+        )):
+            candidates = _lldb_binding_candidates()
+
+        assert "/real/bindings" in candidates
+
+    def test_missing_tools_yield_no_candidates_rather_than_raising(self):
+        """A machine without lldb or Xcode must produce a clear message, not a
+        FileNotFoundError from the search itself."""
+        from memslicer.acquirer.lldb_bridge import _lldb_binding_candidates
+
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            assert _lldb_binding_candidates() == []
+
+
+class TestEnsureLLDBImportable:
+    """The chosen directory is reported so the caller can explain a failure."""
+
+    def test_already_importable_selects_nothing(self):
+        """Nothing was added, so nothing should be blamed later."""
+        from memslicer.acquirer import lldb_bridge
+
+        with patch.dict(sys.modules, {"lldb": MagicMock()}):
+            assert lldb_bridge._ensure_lldb_importable() is None
+
+    def test_importable_candidate_is_kept_on_sys_path(self):
+        """The directory whose bindings actually load is the one that stays."""
+        from memslicer.acquirer import lldb_bridge
+
+        with patch.object(
+            lldb_bridge, "_lldb_binding_candidates",
+            return_value=["/does/not/exist", "/real/bindings"],
+        ), patch("os.path.isdir", lambda p: p == "/real/bindings"), patch(
+            "importlib.import_module", return_value=MagicMock(),
+        ):
+            original = list(sys.path)
+            try:
+                assert lldb_bridge._ensure_lldb_importable() == "/real/bindings"
+                assert sys.path[0] == "/real/bindings"
+            finally:
+                sys.path[:] = original
+
+    def test_search_continues_past_bindings_that_do_not_load(self):
+        """Homebrew LLVM beside Xcode gives two builds; only one imports into
+        this interpreter, so finding a directory is not the same as being done.
+        """
+        from memslicer.acquirer import lldb_bridge
+
+        attempted: list[str] = []
+
+        def _import(_name):
+            attempted.append(sys.path[0])
+            if sys.path[0] != "/good":
+                raise ImportError("cannot import name '_lldb'")
+            return MagicMock()
+
+        with patch.object(
+            lldb_bridge, "_lldb_binding_candidates",
+            return_value=["/bad", "/good"],
+        ), patch("os.path.isdir", return_value=True), patch(
+            "importlib.import_module", _import,
+        ):
+            original = list(sys.path)
+            try:
+                assert lldb_bridge._ensure_lldb_importable() == "/good"
+                assert attempted == ["/bad", "/good"]
+                # The rejected candidate must not be left behind.
+                assert "/bad" not in sys.path
+            finally:
+                sys.path[:] = original
+
+    def test_none_of_the_candidates_load_reports_the_first_that_existed(self):
+        """That directory is what the error message needs to name."""
+        from memslicer.acquirer import lldb_bridge
+
+        with patch.object(
+            lldb_bridge, "_lldb_binding_candidates",
+            return_value=["/first", "/second"],
+        ), patch("os.path.isdir", return_value=True), patch(
+            "importlib.import_module", side_effect=ImportError("nope"),
+        ):
+            original = list(sys.path)
+            try:
+                assert lldb_bridge._ensure_lldb_importable() == "/first"
+            finally:
+                sys.path[:] = original
+
+    def test_no_existing_candidate_selects_nothing(self):
+        from memslicer.acquirer import lldb_bridge
+
+        with patch.object(
+            lldb_bridge, "_lldb_binding_candidates", return_value=["/nope"],
+        ), patch("os.path.isdir", return_value=False):
+            assert lldb_bridge._ensure_lldb_importable() is None
+
+
+class TestLLDBImportMessage:
+    """Bindings that were never found and bindings that would not load need
+    opposite responses, so the message must tell them apart."""
+
+    def test_not_found_points_at_installation(self):
+        from memslicer.acquirer.lldb_bridge import _lldb_import_message
+
+        message = _lldb_import_message(None, ImportError("No module named 'lldb'"))
+
+        assert "no LLDB Python bindings could be found" in message
+        assert "lldb -P" in message
+
+    def test_found_but_unloadable_points_at_the_interpreter(self):
+        """This is the failure that reads as 'not installed' but is not: the
+        compiled extension only imports into the interpreter it was built for."""
+        from memslicer.acquirer.lldb_bridge import _lldb_import_message
+
+        message = _lldb_import_message(
+            "/Applications/Xcode.app/Contents/SharedFrameworks"
+            "/LLDB.framework/Resources/Python",
+            ImportError("cannot import name '_lldb'"),
+        )
+
+        assert "were found at" in message
+        assert "could not be loaded by this interpreter" in message
+        assert sys.executable in message
+        assert "cannot import name '_lldb'" in message
+
+
+# ---------------------------------------------------------------------------
+# Tests -- page residency
+# ---------------------------------------------------------------------------
+
+def _connect_local_linux(page_size=4096):
+    """Connect a bridge to a mocked *local* Linux target.
+
+    Mirrors ``TestLLDBBridgeLinuxRefinement``: the triple says Linux, sysconf
+    answers *page_size*, and no /proc/<pid>/maps exists to refine from.
+
+    Returns (bridge, mock_process).
+    """
+    mock_lldb, _debugger, mock_target, mock_process = _make_mock_lldb()
+    mock_target.GetTriple.return_value = "x86_64-unknown-linux-gnu"
+
+    with patch.dict(sys.modules, {"lldb": mock_lldb}), \
+         patch("os.sysconf", return_value=page_size), \
+         patch("os.path.isfile", return_value=False):
+        from memslicer.acquirer.lldb_bridge import LLDBBridge
+
+        bridge = LLDBBridge(target=1234, logger=MagicMock())
+        bridge.connect()
+
+    return bridge, mock_process
+
+
+class TestLLDBBridgeResidency:
+    """Residency comes from a local Linux target's /proc/<pid>/pagemap only."""
+
+    def test_local_linux_readable_pagemap_reports_pagemap(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "pagemap"
+
+        # The PID LLDB attached to, not the constructor argument.
+        probe.assert_called_once_with(9999)
+
+    def test_local_linux_unreadable_pagemap_reports_none(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=False,
+        ):
+            assert bridge.residency_method() == "none"
+
+    def test_macos_target_reports_none_without_probing(self):
+        bridge, *_ = _create_and_connect()
+        assert bridge.get_platform_info().os == OSType.macOS
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "none"
+
+        probe.assert_not_called()
+
+    def test_remote_linux_target_reports_none_without_probing(self):
+        """A remote target's /proc lives on the other machine."""
+        bridge, _lldb, _platform, _logger = _connect_remote()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "none"
+
+        probe.assert_not_called()
+
+    def test_before_connect_reports_none(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.residency_method() == "none"
+
+    def test_query_reads_pagemap_with_the_target_page_size(self):
+        bridge, _process = _connect_local_linux(page_size=16384)
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=b"\x01\x00",
+        ) as reader:
+            mask = bridge.query_residency(0x10000, 0x8000)
+
+        assert mask == b"\x01\x00"
+        reader.assert_called_once_with(9999, 0x10000, 0x8000, 16384)
+
+    def test_query_passes_an_unreadable_pagemap_through(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=None,
+        ):
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+    def test_query_macos_returns_none_without_reading(self):
+        bridge, *_ = _create_and_connect()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=b"\x01",
+        ) as reader:
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+        reader.assert_not_called()
+
+    def test_query_before_connect_returns_none(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.query_residency(0x10000, 0x1000) is None
+
+    def test_bridge_satisfies_residency_capable(self):
+        from memslicer.acquirer.bridge import ResidencyCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ResidencyCapable)
+
+
+# ---------------------------------------------------------------------------
+# Tests -- thread stack pointers
+# ---------------------------------------------------------------------------
+
+def _thread_with_sp(sp, valid=True):
+    """A mock SBThread whose frame 0 reports *sp*."""
+    thread = MagicMock()
+    frame = thread.GetFrameAtIndex.return_value
+    frame.IsValid.return_value = valid
+    frame.GetSP.return_value = sp
+    return thread
+
+
+class TestLLDBBridgeStackPointers:
+    """enumerate_stack_pointers() reads frame 0 of every thread."""
+
+    def test_reads_frame_zero_sp_of_every_thread(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        threads = [_thread_with_sp(0x7fff0000), _thread_with_sp(0x7ffe0000)]
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = threads
+
+        assert bridge.enumerate_stack_pointers() == [0x7fff0000, 0x7ffe0000]
+
+        process.GetThreadAtIndex.assert_any_call(0)
+        process.GetThreadAtIndex.assert_any_call(1)
+        for thread in threads:
+            thread.GetFrameAtIndex.assert_called_once_with(0)
+
+    def test_unreadable_sps_are_left_out(self):
+        """Invalid address, zero, a non-int answer and an invalid frame."""
+        from memslicer.acquirer.lldb_bridge import _LLDB_INVALID_ADDRESS
+
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 5
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_sp(0x7fff0000),
+            _thread_with_sp(_LLDB_INVALID_ADDRESS),
+            _thread_with_sp(0),
+            _thread_with_sp(MagicMock()),
+            _thread_with_sp(0x7ffe0000, valid=False),
+        ]
+
+        assert bridge.enumerate_stack_pointers() == [0x7fff0000]
+
+    def test_thread_raising_is_left_out(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            RuntimeError("thread exited"), _thread_with_sp(0x7ffe0000),
+        ]
+
+        assert bridge.enumerate_stack_pointers() == [0x7ffe0000]
+
+    def test_thread_count_failure_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.side_effect = RuntimeError("process gone")
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_non_int_thread_count_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+
+        assert not isinstance(process.GetNumThreads(), int)
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_before_connect_gives_empty(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_after_disconnect_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = _thread_with_sp(0x7fff0000)
+
+        bridge.disconnect()
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_bridge_satisfies_thread_stack_capable(self):
+        from memslicer.acquirer.bridge import ThreadStackCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ThreadStackCapable)
+
+
+def _mock_register(name, value, byte_size):
+    """Build a MagicMock SBValue for one register."""
+    reg = MagicMock()
+    reg.GetName.return_value = name
+    reg.GetByteSize.return_value = byte_size
+    reg.GetValueAsUnsigned.return_value = value
+    return reg
+
+
+def _thread_with_registers(tid, name, regs, *, valid=True):
+    """Build a MagicMock SBThread whose frame 0 carries *regs*.
+
+    *regs* maps a register name to ``(value, byte_size)``; the registers are
+    returned in one register set, in dict order.
+    """
+    thread = MagicMock()
+    thread.GetThreadID.return_value = tid
+    thread.GetName.return_value = name
+    frame = thread.GetFrameAtIndex.return_value
+    frame.IsValid.return_value = valid
+    reg_set = [_mock_register(n, v, size) for n, (v, size) in regs.items()]
+    frame.GetRegisters.return_value = [reg_set]
+    return thread
+
+
+_X86_64_REGS = {
+    "rip": (0x401000, 8), "rsp": (0x7fff0000, 8), "rbp": (0x7fff0100, 8),
+    "rax": (0x2a, 8), "rflags": (0x246, 8), "cs": (0x33, 2),
+}
+
+
+def _registers_readable(mock_lldb):
+    """Make every SBError the bridge creates report success."""
+    mock_lldb.SBError.return_value.Fail.return_value = False
+
+
+class TestLLDBBridgeEnumerateThreads:
+    """enumerate_threads() reads the frame-0 register file of every thread."""
+
+    @staticmethod
+    def _by_name(info):
+        return {r.name: r for r in info.registers}
+
+    def test_reads_registers_of_every_thread(self):
+        from memslicer.msl.constants import (
+            REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_PC, REG_ROLE_SP, ThreadState,
+        )
+
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        second = dict(_X86_64_REGS, rsp=(0x7ffe0000, 8))
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(101, "main", _X86_64_REGS),
+            _thread_with_registers(102, "worker", second),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [101, 102]
+        assert [t.name for t in threads] == ["main", "worker"]
+        assert all(t.suspended is True for t in threads)
+        assert all(t.state == ThreadState.STOPPED for t in threads)
+        assert all(t.partial is False for t in threads)
+        regs = self._by_name(threads[0])
+        assert set(regs) == {"rip", "rsp", "rbp", "rax", "rflags", "cs"}
+        assert regs["rip"].role == REG_ROLE_PC
+        assert regs["rsp"].role == REG_ROLE_SP
+        assert regs["rbp"].role == REG_ROLE_FP
+        assert regs["rflags"].role == REG_ROLE_FLAGS
+        assert regs["rax"].role == 0
+        assert regs["rsp"].value == (0x7fff0000).to_bytes(8, "little")
+        assert regs["rsp"].width == 8
+        assert regs["cs"].value == (0x33).to_bytes(2, "little")
+        assert regs["cs"].width == 2
+        assert threads[1].stack_pointer == 0x7ffe0000
+
+    @staticmethod
+    def _wide_thread(raw_by_name):
+        """A thread with the x86_64 GPRs plus wide registers whose SBData
+        yields *raw_by_name* (``None`` = unreadable)."""
+        sizes = {n: (0, 16 if raw is None else len(raw)) for n, raw in raw_by_name.items()}
+        thread = _thread_with_registers(1, "", dict(_X86_64_REGS, **sizes))
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        for reg in reg_set:
+            if reg.GetName() in raw_by_name:
+                reg.GetData.return_value.ReadRawData.return_value = raw_by_name[reg.GetName()]
+        return thread
+
+    def test_vector_registers_are_captured_at_full_width(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        xmm0 = bytes(range(16))
+        ymm0 = bytes(range(32, 64))
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = self._wide_thread(
+            {"xmm0": xmm0, "ymm0": ymm0},
+        )
+
+        (info,) = bridge.enumerate_threads()
+
+        regs = self._by_name(info)
+        assert regs["xmm0"].width == 16 and regs["xmm0"].value == xmm0
+        assert regs["ymm0"].width == 32 and regs["ymm0"].value == ymm0
+        assert regs["xmm0"].role == 0
+        assert info.partial is False
+
+    def test_unreadable_vector_register_marks_partial(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = self._wide_thread({"xmm0": None})
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "xmm0" not in self._by_name(info)
+        assert "rip" in self._by_name(info)
+        assert info.partial is True
+
+    def test_register_wider_than_table_19b_width_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = self._wide_thread(
+            {"z0": bytes(256)},
+        )
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "z0" not in self._by_name(info)
+        assert info.partial is False
+
+    def test_unreadable_register_is_left_out_and_marks_partial(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        regs = dict(_X86_64_REGS, fs_base=(0x7f00, 8))
+        thread = _thread_with_registers(1, "", regs)
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        fs_base = next(r for r in reg_set if r.GetName() == "fs_base")
+
+        def failing_read(error, default):
+            error.Fail.return_value = True
+            return default
+
+        fs_base.GetValueAsUnsigned.side_effect = failing_read
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = thread
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "fs_base" not in self._by_name(info)
+        assert "rip" in self._by_name(info)
+        assert info.partial is True
+
+    def test_register_without_name_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        regs = dict(_X86_64_REGS, nameless=(0x1, 8))
+        thread = _thread_with_registers(1, "", regs)
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        reg_set[-1].GetName.return_value = None
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = thread
+
+        (info,) = bridge.enumerate_threads()
+
+        assert set(self._by_name(info)) == set(_X86_64_REGS)
+        assert info.partial is False
+
+    def test_thread_without_stack_pointer_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        no_sp = {k: v for k, v in _X86_64_REGS.items() if k != "rsp"}
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(1, "", no_sp),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_invalid_frame_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(1, "", _X86_64_REGS, valid=False),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_thread_raising_is_left_out(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            RuntimeError("thread exited"),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_thread_count_failure_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.side_effect = RuntimeError("process gone")
+
+        assert bridge.enumerate_threads() == []
+
+    def test_non_int_thread_count_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+
+        assert not isinstance(process.GetNumThreads(), int)
+        assert bridge.enumerate_threads() == []
+
+    def test_before_connect_gives_empty(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.enumerate_threads() == []
+
+    def test_after_disconnect_gives_empty(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = _thread_with_registers(
+            1, "", _X86_64_REGS,
+        )
+
+        bridge.disconnect()
+
+        assert bridge.enumerate_threads() == []
+
+    def test_bridge_satisfies_thread_registers_capable(self):
+        from memslicer.acquirer.bridge import ThreadRegistersCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ThreadRegistersCapable)

@@ -6,7 +6,9 @@ these tests build the ``.msl`` by hand (no Frida) and verify the full
 write -> read journey: ``load_slice`` resolves the hint to an absolute address,
 ``load_angr`` stashes it in ``state.globals``, and the CLI selector picks it.
 """
-import io
+import struct
+
+import pytest
 
 from memslicer.msl.writer import MSLWriter
 from memslicer.msl.types import (
@@ -14,8 +16,8 @@ from memslicer.msl.types import (
     KeyHint,
 )
 from memslicer.msl.constants import (
-    ArchType, CapBit, CompAlgo, OSType, PageState, RegionType,
-    REG_FLAG_PC, REG_FLAG_SP, THREAD_FLAG_CURRENT, ThreadState,
+    ArchType, BlockType, CapBit, CompAlgo, OSType, PageState, RegionType,
+    REG_ROLE_PC, REG_ROLE_SP, TC_FLAG_CURRENT, ThreadState,
 )
 from memslicer.emu.loader import load_slice, KeyHintInfo
 
@@ -55,10 +57,10 @@ def _write_slice_with_key_hint(path, *, region_offset=KEY_OFFSET,
             page_states=[PageState.CAPTURED],
             page_data_chunks=[bytes(keypage)]))
         w.write_thread_context(ThreadContext(
-            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=7, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=[
-                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", (0x7ffff000).to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, (0x7ffff000).to_bytes(8, "little")),
             ]))
         ref_uuid = b"\xAB" * 16 if dangling else heap_uuid
         w.write_key_hint(KeyHint(
@@ -151,7 +153,6 @@ def test_no_key_hint_yields_empty_list(tmp_path):
 
 def test_load_angr_stashes_key_hints(tmp_path):
     """load_angr surfaces resolved hints in state.globals["msl_key_hints"]."""
-    import pytest
     pytest.importorskip("angr")
     from memslicer.symbex.angr_loader import load_angr
 
@@ -164,125 +165,135 @@ def test_load_angr_stashes_key_hints(tmp_path):
     assert hints[0].address == expected_addr
 
 
+class _KeyHintBridge:
+    """Minimal bridge: one RW heap page holding a key, plus key events."""
+
+    is_remote = False
+    key_hints_armed = True
+
+    def __init__(self, events):
+        self._events = events
+
+    def connect(self):
+        pass
+
+    def get_platform_info(self):
+        from memslicer.acquirer.bridge import PlatformInfo
+        return PlatformInfo(arch=ArchType.x86_64, os=OSType.Windows,
+                            pid=1234, page_size=PS)
+
+    def enumerate_modules(self):
+        return []
+
+    def enumerate_threads(self):
+        return []
+
+    def enumerate_ranges(self):
+        from memslicer.acquirer.bridge import MemoryRange
+        return [MemoryRange(base=HEAP_VA, size=PS, protection="rw-",
+                            file_path="")]
+
+    def read_memory(self, address, size):
+        # A page of zeros with the key bytes planted at KEY_OFFSET.
+        buf = bytearray(size)
+        if address == HEAP_VA and size >= KEY_OFFSET + KEY_LEN:
+            buf[KEY_OFFSET:KEY_OFFSET + KEY_LEN] = bytes(range(KEY_LEN))
+        return bytes(buf)
+
+    def collect_key_hints(self):
+        return list(self._events)
+
+    def disconnect(self):
+        pass
+
+
+def _acquire(bridge, out):
+    from memslicer.acquirer.engine import AcquisitionEngine
+    from memslicer.acquirer.region_filter import RegionFilter
+
+    AcquisitionEngine(
+        bridge=bridge,
+        region_filter=RegionFilter(skip_no_read=False),
+        capture_registers=False,
+    ).acquire(str(out))
+    return load_slice(str(out))
+
+
+def _cap_bitmap(path) -> int:
+    """CapBitmap as written in the file header (8B at offset 16)."""
+    return struct.unpack_from("<Q", path.read_bytes(), 16)[0]
+
+
 def test_engine_writes_key_hint_from_bridge_event(tmp_path):
     """End-to-end write path (no Frida): a bridge that reports a KeyHintEvent
     inside a captured region makes the engine emit a KeyHint block that the
     reader resolves back to the exact event address."""
-    from memslicer.acquirer.engine import AcquisitionEngine
-    from memslicer.acquirer.bridge import (
-        PlatformInfo, MemoryRange, KeyHintEvent,
-    )
-    from memslicer.acquirer.region_filter import RegionFilter
+    from memslicer.acquirer.bridge import KeyHintEvent
 
     key_addr = HEAP_VA + KEY_OFFSET
-
-    class FakeBridge:
-        is_remote = False
-
-        def connect(self):
-            pass
-
-        def get_platform_info(self):
-            return PlatformInfo(arch=ArchType.x86_64, os=OSType.Windows,
-                                pid=1234, page_size=PS)
-
-        def enumerate_modules(self):
-            return []
-
-        def enumerate_threads(self):
-            return []
-
-        def enumerate_ranges(self):
-            return [MemoryRange(base=HEAP_VA, size=PS, protection="rw-",
-                                file_path="")]
-
-        def read_memory(self, address, size):
-            # A page of zeros with the key bytes planted at KEY_OFFSET.
-            buf = bytearray(size)
-            if address == HEAP_VA and size >= KEY_OFFSET + KEY_LEN:
-                buf[KEY_OFFSET:KEY_OFFSET + KEY_LEN] = bytes(range(KEY_LEN))
-            return bytes(buf)
-
-        def collect_key_hints(self):
-            return [KeyHintEvent(address=key_addr, length=KEY_LEN,
-                                 api="BCryptGenerateSymmetricKey")]
-
-        def disconnect(self):
-            pass
-
+    events = [KeyHintEvent(address=key_addr, length=KEY_LEN,
+                           api="BCryptGenerateSymmetricKey")] * 3
     out = tmp_path / "captured.msl"
-    engine = AcquisitionEngine(
-        bridge=FakeBridge(),
-        region_filter=RegionFilter(skip_no_read=False),
-        capture_threads=False,
-    )
-    engine.acquire(str(out))
+    image = _acquire(_KeyHintBridge(events), out)
 
-    image = load_slice(str(out))
-    assert len(image.key_hints) == 1
+    assert len(image.key_hints) == 1          # duplicates collapsed
     hint = image.key_hints[0]
     assert hint.address == key_addr           # resolved to the real address
     assert hint.key_len == KEY_LEN
     assert hint.confidence == 0x02            # Confirmed (live API call)
     assert "BCryptGenerateSymmetricKey" in hint.note
+    assert _cap_bitmap(out) & (1 << CapBit.CryptoHints)
+
+
+def test_engine_without_armed_hooks_writes_no_key_hint(tmp_path):
+    """No armed hooks: no KeyHint block and the CryptoHints bit stays clear,
+    even if the bridge would report events."""
+    from memslicer.acquirer.bridge import KeyHintEvent
+
+    bridge = _KeyHintBridge([KeyHintEvent(address=HEAP_VA, length=16)])
+    bridge.key_hints_armed = False
+    out = tmp_path / "captured.msl"
+    image = _acquire(bridge, out)
+
+    assert image.key_hints == []
+    assert not _cap_bitmap(out) & (1 << CapBit.CryptoHints)
 
 
 def test_engine_skips_key_hint_outside_captured_regions(tmp_path):
     """A key event whose address is not inside any captured region produces
     no KeyHint block (no false hint at a bogus location)."""
-    from memslicer.acquirer.engine import AcquisitionEngine
-    from memslicer.acquirer.bridge import (
-        PlatformInfo, MemoryRange, KeyHintEvent,
-    )
-    from memslicer.acquirer.region_filter import RegionFilter
+    from memslicer.acquirer.bridge import KeyHintEvent
 
-    class FakeBridge:
-        is_remote = False
-
-        def connect(self):
-            pass
-
-        def get_platform_info(self):
-            return PlatformInfo(arch=ArchType.x86_64, os=OSType.Windows,
-                                pid=1234, page_size=PS)
-
-        def enumerate_modules(self):
-            return []
-
-        def enumerate_threads(self):
-            return []
-
-        def enumerate_ranges(self):
-            return [MemoryRange(base=HEAP_VA, size=PS, protection="rw-",
-                                file_path="")]
-
-        def read_memory(self, address, size):
-            return bytes(size)
-
-        def collect_key_hints(self):
-            # Address far outside the single captured region.
-            return [KeyHintEvent(address=0xDEAD0000, length=16,
-                                 api="NCryptDeriveKey")]
-
-        def disconnect(self):
-            pass
-
-    out = tmp_path / "captured.msl"
-    engine = AcquisitionEngine(
-        bridge=FakeBridge(),
-        region_filter=RegionFilter(skip_no_read=False),
-        capture_threads=False,
-    )
-    engine.acquire(str(out))
-
-    image = load_slice(str(out))
+    # Address far outside the single captured region.
+    events = [KeyHintEvent(address=0xDEAD0000, length=16, api="NCryptDeriveKey")]
+    image = _acquire(_KeyHintBridge(events), tmp_path / "captured.msl")
     assert image.key_hints == []
+
+
+def test_truncated_key_hint_block_is_skipped(tmp_path, monkeypatch):
+    """A KeyHint block too short for its fixed part is skipped; the rest of
+    the slice still loads."""
+    from memslicer.emu import loader
+
+    p = tmp_path / "keyed.msl"
+    _write_slice_with_key_hint(p)
+    real = loader.iterate_blocks
+
+    def truncating(f):
+        for blk in real(f):
+            if blk.block_type == BlockType.KeyHint:
+                blk.payload = blk.payload[:20]
+            yield blk
+
+    monkeypatch.setattr(loader, "iterate_blocks", truncating)
+    image = load_slice(str(p))
+    assert image.key_hints == []
+    assert len(image.regions) == 2
 
 
 def test_cli_select_key_hint_prefers_confirmed(tmp_path):
     """_select_key_hint picks the resolved, highest-confidence hint."""
     # cli_symbex imports angr/claripy at module load; skip without the extra.
-    import pytest
     pytest.importorskip("angr")
     from memslicer.cli_symbex import _select_key_hint
 
