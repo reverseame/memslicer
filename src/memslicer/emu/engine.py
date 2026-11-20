@@ -163,6 +163,7 @@ class MSLEmulator:
         self._synthetic: list[tuple[int, int]] = []
         self._synthetic_reads: list[tuple[int, int, int]] = []
         self._synthetic_read_count = 0
+        self._synthetic_read_sites: set[int] = set()   # PCs, not capped
         self._max_synthetic_reads = 256
         self._map_memory()
         self._seed_registers()
@@ -212,7 +213,7 @@ class MSLEmulator:
 
         ``_map_memory`` runs before ``_seed_registers``, so at mapping time the
         CPU's SP is still 0 -- the value has to come from the Thread Context.
-        Prefers the ``REG_FLAG_SP``-flagged register, then this architecture's
+        Prefers the ``REG_ROLE_SP``-flagged register, then this architecture's
         SP name, then the same fallback names ``premap_stack_region`` probes on
         the angr side.
         """
@@ -254,12 +255,14 @@ class MSLEmulator:
             return
 
         half_size = (region_size_mb * 1024 * 1024) // 2
-        max_user_addr = (1 << self.bits) - 1
+        # Exclusive top of the user address space; page-aligned so the last
+        # mapped chunk is too (0xFFFFFFFF would not be on 32-bit targets).
+        addr_limit = 1 << self.bits
         if self.bits == 64:
-            max_user_addr = 0x7FFFFFFFFFFF
+            addr_limit = 0x800000000000
 
         start_addr = max(0x10000, (sp_val - half_size) & ~(_UC_PAGE - 1))
-        end_addr = min(max_user_addr, (sp_val + half_size) & ~(_UC_PAGE - 1))
+        end_addr = min(addr_limit, sp_val + half_size) & ~(_UC_PAGE - 1)
         if end_addr <= start_addr:
             return
 
@@ -325,8 +328,9 @@ class MSLEmulator:
             logger.warning(
                 "read of pre-mapped stack the code never wrote at %#x: the value "
                 "is invented zero fill, not captured data", address)
+        pc = uc.reg_read(self._reg_const(self._pc_name))
+        self._synthetic_read_sites.add(pc)
         if len(self._synthetic_reads) < self._max_synthetic_reads:
-            pc = uc.reg_read(self._reg_const(self._pc_name))
             self._synthetic_reads.append((pc, address, size))
 
     # -- provenance of pre-mapped stack -------------------------------------
@@ -337,7 +341,11 @@ class MSLEmulator:
         return list(self._synthetic)
 
     def is_synthetic(self, addr: int) -> bool:
-        """True if *addr* lies in pre-mapped fill rather than captured memory."""
+        """True if *addr* lies in pre-mapped fill rather than captured memory.
+
+        Address-based only: a byte the emulated code later wrote is still
+        reported as synthetic (reads of written pages are not counted by
+        :meth:`synthetic_read_count`, though)."""
         return any(lo <= addr < hi for lo, hi in self._synthetic)
 
     def synthetic_reads(self) -> list[tuple[int, int, int]]:
@@ -352,6 +360,10 @@ class MSLEmulator:
     def synthetic_read_count(self) -> int:
         """Total reads of unwritten pre-mapped stack (not capped)."""
         return self._synthetic_read_count
+
+    def synthetic_read_sites(self) -> int:
+        """Distinct PCs that read unwritten pre-mapped stack (not capped)."""
+        return len(self._synthetic_read_sites)
 
     def _find_free_page(self, size: int) -> int:
         """Return a page-aligned address with *size* bytes free of mapped spans."""

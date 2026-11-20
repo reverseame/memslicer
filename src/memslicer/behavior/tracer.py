@@ -212,8 +212,8 @@ class BehaviorTracer:
         invented = getattr(self.emu, "synthetic_read_count", None)
         if callable(invented):
             self.graph.meta["synthetic_stack_reads"] = invented()
-            self.graph.meta["synthetic_stack_read_sites"] = len(
-                {pc for pc, _, _ in self.emu.synthetic_reads()})
+            self.graph.meta["synthetic_stack_read_sites"] = (
+                self.emu.synthetic_read_sites())
         self.graph.meta["last_pc"] = f"0x{self.emu.pc:x}"
         self.graph.meta["dataflow_edges"] = link_dataflow(self.graph)
         return self.graph

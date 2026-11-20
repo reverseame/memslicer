@@ -6,6 +6,7 @@ from the file header. No Unicorn/Capstone dependency lives here.
 """
 from __future__ import annotations
 
+import logging
 import struct
 from dataclasses import dataclass, field
 
@@ -15,6 +16,8 @@ from memslicer.msl.constants import (
 )
 from memslicer.msl.iterator import iterate_blocks
 from memslicer.utils.padding import pad8
+
+logger = logging.getLogger(__name__)
 
 _REGION_HDR = "<QQBBB5sQ"   # BaseAddr, RegionSize, Protection, RegionType, PageSizeLog2, rsv, Timestamp
 _TC_HDR = "<QQHBBIH6s"       # ThreadID, StartTime, Flags, State, Arch, RegCount, NameLen, rsv
@@ -277,7 +280,12 @@ def load_slice(path: str) -> SliceImage:
             elif blk.block_type == BlockType.ModuleEntry:
                 image.modules.append(_parse_module(blk.payload))
             elif blk.block_type == BlockType.KeyHint:
-                image.key_hints.append(_parse_key_hint(blk.payload))
+                # A KeyHint is advisory: a truncated one is skipped rather
+                # than making the whole slice unloadable.
+                try:
+                    image.key_hints.append(_parse_key_hint(blk.payload))
+                except ValueError as exc:
+                    logger.warning("skipping malformed KeyHint block: %s", exc)
 
         for hint in image.key_hints:
             base = region_base_by_uuid.get(hint.region_uuid)
