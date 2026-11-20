@@ -9,7 +9,7 @@ allow-direct-references = true
 
 [project]
 name = "memslicer"
-version = "0.2.7"
+version = "0.5.2"
 description = "MSL memory dump tool with pluggable debugger backends (Frida, GDB, LLDB)"
 requires-python = ">= 3.10"
 license = "Apache-2.0"
@@ -106,6 +106,7 @@ markers = [
     "requires_linux: skipped unless sys.platform.startswith('linux')",
     "requires_darwin: skipped unless sys.platform == 'darwin'",
     "requires_windows: skipped unless sys.platform == 'win32'",
+    "requires_frida_runtime: skipped unless a local Frida system session is available",
 ]
 
 [tool.hatch.build.targets.wheel]

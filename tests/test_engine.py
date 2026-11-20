@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import struct
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 
-from memslicer.acquirer.bridge import MemoryRange, ModuleInfo, PlatformInfo
-from memslicer.acquirer.engine import AcquisitionEngine, classify_region, volatility_key
+from memslicer.acquirer.base import UnreadableRange
+from memslicer.acquirer.bridge import (
+    MemoryRange, ModuleInfo, PlatformInfo, ReadResult,
+)
+from memslicer.acquirer.engine import (
+    AcquisitionEngine, classify_region, coalesce_unreadable, volatility_key,
+)
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
-    ArchType, CapBit, HEADER_SIZE, OSType, RegionType,
+    ArchType, CapBit, HEADER_SIZE, OSType, PageState, RegionType,
     BLOCK_HEADER_SIZE, BLOCK_MAGIC, BlockType,
 )
-from memslicer.msl.types import ProcessEntry, ConnectionEntry, HandleEntry
+from memslicer.msl.types import (
+    MemoryRegion, ProcessEntry, ConnectionEntry, HandleEntry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +60,51 @@ class TestClassifyRegion:
     def test_unknown_path(self):
         assert classify_region("something") == RegionType.Unknown
 
+    def test_deleted_shared_library_still_image(self):
+        assert classify_region("/x.so (deleted)") == RegionType.Image
+
+    def test_versioned_shared_library_is_image(self):
+        assert classify_region("/usr/lib/x86_64-linux-gnu/libc.so.6") == RegionType.Image
+
+    def test_scudo_anon_label_is_heap(self):
+        assert classify_region("[anon:scudo:primary]") == RegionType.Heap
+
+    def test_libc_malloc_anon_label_is_heap(self):
+        assert classify_region("[anon:libc_malloc]") == RegionType.Heap
+
+    def test_dalvik_main_space_is_heap(self):
+        assert classify_region("[anon:dalvik-main space]") == RegionType.Heap
+
+    def test_stack_and_tls_anon_label_is_stack(self):
+        assert classify_region("[anon:stack_and_tls:123]") == RegionType.Stack
+
+    def test_numbered_stack_is_stack(self):
+        assert classify_region("[stack:4242]") == RegionType.Stack
+
+    def test_dalvik_linear_alloc_is_anon(self):
+        assert classify_region("[anon:dalvik-LinearAlloc]") == RegionType.Anon
+
+    def test_memfd_jit_cache_is_anon(self):
+        assert classify_region("/memfd:jit-cache (deleted)") == RegionType.Anon
+
+    def test_anon_shmem_jit_code_cache_is_anon(self):
+        assert classify_region("[anon_shmem:dalvik-jit-code-cache]") == RegionType.Anon
+
+    def test_memfd_other_is_shared_mem(self):
+        assert classify_region("/memfd:foo (deleted)") == RegionType.SharedMem
+
+    def test_ashmem_is_shared_mem(self):
+        assert classify_region("/dev/ashmem/foo (deleted)") == RegionType.SharedMem
+
+    def test_device_node_is_other(self):
+        assert classify_region("/dev/kgsl-3d0") == RegionType.Other
+
+    def test_anon_inode_is_other(self):
+        assert classify_region("anon_inode:[eventfd]") == RegionType.Other
+
+    def test_vdso_is_other(self):
+        assert classify_region("[vdso]") == RegionType.Other
+
 
 class TestVolatilityKeyOrdering:
     """Tests for volatility_key ensuring correct priority ordering."""
@@ -87,6 +140,35 @@ class TestVolatilityKeyOrdering:
         r1 = MemoryRange(base=0x1000, size=4096, protection="rw-", file_path="")
         r2 = MemoryRange(base=0x2000, size=4096, protection="rw-", file_path="")
         assert volatility_key(r1) < volatility_key(r2)
+
+    def test_rw_dalvik_main_space_priority_zero(self):
+        managed = MemoryRange(
+            base=0x1000, size=4096, protection="rw-",
+            file_path="[anon:dalvik-main space]",
+        )
+        assert volatility_key(managed)[0] == 0
+
+    def test_rw_scudo_primary_priority_zero(self):
+        scudo = MemoryRange(
+            base=0x1000, size=4096, protection="rw-",
+            file_path="[anon:scudo:primary]",
+        )
+        assert volatility_key(scudo)[0] == 0
+
+    def test_rw_named_heaps_sort_before_ro_files(self):
+        managed = MemoryRange(
+            base=0x9000, size=4096, protection="rw-",
+            file_path="[anon:dalvik-main space]",
+        )
+        scudo = MemoryRange(
+            base=0x8000, size=4096, protection="rw-",
+            file_path="[anon:scudo:primary]",
+        )
+        ro_file = MemoryRange(
+            base=0x1000, size=4096, protection="r--", file_path="/data/file",
+        )
+        assert volatility_key(managed) < volatility_key(ro_file)
+        assert volatility_key(scudo) < volatility_key(ro_file)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +233,130 @@ class MockBridge:
     def disconnect(self) -> None:
         self.connected = False
         self.disconnect_count += 1
+
+
+# ---------------------------------------------------------------------------
+# Fault-injecting bridges
+# ---------------------------------------------------------------------------
+
+
+_NO_OVERRIDE = object()
+"""Sentinel meaning "derive the fault address from the bad pages"."""
+
+
+class FaultingBridge(MockBridge):
+    """A MockBridge whose reads fail whenever they touch a "bad" page.
+
+    Only :meth:`read_memory` is exposed, so the engine takes the path it takes
+    for any backend that cannot localise a fault -- one read per page.
+
+    Attributes:
+        bad_pages: Page-aligned addresses that cannot be read.
+        reads: Every ``(address, size)`` the engine asked for, in order.
+    """
+
+    def __init__(
+        self,
+        ranges: list[MemoryRange] | None = None,
+        modules: list[ModuleInfo] | None = None,
+        bad_pages: tuple[int, ...] = (),
+        page_size: int = 4096,
+        fill: bytes = b"\xa5",
+        max_reads: int = 512,
+    ) -> None:
+        super().__init__(ranges=ranges, modules=modules)
+        self.bad_pages = set(bad_pages)
+        self.page_size = page_size
+        self.fill = fill
+        self.max_reads = max_reads
+        self.reads: list[tuple[int, int]] = []
+
+    def first_bad_in(self, address: int, size: int) -> int | None:
+        """Return the first bad page touched by ``[address, address+size)``."""
+        if size <= 0:
+            return None
+        first = address - (address % self.page_size)
+        for page in range(first, address + size, self.page_size):
+            if page in self.bad_pages:
+                return page
+        return None
+
+    def read_memory(self, address: int, size: int) -> bytes | None:
+        self.reads.append((address, size))
+        if len(self.reads) > self.max_reads:
+            raise RuntimeError(
+                f"read budget of {self.max_reads} exhausted — "
+                "the engine is not making forward progress"
+            )
+        if size <= 0 or self.first_bad_in(address, size) is not None:
+            return None
+        return self.fill * size
+
+
+class FaultReportingBridge(FaultingBridge):
+    """A :class:`FaultingBridge` that also implements ``read_memory_ex``.
+
+    Defining the optional capability only on this subclass keeps both bridge
+    shapes — with and without fault reporting — exercised by the suite.
+
+    Attributes:
+        fault_override: ``_NO_OVERRIDE`` to report the real faulting page;
+            ``None`` to report a failure without an address (as a backend that
+            cannot localise the fault would); an int to always report that
+            address, however implausible.
+    """
+
+    def __init__(self, *args, fault_override=_NO_OVERRIDE, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fault_override = fault_override
+
+    def read_memory_ex(self, address: int, size: int) -> ReadResult:
+        data = self.read_memory(address, size)
+        if data is not None:
+            return ReadResult(data=data)
+        if self.fault_override is _NO_OVERRIDE:
+            fault = self.first_bad_in(address, size)
+        else:
+            fault = self.fault_override
+        return ReadResult(
+            data=None,
+            fault_addr=fault,
+            error=(
+                f"access violation accessing 0x{fault:x}"
+                if fault is not None else "read failed"
+            ),
+        )
+
+
+def _read_span(bridge: FaultingBridge, base: int, size: int,
+               page_size: int = 4096, file_path: str = ""):
+    """Drive ``_read_region`` directly and return ``(region, data_size)``."""
+    engine = AcquisitionEngine(bridge)
+    return engine._read_region(base, size, 0x03, file_path, page_size)
+
+
+def _states(*runs: tuple[PageState, int]) -> list[PageState]:
+    """Build a page-state list from ``(state, count)`` runs."""
+    out: list[PageState] = []
+    for state, count in runs:
+        out.extend([state] * count)
+    return out
+
+
+def _make_region(
+    states: list[PageState], base: int = 0x10000, page_size: int = 4096,
+) -> MemoryRegion:
+    """Build a MemoryRegion carrying only the page states under test."""
+    return MemoryRegion(
+        base_addr=base,
+        region_size=len(states) * page_size,
+        protection=0x03,
+        region_type=RegionType.Anon,
+        page_size=page_size,
+        timestamp_ns=0,
+        page_states=list(states),
+        page_data_chunks=[],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -730,3 +936,743 @@ class TestEngineHandleTableFallback:
             result = engine._collect_handle_table(1234)
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Fault-boundary splitting
+# ---------------------------------------------------------------------------
+
+
+PAGE = 4096
+BASE = 0x10000
+REGION_PAGES = 16
+REGION_SIZE = REGION_PAGES * PAGE
+
+
+class TestSplitOnFault:
+    """Reads split at the reported fault boundary instead of degrading to
+    one read per page."""
+
+    def test_single_fault_in_the_middle(self):
+        bad = BASE + 7 * PAGE
+        bridge = FaultReportingBridge(bad_pages=(bad,))
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 7), (PageState.FAILED, 1),
+            (PageState.CAPTURED, 8),
+        )
+        assert data_size == 15 * PAGE
+        # Full read, readable prefix, readable suffix — nothing per-page.
+        assert len(bridge.reads) == 3
+        assert len(bridge.reads) < REGION_PAGES + 1
+
+    def test_fault_at_span_start_issues_no_zero_length_read(self):
+        """With the very first page bad the good prefix is empty, so no read
+        may be issued for it."""
+        bridge = FaultReportingBridge(bad_pages=(BASE,))
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.FAILED, 1), (PageState.CAPTURED, 15),
+        )
+        assert data_size == 15 * PAGE
+        assert all(size > 0 for _addr, size in bridge.reads)
+        assert len(bridge.reads) == 2
+
+    def test_fault_on_last_page(self):
+        bad = BASE + 15 * PAGE
+        bridge = FaultReportingBridge(bad_pages=(bad,))
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 15), (PageState.FAILED, 1),
+        )
+        assert data_size == 15 * PAGE
+        assert len(bridge.reads) == 2
+
+    def test_two_faults_in_one_region(self):
+        bad = (BASE + 3 * PAGE, BASE + 10 * PAGE)
+        bridge = FaultReportingBridge(bad_pages=bad)
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 3), (PageState.FAILED, 1),
+            (PageState.CAPTURED, 6), (PageState.FAILED, 1),
+            (PageState.CAPTURED, 5),
+        )
+        assert data_size == 14 * PAGE
+        assert len(bridge.reads) < REGION_PAGES + 1
+
+    def test_fault_outside_span_degrades_to_page_reads(self):
+        """A nonsensical fault address must not be trusted; the result has to
+        match what the plain page-by-page path produces."""
+        bad = BASE + 7 * PAGE
+        bogus = BASE - 0x100000
+        reporting = FaultReportingBridge(bad_pages=(bad,), fault_override=bogus)
+        plain = FaultingBridge(bad_pages=(bad,))
+
+        region, data_size = _read_span(reporting, BASE, REGION_SIZE)
+        plain_region, plain_size = _read_span(plain, BASE, REGION_SIZE)
+
+        assert region.page_states == plain_region.page_states
+        assert data_size == plain_size
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 7), (PageState.FAILED, 1),
+            (PageState.CAPTURED, 8),
+        )
+
+    def test_no_fault_address_matches_bridge_without_read_memory_ex(self):
+        """Regression guard for the GDB/LLDB bridges, which never report a
+        fault address."""
+        bad = BASE + 7 * PAGE
+        reporting = FaultReportingBridge(bad_pages=(bad,), fault_override=None)
+        plain = FaultingBridge(bad_pages=(bad,))
+
+        region, data_size = _read_span(reporting, BASE, REGION_SIZE)
+        plain_region, plain_size = _read_span(plain, BASE, REGION_SIZE)
+
+        assert region.page_states == plain_region.page_states
+        assert data_size == plain_size
+        assert reporting.reads == plain.reads
+
+    def test_stale_fault_address_still_terminates(self):
+        """A backend that keeps reporting the same address below ``pos`` must
+        not be able to stall the split loop."""
+        bad = BASE + 7 * PAGE
+        bridge = FaultReportingBridge(
+            bad_pages=(bad,), fault_override=BASE, max_reads=200,
+        )
+        outcome: list[object] = []
+
+        def run() -> None:
+            try:
+                outcome.append(_read_span(bridge, BASE, REGION_SIZE))
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome.append(exc)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=30)
+
+        assert not worker.is_alive(), "_read_span_split did not terminate"
+        assert outcome, "worker produced no outcome"
+        assert not isinstance(outcome[0], BaseException), outcome[0]
+        region, _data_size = outcome[0]
+        assert len(region.page_states) == REGION_PAGES
+        assert region.page_states.count(PageState.FAILED) >= 1
+
+
+class TestCoalesceUnreadable:
+    """Contiguous runs of lost pages are reported as address ranges."""
+
+    def test_single_run_of_three_pages(self):
+        region = _make_region(_states(
+            (PageState.CAPTURED, 2), (PageState.FAILED, 3),
+            (PageState.CAPTURED, 1),
+        ))
+
+        ranges = coalesce_unreadable(region)
+
+        assert len(ranges) == 1
+        assert isinstance(ranges[0], UnreadableRange)
+        assert ranges[0].base == BASE + 2 * PAGE
+        assert ranges[0].size == 3 * PAGE
+        assert ranges[0].region_base == BASE
+        assert ranges[0].expected is False
+
+    def test_two_separate_runs(self):
+        region = _make_region(_states(
+            (PageState.FAILED, 1), (PageState.CAPTURED, 2),
+            (PageState.FAILED, 2), (PageState.CAPTURED, 1),
+        ))
+
+        ranges = coalesce_unreadable(region)
+
+        assert len(ranges) == 2
+        assert (ranges[0].base, ranges[0].size) == (BASE, PAGE)
+        assert (ranges[1].base, ranges[1].size) == (BASE + 3 * PAGE, 2 * PAGE)
+
+    def test_run_reaching_the_end_of_the_region(self):
+        region = _make_region(_states(
+            (PageState.CAPTURED, 2), (PageState.FAILED, 2),
+        ))
+
+        ranges = coalesce_unreadable(region)
+
+        assert len(ranges) == 1
+        assert ranges[0].base == BASE + 2 * PAGE
+        assert ranges[0].size == 2 * PAGE
+
+    def test_all_captured_yields_no_ranges(self):
+        region = _make_region([PageState.CAPTURED] * 4)
+
+        assert coalesce_unreadable(region) == []
+
+    def test_kernel_pseudo_region_marks_ranges_expected(self):
+        region = _make_region(_states((PageState.UNMAPPED, 2)))
+
+        ranges = coalesce_unreadable(region, "[vvar_vclock]")
+
+        assert len(ranges) == 1
+        assert ranges[0].expected is True
+        assert ranges[0].file_path == "[vvar_vclock]"
+
+    def test_ordinary_region_ranges_are_not_expected(self):
+        region = _make_region(_states((PageState.FAILED, 2)))
+
+        ranges = coalesce_unreadable(region, "/usr/lib/libc.so.6")
+
+        assert ranges[0].expected is False
+
+    def test_unmapped_and_failed_runs_both_counted(self):
+        """Coalescing keys off "not captured", so a UNMAPPED page adjacent to
+        a FAILED one forms a single run."""
+        region = _make_region(_states(
+            (PageState.CAPTURED, 1), (PageState.FAILED, 1),
+            (PageState.UNMAPPED, 1), (PageState.CAPTURED, 1),
+        ))
+
+        ranges = coalesce_unreadable(region)
+
+        assert len(ranges) == 1
+        assert ranges[0].size == 2 * PAGE
+
+
+class TestKernelPseudoRegionAccounting:
+    """A kernel pseudo-mapping's failed reads are the kernel's answer, not
+    data loss."""
+
+    def _pseudo_bridge(self, file_path: str = "[vvar_vclock]", pages: int = 2):
+        ranges = [MemoryRange(
+            base=BASE, size=pages * PAGE, protection="r--", file_path=file_path,
+        )]
+        # No memory entries at all, so every read fails.
+        return MockBridge(ranges=ranges, modules=[], memory={})
+
+    def test_pages_recorded_as_unmapped_not_failed(self):
+        bridge = self._pseudo_bridge()
+
+        region, data_size = _read_span(
+            bridge, BASE, 2 * PAGE, file_path="[vvar_vclock]",
+        )
+
+        assert region.page_states == [PageState.UNMAPPED] * 2
+        assert PageState.FAILED not in region.page_states
+        assert data_size == 0
+
+    def test_ordinary_region_still_reports_failed(self):
+        bridge = MockBridge(memory={})
+
+        region, _data_size = _read_span(bridge, BASE, 2 * PAGE, file_path="")
+
+        assert region.page_states == [PageState.FAILED] * 2
+
+    def test_acquire_accounts_pseudo_pages_separately(self, tmp_path: Path):
+        bridge = self._pseudo_bridge()
+        engine = AcquisitionEngine(bridge)
+        output = tmp_path / "dump.msl"
+
+        result = engine.acquire(output)
+
+        assert result.pages_expected_unreadable == 2
+        assert result.pages_failed == 0
+        assert result.pages_captured == 0
+        assert result.bytes_expected_unreadable == 2 * PAGE
+        assert "[vvar_vclock]" in result.expected_unreadable_regions
+
+    def test_acquire_still_writes_the_pseudo_region(self, tmp_path: Path):
+        bridge = self._pseudo_bridge()
+        engine = AcquisitionEngine(bridge)
+        output = tmp_path / "dump.msl"
+
+        result = engine.acquire(output)
+
+        assert result.regions_captured == 1
+        assert result.regions_skipped == 0
+        blocks = _parse_blocks(output.read_bytes())
+        assert _find_block(blocks, BlockType.MemoryRegion) is not None
+
+    def test_acquire_marks_pseudo_ranges_expected(self, tmp_path: Path):
+        bridge = self._pseudo_bridge()
+        engine = AcquisitionEngine(bridge)
+
+        result = engine.acquire(tmp_path / "dump.msl")
+
+        assert len(result.unreadable_ranges) == 1
+        assert result.unreadable_ranges[0].expected is True
+        assert result.unreadable_ranges[0].file_path == "[vvar_vclock]"
+
+    def test_skip_kernel_pseudo_filter_skips_the_region(self, tmp_path: Path):
+        data = b"\xaa" * PAGE
+        ranges = [
+            MemoryRange(base=BASE, size=PAGE, protection="r--",
+                        file_path="[vvar_vclock]"),
+            MemoryRange(base=0x20000, size=PAGE, protection="rw-",
+                        file_path=""),
+        ]
+        bridge = MockBridge(ranges=ranges, modules=[], memory={0x20000: data})
+        engine = AcquisitionEngine(
+            bridge, region_filter=RegionFilter(skip_kernel_pseudo=True),
+        )
+
+        result = engine.acquire(tmp_path / "dump.msl")
+
+        assert result.regions_skipped == 1
+        assert result.skip_reasons["kernel-pseudo"] == 1
+        assert result.regions_captured == 1
+        assert result.pages_expected_unreadable == 0
+
+
+class ShortReadBridge(MockBridge):
+    """A MockBridge that answers every read with fewer bytes than requested.
+
+    Real backends do this: GDB bisects around unreadable holes and LLDB's
+    ``ReadMemory`` can stop at the first bad cache line, both without saying
+    the read failed. The engine must record only the pages it actually got.
+
+    Attributes:
+        returned: Bytes handed back per read, however much was asked for.
+    """
+
+    def __init__(self, returned: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.returned = returned
+
+    def read_memory(self, address: int, size: int) -> bytes | None:
+        return b"\xa5" * min(self.returned, size)
+
+
+class TestShortReadAccounting:
+    """A backend returning fewer bytes than asked for is never recorded as a
+    fully captured span."""
+
+    def test_short_read_marks_only_the_returned_pages(self):
+        bridge = ShortReadBridge(returned=3 * PAGE)
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 3), (PageState.FAILED, REGION_PAGES - 3),
+        )
+        assert data_size == 3 * PAGE
+
+    def test_partial_page_is_not_captured(self):
+        """A read stopping mid-page captures only the whole pages before it.
+
+        Spec Table 24 gives a Captured page exactly PageSize bytes, so the
+        partial page is recorded as Failed and its fragment is dropped
+        rather than padded with fabricated zeros.
+        """
+        bridge = ShortReadBridge(returned=PAGE + 100)
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 1), (PageState.FAILED, REGION_PAGES - 1),
+        )
+        assert data_size == PAGE
+        assert sum(len(c) for c in region.page_data_chunks) == PAGE
+
+    def test_short_read_in_a_chunked_region(self):
+        """The same accounting applies to each chunk of an oversized region."""
+        bridge = ShortReadBridge(returned=PAGE)
+        engine = AcquisitionEngine(bridge, max_chunk_size=4 * PAGE)
+
+        region, data_size = engine._read_region(
+            BASE, REGION_SIZE, 0x03, "", PAGE,
+        )
+
+        # One captured page at the head of each of the four chunks.
+        assert region.page_states == _states(
+            (PageState.CAPTURED, 1), (PageState.FAILED, 3),
+        ) * 4
+        assert data_size == 4 * PAGE
+
+    def test_captured_page_count_matches_the_data_written(self):
+        """Page states and payload stay in step, so bytes are never placed at
+        an offset the state map does not claim."""
+        bridge = ShortReadBridge(returned=5 * PAGE)
+
+        region, data_size = _read_span(bridge, BASE, REGION_SIZE)
+
+        captured = region.page_states.count(PageState.CAPTURED)
+        assert sum(len(c) for c in region.page_data_chunks) == data_size
+        assert captured * PAGE >= data_size > (captured - 1) * PAGE
+
+
+# ---------------------------------------------------------------------------
+# Assumed page size provenance
+# ---------------------------------------------------------------------------
+
+
+def _system_context_os_detail(raw: bytes) -> str:
+    """Return the packed ``OSDetail`` string from a capture's SystemContext."""
+    blocks = _parse_blocks(raw)
+    payload = _find_block(blocks, BlockType.SystemContext)
+    assert payload is not None, "SystemContext block not found"
+
+    # Fixed 32-byte header; the length fields start at offset 13.
+    acq_user_len, hostname_len, domain_len, _os_detail_len, _case_ref_len = (
+        struct.unpack_from("<HHHHH", payload, 13)
+    )
+    offset = 32
+    for length in (acq_user_len, hostname_len, domain_len):
+        if length > 0:
+            _value, offset = _read_padded_string(payload, offset)
+    os_detail, _offset = _read_padded_string(payload, offset)
+    return os_detail
+
+
+def _capture_collector_warnings(
+    tmp_path: Path,
+    *,
+    page_size_assumed: bool,
+    collector: MockCollector | None = None,
+) -> list[str]:
+    """Acquire an investigation-mode slice and return its collector warnings.
+
+    The warnings are read back out of the finished file rather than off the
+    engine, so the assertion covers everything between the bridge and the
+    bytes an analyst opens.
+    """
+    from memslicer.acquirer.os_detail import parse_os_detail
+
+    data = b"\xaa" * 4096
+    ranges = [MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="")]
+    bridge = MockBridge(
+        ranges=ranges,
+        modules=[],
+        memory={0x10000: data},
+        platform_info=PlatformInfo(
+            arch=ArchType.x86_64,
+            os=OSType.Linux,
+            pid=1234,
+            page_size=4096,
+            page_size_assumed=page_size_assumed,
+        ),
+    )
+    engine = AcquisitionEngine(
+        bridge, investigation=True, collector=collector or MockCollector(),
+    )
+    output = tmp_path / "dump.msl"
+    engine.acquire(output)
+
+    os_detail = _system_context_os_detail(output.read_bytes())
+    warning = parse_os_detail(os_detail).get("collector_warning", "")
+    return [w for w in warning.split(",") if w]
+
+
+class TestAssumedPageSizeWarning:
+    """A capture whose page size was guessed must not read as one where the
+    page size was known.
+
+    Nothing else in the file can tell the two apart: ``PageSizeLog2`` and the
+    page-state map agree with each other either way, so a 16K-page target
+    recorded with a guessed 4K page size produces a self-consistent, wrong
+    slice. The warning is the only surviving trace of the doubt.
+    """
+
+    def test_guessed_page_size_is_recorded_in_the_capture(self, tmp_path: Path):
+        """A slice taken from a bridge that could not learn the page size
+        arrives without any sign that the page size was a default."""
+        warnings = _capture_collector_warnings(tmp_path, page_size_assumed=True)
+
+        assert "page_size_assumed_4k" in warnings
+
+    def test_known_page_size_is_not_flagged(self, tmp_path: Path):
+        """A slice from a bridge that did learn the page size carries a doubt
+        marker anyway, so analysts cannot trust the marker to mean anything."""
+        warnings = _capture_collector_warnings(tmp_path, page_size_assumed=False)
+
+        assert "page_size_assumed_4k" not in warnings
+
+    def test_guessed_page_size_does_not_displace_collector_warnings(
+        self, tmp_path: Path,
+    ):
+        """The page-size doubt overwrites what the collector had already
+        reported, so an operator loses the host-side warnings."""
+        collector = MockCollector()
+        collector.system_info.collector_warnings = [
+            "hidepid_active", "kallsyms_restricted",
+        ]
+
+        warnings = _capture_collector_warnings(
+            tmp_path, page_size_assumed=True, collector=collector,
+        )
+
+        assert "hidepid_active" in warnings
+        assert "kallsyms_restricted" in warnings
+        assert "page_size_assumed_4k" in warnings
+
+
+# ---------------------------------------------------------------------------
+# Investigation collector selection for remote bridges (GitHub issue #3)
+# ---------------------------------------------------------------------------
+
+
+class RemoteBridge(MockBridge):
+    """A bridge attached to a process on another machine that can collect
+    investigation data there (Frida-like)."""
+
+    is_remote = True
+
+    def __init__(self, *args, remote_collector=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.remote_collector = remote_collector
+        self.create_remote_collector_calls = 0
+
+    def create_remote_collector(self, logger):
+        self.create_remote_collector_calls += 1
+        return self.remote_collector
+
+
+class RemoteBridgeWithoutCollector(MockBridge):
+    """A remote bridge with no way to collect on the target (GDB-like)."""
+
+    is_remote = True
+
+
+def _one_page_kwargs() -> dict:
+    return dict(
+        ranges=[MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="")],
+        modules=[],
+        memory={0x10000: b"\xaa" * 4096},
+    )
+
+
+def _device_collector() -> MockCollector:
+    """A collector whose hostname proves the data came from the target."""
+    collector = MockCollector()
+    collector.system_info.hostname = "device-host"
+    return collector
+
+
+def _system_context_hostname(raw: bytes) -> str:
+    blocks = _parse_blocks(raw)
+    payload = _find_block(blocks, BlockType.SystemContext)
+    assert payload is not None, "SystemContext block not found"
+    acq_user_len, _hostname_len, _d, _o, _c = struct.unpack_from("<HHHHH", payload, 13)
+    offset = 32
+    if acq_user_len > 0:
+        _acq_user, offset = _read_padded_string(payload, offset)
+    hostname, _offset = _read_padded_string(payload, offset)
+    return hostname
+
+
+class TestRemoteCollectorSelection:
+    """A remote bridge must never be served by a host-local collector."""
+
+    def test_remote_bridge_collector_is_used_for_the_capture(self, tmp_path: Path):
+        sentinel = _device_collector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        assert engine._collector is sentinel
+        assert bridge.create_remote_collector_calls == 1
+        assert _system_context_hostname(output.read_bytes()) == "device-host"
+        # The host-side LinuxCollector fallback must never be touched.
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+    def test_remote_bridge_without_capability_gets_null_collector(
+        self, tmp_path: Path, caplog,
+    ):
+        from memslicer.acquirer.collectors.fallback import NullCollector
+
+        bridge = RemoteBridgeWithoutCollector(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        with caplog.at_level("WARNING", logger="memslicer"):
+            engine.acquire(tmp_path / "dump.msl")
+
+        assert isinstance(engine._collector, NullCollector)
+        assert "remote target" in caplog.text
+        assert "RemoteBridgeWithoutCollector" in caplog.text
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+    def test_remote_factory_returning_none_gets_null_collector(self, tmp_path: Path):
+        from memslicer.acquirer.collectors.fallback import NullCollector
+
+        bridge = RemoteBridge(remote_collector=None, **_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert bridge.create_remote_collector_calls == 1
+        assert isinstance(engine._collector, NullCollector)
+
+    def test_remote_bridge_replaces_host_memslicer_collector(self, tmp_path: Path):
+        from memslicer.acquirer.collectors.linux import LinuxCollector
+
+        sentinel = _device_collector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=LinuxCollector(),
+        )
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is sentinel
+
+    def test_remote_bridge_keeps_user_supplied_collector(self, tmp_path: Path):
+        sentinel = _device_collector()
+        user_collector = MockCollector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=user_collector,
+        )
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is user_collector
+        assert bridge.create_remote_collector_calls == 0
+
+    def test_local_bridge_without_collector_keeps_fallback_path(self, tmp_path: Path):
+        bridge = MockBridge(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is None
+
+    def test_remote_bridge_without_collector_never_reads_host_tables(self):
+        bridge = RemoteBridgeWithoutCollector(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        tables = engine._collect_system_tables(1234)
+
+        assert tables.process_table == []
+        assert tables.connection_table == []
+        assert tables.handle_table == []
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+
+class TestCollectOrDefault:
+    """Extension-block collection degrades to the caller's default."""
+
+    def _engine(self) -> AcquisitionEngine:
+        return AcquisitionEngine(MockBridge(), investigation=True, collector=None)
+
+    def test_returns_collected_value(self):
+        assert self._engine()._collect_or_default("x", lambda: 42, None) == 42
+
+    def test_returns_default_and_logs_on_failure(self, caplog):
+        def boom():
+            raise OSError("no /proc")
+
+        with caplog.at_level("WARNING", logger="memslicer"):
+            result = self._engine()._collect_or_default("thing", boom, "fallback")
+
+        assert result == "fallback"
+        assert "Failed to collect thing: no /proc" in caplog.text
+
+    def test_table_or_empty_still_returns_empty_list_on_failure(self):
+        def boom():
+            raise RuntimeError("nope")
+
+        assert self._engine()._table_or_empty("table", boom) == []
+
+
+# ---------------------------------------------------------------------------
+# VAS Map (0x1001) written by the engine
+# ---------------------------------------------------------------------------
+
+
+_ANDROID_RANGES = [
+    ("[anon:dalvik-main space (region space)]", 0x12c00000, "rw-"),
+    ("[anon:dalvik-zygote space]", 0x70000000, "rw-"),
+    ("[anon:dalvik-/system/framework/boot.art]", 0x70100000, "rw-"),
+    ("[anon:dalvik-card table]", 0x70200000, "rw-"),
+    ("[anon:scudo:primary]", 0x7a0000000, "rw-"),
+    ("[anon:libc_malloc]", 0x7a1000000, "rw-"),
+    ("[anon:stack_and_tls:4242]", 0x7a2000000, "rw-"),
+    ("[anon:cfi shadow]", 0x7a3000000, "r--"),
+    ("/data/app/~~x==/com.example-1/lib/arm64/libapp.so", 0x7a4000000, "r-x"),
+    ("[vdso]", 0x7a5000000, "r-x"),
+    ("[stack]", 0x7ff000000, "rw-"),
+]
+
+
+def _android_bridge() -> MockBridge:
+    ranges = [MemoryRange(base=b, size=4096, protection=p, file_path=n)
+              for n, b, p in _ANDROID_RANGES]
+    return MockBridge(
+        ranges=ranges,
+        platform_info=PlatformInfo(arch=ArchType.ARM64, os=OSType.Android,
+                                   pid=4242, page_size=4096),
+        memory={r.base: b"\x5a" * 4096 for r in ranges},
+    )
+
+
+def _read_vas(path: Path):
+    from memslicer.msl.iterator import iterate_blocks
+    from memslicer.msl.writer import parse_vas_map
+    with path.open("rb") as f:
+        blocks = [b for b in iterate_blocks(f) if b.block_type == BlockType.VASMap]
+    assert len(blocks) == 1
+    return parse_vas_map(blocks[0].payload)
+
+
+class TestEngineVasMap:
+    """Every enumerated range lands in the VAS Map with its full name."""
+
+    def test_spaced_android_names_complete_including_skipped(self, tmp_path: Path):
+        # min_prot=3 (rw) skips the r-- and r-x ranges.
+        engine = AcquisitionEngine(
+            _android_bridge(), region_filter=RegionFilter(min_prot=3),
+        )
+        output = tmp_path / "android.msl"
+        result = engine.acquire(output)
+        assert result.regions_skipped == 3
+
+        vas = _read_vas(output)
+        want = sorted(_ANDROID_RANGES, key=lambda t: t[1])
+        assert [(e.mapped_path, e.base_addr) for e in vas] == [(n, b) for n, b, _ in want]
+        by_name = {e.mapped_path: e for e in vas}
+        assert by_name["[anon:dalvik-main space (region space)]"].region_type == RegionType.Heap
+        assert by_name["[anon:scudo:primary]"].region_type == RegionType.Heap
+        assert by_name["[anon:stack_and_tls:4242]"].region_type == RegionType.Stack
+        assert by_name["[anon:cfi shadow]"].protection == 1  # skipped, still recorded
+        for e in vas:
+            assert e.region_type == classify_region(e.mapped_path)
+
+    def test_header_os_type_is_android(self, tmp_path: Path):
+        output = tmp_path / "android.msl"
+        AcquisitionEngine(_android_bridge()).acquire(output)
+        raw = output.read_bytes()[:HEADER_SIZE]
+        os_type = struct.unpack_from("<H", raw, 0x30)[0]
+        assert os_type == OSType.Android
+
+    def test_aborted_capture_still_lists_unvisited_ranges(self, tmp_path: Path):
+        bridge = _android_bridge()
+        engine = AcquisitionEngine(bridge)
+
+        def progress_cb(regions_captured, *_):
+            if regions_captured >= 1:
+                engine.request_abort()
+
+        engine.set_progress_callback(progress_cb)
+        output = tmp_path / "aborted.msl"
+        result = engine.acquire(output)
+        assert result.aborted is True
+        assert result.regions_captured < len(_ANDROID_RANGES)
+        assert len(_read_vas(output)) == len(_ANDROID_RANGES)
+
+    def test_vas_region_type_matches_memory_region_blocks(self, tmp_path: Path):
+        from memslicer.msl.iterator import iterate_blocks
+        output = tmp_path / "android.msl"
+        AcquisitionEngine(_android_bridge()).acquire(output)
+        with output.open("rb") as f:
+            stored = {
+                struct.unpack_from("<Q", b.payload, 0)[0]: b.payload[0x11]
+                for b in iterate_blocks(f) if b.block_type == BlockType.MemoryRegion
+            }
+        vas = {e.base_addr: int(e.region_type) for e in _read_vas(output)}
+        assert stored and all(vas[base] == rtype for base, rtype in stored.items())

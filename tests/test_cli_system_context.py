@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from memslicer import cli_sysctx
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+
 
 # ---------------------------------------------------------------------------
 # Fake collector with configurable richness
@@ -106,7 +108,7 @@ class _EmptyCollector:
 # Shared patch context
 # ---------------------------------------------------------------------------
 
-def _run(args: list[str], *, collector=None) -> tuple[int, str, str]:
+def _run(args: list[str], *, collector=None) -> "tuple[int, str, str]":
     """Invoke the CLI via CliRunner with the collector factory patched."""
     if collector is None:
         collector = _FakeCollector()
@@ -297,7 +299,6 @@ class TestEntryPointWiring:
             text=True,
             cwd=PROJECT_ROOT,
             timeout=30,
-            check=False,
         )
         # Exit code may be 0 or 2 depending on whether the host collector
         # manages to populate the minimum set; both are valid behaviors
@@ -308,3 +309,57 @@ class TestEntryPointWiring:
         payload = json.loads(result.stdout)
         assert payload["schema"] == "memslicer.system-context/v1"
         assert "system_context" in payload
+
+
+# ---------------------------------------------------------------------------
+# Remote targets are not collected from this host (Step 8)
+# ---------------------------------------------------------------------------
+
+class TestMakeCollectorRemote:
+
+    def test_remote_returns_null_collector_with_warning(self) -> None:
+        from unittest.mock import MagicMock
+        from memslicer.acquirer.collectors.fallback import NullCollector
+
+        logger = MagicMock()
+        collector = cli_sysctx._make_collector(None, is_remote=True, logger=logger)
+
+        assert isinstance(collector, NullCollector)
+        # NullCollector logs its own "minimal data" warning; ours must be there too.
+        messages = [c.args[0] for c in logger.warning.call_args_list]
+        remote = [m for m in messages if "cannot reach remote targets" in m]
+        assert len(remote) == 1
+        assert "memslicer <pid> -I -U" in remote[0]
+
+    def test_remote_never_touches_host_factory(self) -> None:
+        from unittest.mock import MagicMock
+
+        with patch("memslicer.acquirer.collectors.create_collector") as factory:
+            cli_sysctx._make_collector("android", is_remote=True, logger=MagicMock())
+
+        factory.assert_not_called()
+
+    def test_local_still_uses_host_factory(self) -> None:
+        from unittest.mock import MagicMock
+
+        sentinel = object()
+        logger = MagicMock()
+        with patch(
+            "memslicer.acquirer.collectors.create_collector", return_value=sentinel,
+        ) as factory:
+            collector = cli_sysctx._make_collector(None, is_remote=False, logger=logger)
+
+        assert collector is sentinel
+        assert factory.call_args.kwargs["is_remote"] is False
+        logger.warning.assert_not_called()
+
+    def test_usb_flag_runs_end_to_end_with_null_collector(self) -> None:
+        """-U without a patched factory collects nothing, but still runs."""
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_sysctx.main, ["--format", "json", "-U"], catch_exceptions=False,
+        )
+
+        assert result.exit_code == cli_sysctx.EXIT_PARTIAL
+        sc = json.loads(result.stdout)["system_context"]
+        assert sc["hostname"] == ""

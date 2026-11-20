@@ -29,20 +29,6 @@ def test_zstd_empty():
     assert decompress(compressed, CompAlgo.ZSTD) == b""
 
 
-def test_lz4_trailing_padding_with_size():
-    """The block writer pads (UncompressedSize + lz4-block) to 8 bytes, so the
-    payload reaching decompress() can carry up to 7 trailing bytes. With the
-    known uncompressed_size, decompress() must strip them and still decode.
-    Regression for the "insufficient space in destination buffer" read bug.
-    """
-    data = bytes(range(256)) * 64 + b"\x00" * 40  # 16424 B, like a real region
-    compressed = compress(data, CompAlgo.LZ4)
-    for pad in range(8):
-        padded = compressed + b"\x00" * pad
-        out = decompress(padded, CompAlgo.LZ4, uncompressed_size=len(data))
-        assert out == data, f"failed with {pad} trailing pad bytes"
-
-
 def test_lz4_empty():
     compressed = compress(b"", CompAlgo.LZ4)
     assert decompress(compressed, CompAlgo.LZ4) == b""
@@ -53,3 +39,35 @@ def test_invalid_algo():
         compress(b"data", 99)
     with pytest.raises(ValueError):
         decompress(b"data", 99)
+
+
+# --- decompress_tolerating_padding (legacy 8-byte padded payloads) ---
+
+from memslicer.msl.compression import (  # noqa: E402
+    MAX_LEGACY_PAD_TRIM, decompress_tolerating_padding,
+)
+
+_SAMPLE = b"hello world" * 100
+
+
+@pytest.mark.parametrize("pad", range(MAX_LEGACY_PAD_TRIM + 1))
+def test_tolerating_padding_lz4_trailing_zeros(pad):
+    padded = compress(_SAMPLE, CompAlgo.LZ4) + b"\x00" * pad
+    assert decompress_tolerating_padding(padded, CompAlgo.LZ4) == _SAMPLE
+
+
+def test_tolerating_padding_rejects_nonzero_trailing_garbage():
+    garbage = compress(_SAMPLE, CompAlgo.LZ4) + b"\x01\x00\x00"
+    with pytest.raises(Exception):
+        decompress_tolerating_padding(garbage, CompAlgo.LZ4)
+
+
+def test_tolerating_padding_zstd_with_padding_unaffected():
+    padded = compress(_SAMPLE, CompAlgo.ZSTD) + b"\x00" * 5
+    assert decompress_tolerating_padding(padded, CompAlgo.ZSTD) == _SAMPLE
+
+
+def test_plain_decompress_stays_strict_for_padded_lz4():
+    padded = compress(_SAMPLE, CompAlgo.LZ4) + b"\x00" * 3
+    with pytest.raises(Exception):
+        decompress(padded, CompAlgo.LZ4)

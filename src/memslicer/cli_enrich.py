@@ -16,19 +16,39 @@ logic against its captured regions, and append the manifest block as
 an additive overlay. The original bytes in the input slice are
 untouched until the new file is written alongside.
 
+Extension segment (spec Section 4.6): the capture segment -- header,
+every block and the original ``EndOfCapture`` -- is copied verbatim,
+together with every extension segment that already verifies. The
+manifest goes into a new extension segment appended after them, closed
+by an ``EndOfExtension`` block that records the segment's hash, its
+block count and ``memslicer-enrich/<version>`` as producer. The
+``PrevHash`` chain (Section 4.4) continues through the EoC and the
+existing segments, so the enriched file still has one linear chain and
+the original EoC ``FileHash`` stays valid.
+
+Modules whose build-id an existing manifest (in any segment, including
+a pre-1.1 manifest written before a replaced EoC) already covers are
+skipped; when nothing is left the slice is not rewritten.
+
+Encrypted slices (spec 1.1.1 Section 10.8): the container is decrypted
+with ``--passphrase`` (prompted when omitted) and enrichers see the same
+blocks as for a plaintext slice, including those of earlier sealed
+segments. The manifest goes into a *sealed* extension segment -- an
+extension segment with zero ``PrevHash`` fields, encrypted under its own
+segment key and chained to the previous AEAD tag -- appended after the
+last verified sealed segment in a single write. The primary ciphertext
+and tag are never touched.
+
 Known limitations (P1.7):
 
-* **Integrity chain**: the appended manifest block is written with a
-  fresh ``prev_hash`` chain — it does not chain from the hash of the
-  preceding bytes in the original slice. The new ``EndOfCapture``'s
-  ``file_hash`` is computed over that fresh chain (fresh file header +
-  manifest + EoC), NOT over the full enriched file bytes, so a strict
-  chain-continuity validator would reject the enriched file on the
-  manifest block's ``prev_hash`` mismatch. Adding a
-  ``seed_chain_from_bytes`` API to the writer to preserve full chain
-  continuity is P2 scope.
+* **Encrypted slices without CipherLen**: a slice sealed before 1.1.1 or
+  by a non-seekable writer has its tag at EOF and cannot take sealed
+  segments; it is refused. Decrypt and re-encrypt it first.
 
-* **Encrypted slices**: not supported (the iterator refuses).
+* **Trailing data**: a slice with bytes after its last verified segment
+  (an unterminated or tampered segment, non-MSL garbage) -- or, for an
+  encrypted slice, after its last verified sealed segment -- is refused
+  rather than built upon (Section 4.6 / 10.8 producer rules).
 
 * **Full MemoryRegion parse**: the CLI parses only the first page of
   each region, which is sufficient for build-id extraction. A
@@ -47,21 +67,37 @@ import shutil
 import struct
 import sys
 from pathlib import Path
+from typing import Iterable
 
 import click
 
+from memslicer import __version__
 from memslicer.acquirer.build_id_post import (
     SOURCE_RETROACTIVE,
     populate_from_regions,
 )
 from memslicer.msl.constants import (
-    HEADER_SIZE,
+    COMPRESSED,
     BlockType,
-    CompAlgo,
     HashAlgo,
     PageState,
 )
-from memslicer.msl.iterator import iterate_blocks, read_hash_algo
+from memslicer.msl.integrity import IntegrityChain
+from memslicer.msl.iterator import (
+    BlockRecord,
+    DecryptedContainer,
+    SegmentSpan,
+    _decompress_block_payload,
+    _iter_raw_blocks,
+    decrypt_container,
+    is_encrypted,
+    iterate_blocks,
+    iterate_container_blocks,
+    read_file_header_info,
+    read_hash_algo,
+    scan_extension_segments,
+)
+from memslicer.msl.sealed import seal_segment
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,
@@ -69,7 +105,17 @@ from memslicer.msl.types import (
     ModuleBuildIdRow,
     ModuleEntry,
 )
-from memslicer.msl.writer import MSLWriter
+from memslicer.msl.writer import (
+    MSLWriter,
+    parse_end_of_extension,
+    parse_module_build_id_manifest,
+)
+
+_HASH_ALGO_OFFSET = 0x3D
+"""``HashAlgo`` byte in the file header (spec Table 3)."""
+
+PRODUCER = f"memslicer-enrich/{__version__}"
+"""Producer string recorded in the EndOfExtension block (spec Table 12a)."""
 
 
 _log = logging.getLogger("memslicer.enrich")
@@ -214,36 +260,88 @@ def _extract_blob_fields(native_blob: bytes) -> tuple[int, int, int, bytes]:
     return (build_id_len, source_id, flags, build_id)
 
 
+def _open_container(slice_path: Path, passphrase: str | None) -> DecryptedContainer | None:
+    """Decrypt an encrypted slice once; ``None`` for a plaintext slice.
+
+    The container (primary stream plus every verified sealed segment) is
+    shared by loading and appending, so the key is derived only once.
+
+    Raises:
+        ValueError: when the slice is encrypted and no passphrase is
+            given, or the primary tag does not verify (wrong passphrase
+            or a modified file).
+    """
+    with open(slice_path, "rb") as f:
+        header_size, _hash_algo, _flags = read_file_header_info(f)
+        if not is_encrypted(f):
+            return None
+        if passphrase is None:
+            raise ValueError(
+                f"slice at {slice_path} is encrypted; a passphrase is required "
+                f"to enrich it (--passphrase)"
+            )
+        return decrypt_container(f, header_size, passphrase)
+
+
 def _load_slice(
     slice_path: Path,
-) -> tuple[list[ModuleEntry], list[MemoryRegion], int, HashAlgo]:
-    """Read modules, regions, the EoC start offset, and hash algo from a slice.
+    container: DecryptedContainer | None = None,
+) -> tuple[list[ModuleEntry], list[MemoryRegion], HashAlgo, set[int]]:
+    """Read modules, regions, hash algo and already-enriched bases from a slice.
 
-    Returns ``(modules, regions, eoc_start_offset, hash_algo)``. Raises
+    Walks the capture segment and every valid extension segment. Rows of
+    any ``ModuleBuildIdManifest`` -- in an extension segment, or in the
+    capture segment of a pre-1.1 enriched file whose manifest precedes a
+    replaced EoC -- contribute their ``base_addr`` to ``enriched_bases``.
+    For an encrypted slice pass the ``container`` from
+    :func:`_open_container`; its sealed segments are walked as well.
+
+    Returns ``(modules, regions, hash_algo, enriched_bases)``. Raises
     :class:`FileNotFoundError` / :class:`ValueError` on missing or
-    malformed files.
+    malformed files, or when the slice has no ``EndOfCapture`` block.
     """
-    modules: list[ModuleEntry] = []
-    regions: list[MemoryRegion] = []
-    eoc_start: int | None = None
+    if container is not None:
+        hash_algo = HashAlgo(container.header[_HASH_ALGO_OFFSET])
+        collected = _collect_blocks(iterate_container_blocks(container))
+    else:
+        with open(slice_path, "rb") as f:
+            if is_encrypted(f):
+                raise ValueError(
+                    f"slice at {slice_path} is encrypted; a passphrase is "
+                    f"required to enrich it (--passphrase)"
+                )
+            hash_algo = read_hash_algo(f)
+            collected = _collect_blocks(iterate_blocks(f, extensions=True))
+    modules, regions, enriched_bases, eoc_seen = collected
 
-    with open(slice_path, "rb") as f:
-        hash_algo = read_hash_algo(f)
-        for block in iterate_blocks(f):
-            if block.block_type == BlockType.ModuleEntry:
-                modules.append(_parse_module_entry_minimal(block.payload))
-            elif block.block_type == BlockType.MemoryRegion:
-                regions.append(_parse_memory_region_for_enrich(block.payload))
-            elif block.block_type == BlockType.EndOfCapture:
-                eoc_start = block.start_offset
-
-    if eoc_start is None:
+    if not eoc_seen:
         raise ValueError(
             f"slice at {slice_path} has no EndOfCapture block; "
             f"cannot determine where to append the manifest"
         )
 
-    return modules, regions, eoc_start, hash_algo
+    return modules, regions, hash_algo, enriched_bases
+
+
+def _collect_blocks(
+    blocks: Iterable[BlockRecord],
+) -> tuple[list[ModuleEntry], list[MemoryRegion], set[int], bool]:
+    """Sort a slice's blocks into ``(modules, regions, enriched_bases, eoc_seen)``."""
+    modules: list[ModuleEntry] = []
+    regions: list[MemoryRegion] = []
+    enriched_bases: set[int] = set()
+    eoc_seen = False
+    for block in blocks:
+        if block.block_type == BlockType.ModuleEntry:
+            modules.append(_parse_module_entry_minimal(block.payload))
+        elif block.block_type == BlockType.MemoryRegion:
+            regions.append(_parse_memory_region_for_enrich(block.payload))
+        elif block.block_type == BlockType.ModuleBuildIdManifest:
+            manifest = parse_module_build_id_manifest(block.payload)
+            enriched_bases.update(row.base_addr for row in manifest.rows)
+        elif block.block_type == BlockType.EndOfCapture:
+            eoc_seen = True
+    return modules, regions, enriched_bases, eoc_seen
 
 
 def _build_manifest_rows(modules: list[ModuleEntry]) -> list[ModuleBuildIdRow]:
@@ -270,56 +368,301 @@ def _build_manifest_rows(modules: list[ModuleEntry]) -> list[ModuleBuildIdRow]:
     return rows
 
 
-def _render_manifest_tail(manifest: ModuleBuildIdManifest) -> bytes:
-    """Serialize a manifest block + fresh EoC using a throwaway writer.
+def _seed_chain(slice_path: Path) -> tuple[IntegrityChain, int, int]:
+    """Hash a slice's header, capture segment and valid extension segments.
 
-    Returns the bytes AFTER the fresh file header, i.e. exactly the
-    manifest block followed by the EoC block. Strips the 64-byte
-    file-header preamble from the throwaway writer's output so the
-    caller can append the result to the copied input preamble.
+    Feeds the HeaderSize-byte file header, then each block's on-disk
+    bytes in order (one block in memory at a time) through the
+    ``EndOfCapture``, then every extension segment that is terminated,
+    counts its blocks exactly and carries a matching ``SegmentHash``
+    (spec Section 4.6). Returns ``(chain, block_index, append_offset)``
+    where ``block_index`` is the number of blocks fed and
+    ``append_offset`` the end of the last valid segment -- the only place
+    a new segment may go.
 
-    Known limitation: the returned block bytes carry a fresh
-    integrity chain seeded from the throwaway header, not from the
-    hash of the caller's preamble. See module docstring.
+    Raises :class:`ValueError` when the slice has no ``EndOfCapture``, or
+    when bytes follow the last valid segment: a producer must not build
+    on unverified trailing data.
     """
-    scratch = io.BytesIO()
-    scratch_header = FileHeader()
-    scratch_writer = MSLWriter(scratch, scratch_header, CompAlgo.NONE)
-    scratch_writer.write_module_build_id_manifest(manifest)
-    scratch_writer.finalize()
+    with open(slice_path, "rb") as f:
+        header_size, hash_algo, _flags = read_file_header_info(f)
+        chain = IntegrityChain(hash_algo=hash_algo)
+        chain.feed_header(f.read(header_size))
+        block_index, eoc_end = _feed_capture_segment(f, chain)
+        if eoc_end is None:
+            raise ValueError(f"slice at {slice_path} has no EndOfCapture block")
+        block_index, append_offset = _feed_valid_segments(f, eoc_end, chain, block_index)
+        f.seek(0, 2)
+        trailing = f.tell() - append_offset
+    if trailing:
+        raise ValueError(
+            f"slice at {slice_path} has {trailing} unverified trailing byte(s) "
+            f"after offset {append_offset}; refusing to append to it"
+        )
+    return chain, block_index, append_offset
 
-    scratch_bytes = scratch.getvalue()
-    # Skip the 64-byte file header that the throwaway writer emitted.
-    return scratch_bytes[HEADER_SIZE:]
+
+def _feed_capture_segment(f, chain: IntegrityChain) -> tuple[int, int | None]:
+    """Feed every capture-segment block including the EoC into ``chain``.
+
+    Returns ``(blocks_fed, eoc_end_offset)``; the offset is ``None`` when
+    the stream ends before an ``EndOfCapture``.
+    """
+    block_index = 0
+    for raw in _iter_raw_blocks(f):
+        chain.feed_block_parts(raw.header_bytes, raw.on_disk_payload)
+        block_index += 1
+        if raw.block_type == BlockType.EndOfCapture:
+            return block_index, raw.end_offset
+    return block_index, None
+
+
+def _feed_valid_segments(
+    f, start: int, chain: IntegrityChain, block_index: int,
+) -> tuple[int, int]:
+    """Feed every verifiable extension segment after ``start`` into ``chain``.
+
+    Stops at the first unterminated, miscounted or hash-mismatching
+    segment, leaving it (and everything after it) as trailing data.
+    Returns ``(block_index, append_offset)``.
+    """
+    spans, append_offset = scan_extension_segments(f, start)
+    for span in spans:
+        if not span.terminated or not _feed_segment(f, span, chain):
+            return block_index, span.start
+        block_index += span.block_count
+        append_offset = span.end
+    return block_index, append_offset
+
+
+def _feed_segment(f, span: SegmentSpan, chain: IntegrityChain) -> bool:
+    """Feed one terminated span; ``False`` when its terminator disagrees.
+
+    The ``SegmentHash`` is taken before the terminator is fed, matching
+    :meth:`MSLWriter.finalize_extension`.
+    """
+    chain.start_segment()
+    f.seek(span.start)
+    ok = False
+    try:
+        for raw in _iter_raw_blocks(f, end=span.end):
+            if raw.block_type == BlockType.EndOfExtension:
+                payload = (
+                    _decompress_block_payload(raw) if raw.flags & COMPRESSED
+                    else raw.on_disk_payload
+                )
+                terminator = parse_end_of_extension(payload)
+                ok = (
+                    terminator.segment_hash == chain.segment_digest()
+                    and terminator.block_count == span.block_count
+                )
+            chain.feed_block_parts(raw.header_bytes, raw.on_disk_payload)
+    except (ValueError, NotImplementedError):
+        ok = False
+    finally:
+        chain.end_segment()
+    return ok
+
+
+def _render_manifest_tail(
+    manifest: ModuleBuildIdManifest,
+    chain: IntegrityChain,
+    block_index: int,
+) -> bytes:
+    """Serialize a manifest block + new EoC continuing an existing chain.
+
+    ``chain`` must be seeded with the original slice's header and every
+    block before its EoC (see :func:`_seed_chain`); ``block_index`` is
+    that block count. The writer's header carries the chain's
+    ``hash_algo`` so it matches the original slice. Returns exactly the manifest block followed by
+    the EoC block -- no file header is emitted -- so the caller appends
+    the result to the copied preamble and the chain stays continuous.
+    """
+    tail = io.BytesIO()
+    writer = MSLWriter.resume(
+        tail, FileHeader(hash_algo=chain.hash_algo), chain, block_index,
+    )
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize()
+    return tail.getvalue()
+
+
+def _render_extension_tail(
+    manifest: ModuleBuildIdManifest,
+    chain: IntegrityChain,
+    block_index: int,
+) -> bytes:
+    """Serialize one extension segment holding the manifest (spec Section 4.6).
+
+    ``chain`` must be seeded with the slice's header, its capture segment
+    including the EoC and every valid existing segment (see
+    :func:`_seed_chain`); ``block_index`` is that block count. Returns
+    exactly the manifest block followed by its ``EndOfExtension`` block
+    -- no file header, no EoC -- so the caller appends the result after
+    the last valid segment and the chain stays continuous.
+    """
+    tail = io.BytesIO()
+    writer = MSLWriter.extend(
+        tail, FileHeader(hash_algo=chain.hash_algo), chain, block_index,
+    )
+    writer.begin_extension()
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize_extension(producer=PRODUCER)
+    return tail.getvalue()
 
 
 def _write_enriched(
     slice_path: Path,
     output_path: Path,
-    eoc_start: int,
     manifest: ModuleBuildIdManifest,
 ) -> None:
     """Write the enriched slice to ``output_path``.
 
-    Copies bytes ``[0, eoc_start)`` verbatim from ``slice_path``, then
-    appends the manifest block and a fresh EoC computed by a throwaway
-    writer.
+    Copies bytes ``[0, append_offset)`` verbatim from ``slice_path`` --
+    header, capture segment with its original EoC, and every valid
+    extension segment -- then appends a new extension segment holding
+    the manifest, whose PrevHash chain continues the original.
+
+    Raises :class:`ValueError` when the slice cannot be appended to (no
+    EoC, or unverified trailing bytes).
     """
-    tail = _render_manifest_tail(manifest)
+    chain, block_index, append_offset = _seed_chain(slice_path)
+    tail = _render_extension_tail(manifest, chain, block_index)
 
     with open(slice_path, "rb") as src, open(output_path, "wb") as dst:
-        remaining = eoc_start
+        remaining = append_offset
         while remaining > 0:
             chunk = src.read(min(remaining, 1 << 20))
             if not chunk:
                 raise IOError(
                     f"unexpected EOF while copying {slice_path} "
-                    f"(expected {eoc_start} bytes, "
-                    f"got {eoc_start - remaining})"
+                    f"(expected {append_offset} bytes, "
+                    f"got {append_offset - remaining})"
                 )
             dst.write(chunk)
             remaining -= len(chunk)
         dst.write(tail)
+
+
+# ---------------------------------------------------------------------------
+# Sealed extension segments (encrypted slices, spec Section 10.8)
+# ---------------------------------------------------------------------------
+
+
+def _require_appendable(container: DecryptedContainer, slice_path: Path) -> None:
+    """Refuse a container that cannot take a sealed segment (Section 10.8).
+
+    Raises:
+        ValueError: when the header ``CipherLen`` is 0, or bytes follow
+            the last verified sealed segment.
+    """
+    if container.cipher_len == 0:
+        raise ValueError(
+            f"slice at {slice_path} was sealed without CipherLen (pre-1.1.1 or "
+            f"non-seekable writer); it cannot take sealed segments -- decrypt "
+            f"and re-encrypt it"
+        )
+    if container.trailing_bytes:
+        raise ValueError(
+            f"slice at {slice_path} has {container.trailing_bytes} unverified "
+            f"trailing byte(s) after offset {container.sealed_end}; refusing "
+            f"to append to it"
+        )
+
+
+def _render_sealed_segment(
+    manifest: ModuleBuildIdManifest, container: DecryptedContainer,
+) -> bytes:
+    """Build the manifest's extension segment and seal it as the next segment.
+
+    Returns ``SealHeader ‖ ciphertext ‖ tag``, chained to the container's
+    last tag, ready to be appended at ``container.sealed_end``.
+    """
+    plaintext = io.BytesIO()
+    hash_algo = HashAlgo(container.header[_HASH_ALGO_OFFSET])
+    writer = MSLWriter.for_sealed_segment(plaintext, FileHeader(hash_algo=hash_algo))
+    writer.begin_extension()
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize_extension(producer=PRODUCER)
+    return seal_segment(
+        container.cek, container.header, container.kem_ciphertext,
+        container.last_tag, len(container.sealed_segments) + 1,
+        plaintext.getvalue(),
+    )
+
+
+def _append_sealed_segment(target: Path, expected_size: int, unit: bytes) -> None:
+    """Append ``unit`` to ``target`` in one write, if it is still ``expected_size`` bytes.
+
+    The size check guards against the file having changed since it was
+    decrypted; the write is flushed and fsynced before returning.
+    """
+    with open(target, "r+b") as f:
+        size = f.seek(0, os.SEEK_END)
+        if size != expected_size:
+            raise ValueError(
+                f"{target} is {size} bytes but the verified container ends at "
+                f"{expected_size}; it changed since it was read -- refusing to "
+                f"append to it"
+            )
+        f.write(unit)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _write_enriched_sealed(
+    slice_path: Path,
+    output_path: Path | None,
+    manifest: ModuleBuildIdManifest,
+    container: DecryptedContainer,
+) -> None:
+    """Append the manifest as a sealed segment.
+
+    With ``output_path`` the slice is copied there first and the copy is
+    appended to; with ``None`` the slice itself is appended to (in place
+    -- the existing bytes are never rewritten). Raises
+    :class:`ValueError` when the container cannot take a sealed segment.
+    """
+    _require_appendable(container, slice_path)
+    unit = _render_sealed_segment(manifest, container)
+    target = slice_path
+    if output_path is not None:
+        shutil.copyfile(slice_path, output_path)
+        target = output_path
+    try:
+        _append_sealed_segment(target, container.sealed_end, unit)
+    except ValueError:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        raise
+
+
+def _prompt_passphrase_if_encrypted(slice_path: Path, passphrase: str | None) -> str | None:
+    """Ask for the passphrase (hidden input) when the slice is encrypted and none was given."""
+    if passphrase is not None:
+        return passphrase
+    with open(slice_path, "rb") as f:
+        if is_encrypted(f):
+            return click.prompt("Passphrase", hide_input=True)
+    return None
+
+
+def _write_result(
+    slice_path: Path,
+    output: Path,
+    manifest: ModuleBuildIdManifest,
+    container: DecryptedContainer | None,
+    in_place: bool,
+) -> None:
+    """Write the enriched slice: a new file, or (encrypted, in place) an append."""
+    if container is None:
+        _write_enriched(slice_path, output, manifest)
+        if in_place:
+            os.replace(output, slice_path)
+    else:
+        _write_enriched_sealed(
+            slice_path, None if in_place else output, manifest, container,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -343,15 +686,31 @@ def _write_enriched(
     "--in-place",
     is_flag=True,
     default=False,
-    help="Atomically replace the original slice after writing to <slice>.tmp.",
+    help=(
+        "Atomically replace the original slice after writing to <slice>.tmp. "
+        "An encrypted slice is appended to directly (one sealed segment)."
+    ),
 )
-def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
+@click.option(
+    "--passphrase",
+    default=None,
+    help=(
+        "Decryption passphrase for an encrypted slice (prompted if the slice "
+        "is encrypted and not provided)."
+    ),
+)
+def main(
+    slice_path: Path, output: Path | None, in_place: bool, passphrase: str | None,
+) -> None:
     """Retroactively enrich an ``.msl`` slice with module build-ids.
 
     Reads the slice, extracts build-ids from captured ``MemoryRegion``
     bytes (Path B per D7 in the P1.6 plan), and appends a
-    ``ModuleBuildIdManifest`` block (``0x005A``) to a new output file.
-    See the module docstring for known limitations.
+    ``ModuleBuildIdManifest`` block (``0x005A``) in a new extension
+    segment. An encrypted slice (needs --passphrase) gets a sealed
+    extension segment (spec Section 10.8); it must have been written with
+    CipherLen (memslicer >= 1.1.1, seekable output). See the module
+    docstring for known limitations.
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -360,22 +719,27 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
     elif output is None:
         output = slice_path.with_suffix(slice_path.suffix + ".enriched")
 
+    passphrase = _prompt_passphrase_if_encrypted(slice_path, passphrase)
     try:
-        modules, regions, eoc_start, hash_algo = _load_slice(slice_path)
+        container = _open_container(slice_path, passphrase)
+        modules, regions, hash_algo, enriched_bases = _load_slice(
+            slice_path, container,
+        )
     except ValueError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
 
-    # Skip modules that already have a populated native_blob.
-    unpopulated = [m for m in modules if not m.native_blob]
+    # Skip modules that already have a populated native_blob, and those
+    # an existing manifest already covers.
+    unpopulated = [
+        m for m in modules
+        if not m.native_blob and m.base_addr not in enriched_bases
+    ]
     if not unpopulated:
         click.echo(
             "nothing to enrich: all modules already have populated build-ids"
         )
-        if in_place:
-            # Don't touch the original; discard the would-be tmp path.
-            return
-        shutil.copyfile(slice_path, output)
+        # Nothing is written: the original is complete as it stands.
         return
 
     populate_from_regions(
@@ -399,10 +763,13 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
         return
 
     manifest = ModuleBuildIdManifest(rows=rows)
-    _write_enriched(slice_path, output, eoc_start, manifest)
+    try:
+        _write_result(slice_path, output, manifest, container, in_place)
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
 
     if in_place:
-        os.replace(output, slice_path)
         click.echo(f"enriched {slice_path} in place ({len(rows)} modules)")
     else:
         click.echo(f"wrote {output} ({len(rows)} modules enriched)")
