@@ -1,4 +1,4 @@
-"""Unit tests for Phase 3: Calling convention stubs (cdecl, stdcall, fastcall, auto)."""
+"""Unit tests for calling convention stubs (cdecl, stdcall, fastcall, auto)."""
 
 import io
 import pytest

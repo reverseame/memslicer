@@ -128,7 +128,7 @@ def resolve_syscall_name(sys_nr: int, os_name: str, arch_name: str) -> tuple[str
             table = WINDOWS_NT_X86_TABLE
         if table is not None and sys_nr in table:
             return table[sys_nr], "MODELED"
-        
+
 
     elif os_name == "android":
         if arch_name == "arm64" and sys_nr in ANDROID_ARM64_TABLE:

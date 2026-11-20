@@ -861,7 +861,7 @@ def test_premap_stack_region_follows_thread_switch(tmp_path):
 #
 # Pre-mapping trades a loud fault for a quiet zero: reading stack the slice
 # never captured now yields 0 instead of raising. So the emulator has to say
-# which values it invented -- CLAUDE.md's rule that auto-recovery must
+# which values it invented -- auto-recovery must always
 # distinguish "fill I created" from "real data being touched again".
 
 # mov rbx, [rsp-0x200000]  -- a read of stack nothing ever wrote.

@@ -1,4 +1,4 @@
-"""Unit tests for Phase 5: Kernel Syscall Interception, OS/Arch Separation, Emulation, and Error Repair."""
+"""Unit tests for kernel Syscall Interception, OS/Arch Separation, Emulation, and Error Repair."""
 
 import io
 import pytest

@@ -442,8 +442,7 @@ derivation that happens before or after the capture window produces no hint.
 
 #### Limitations
 Useful for targeted symbolic extraction of comparison-based logic and common Windows x64 anti-debug bypass.
-It does **not** unpack, defeat anti-VM checks, model real syscall effects or follow other processes. See
-[`docs/malware_analysis_guide.md`](docs/malware_analysis_guide.md) for an honest assessment and workflow.
+It does **not** unpack, defeat anti-VM checks, model real syscall effects or follow other processes.
 
 ---
 

@@ -1,4 +1,4 @@
-"""Unit tests for Phase 1: Dynamic PEB/TEB Resolution & Architecture-Specific Offsets."""
+"""Unit tests for dynamic PEB/TEB Resolution & Architecture-Specific Offsets."""
 
 import pytest
 

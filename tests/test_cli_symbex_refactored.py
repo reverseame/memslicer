@@ -1,4 +1,4 @@
-"""Unit and End-to-End tests for Phase 4: Refactored CLI symbex, binary key injection, FPO fallback, and symbolic RAX check."""
+"""Unit and end-to-end tests for the refactored CLI symbex, binary key injection, FPO fallback, and symbolic RAX check."""
 
 import io
 import pytest

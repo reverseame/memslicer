@@ -155,5 +155,3 @@ def test_premap_stack_region():
 
     # Verify that address around RSP is now mapped
     assert _is_page_mapped(state.memory, 0x7FFBE668D624) is True
-
-

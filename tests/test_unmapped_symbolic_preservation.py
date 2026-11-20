@@ -1,4 +1,4 @@
-"""Unit tests for Phase 2 & P0 remediations: Preservación de Simbolismo, Mapeo Neutral, Rollback y Clasificación Estructurada."""
+"""Unit tests for unmapped-memory recovery: symbolic preservation, neutral mapping, rollback and structured classification."""
 
 import logging
 import pytest

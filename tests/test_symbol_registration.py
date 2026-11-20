@@ -1,4 +1,4 @@
-"""Unit tests for Phase 6: Multi-CLE Symbol Registration and Exported Symbol Hooking in angr.Project."""
+"""Unit tests for multi-CLE Symbol Registration and Exported Symbol Hooking in angr.Project."""
 
 import io
 from types import SimpleNamespace
