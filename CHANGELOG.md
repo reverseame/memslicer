@@ -131,6 +131,12 @@ All notable changes to this project will be documented in this file.
   thread pointer (Table 19g: `fs_base` on Linux/Android/FreeBSD x86_64,
   `gs_base` on Windows/macOS x64, `tpidrro_el0` on Apple ARM64, `x18` on
   Windows ARM64, ...), not on every segment base.
+- Threads dropped from the capture for lacking a program counter or stack
+  pointer (spec Section 5.7) are reported in one WARNING with their thread
+  ids and the missing register, instead of a DEBUG line per thread; when no
+  thread survives the message says the capture has no Thread Context
+  blocks. The summary shows them as `Threads : N (M dropped: no PC/SP)`
+  and `AcquireResult.threads_dropped` counts them.
 
 ### Bug Fixes
 
