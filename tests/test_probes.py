@@ -16,7 +16,7 @@ def _write_slice(path, code, *, code_prot=0b101):
     )
     from memslicer.msl.constants import (
         ArchType, CapBit, CompAlgo, OSType, PageState, RegionType,
-        REG_FLAG_PC, REG_FLAG_SP, THREAD_FLAG_CURRENT, ThreadState,
+        REG_ROLE_PC, REG_ROLE_SP, TC_FLAG_CURRENT, ThreadState,
     )
     page = code + b"\x90" * (PS - len(code))
     cap = ((1 << CapBit.MemoryRegions) | (1 << CapBit.ThreadContexts))
@@ -34,11 +34,10 @@ def _write_slice(path, code, *, code_prot=0b101):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
         w.write_thread_context(ThreadContext(
-            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=7, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=[
-                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"),
-                               REG_FLAG_SP),
+                ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(8, "little")),
             ]))
         w.finalize()
 

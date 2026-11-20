@@ -9,7 +9,7 @@ from memslicer.msl.types import (
 )
 from memslicer.msl.constants import (
     ArchType, CapBit, CompAlgo, OSType, PageState, RegionType,
-    REG_FLAG_PC, REG_FLAG_SP, THREAD_FLAG_CURRENT, ThreadState,
+    REG_ROLE_PC, REG_ROLE_SP, TC_FLAG_CURRENT, ThreadState,
 )
 
 PS = 4096
@@ -39,11 +39,11 @@ def _write_slice(path, *, with_regs=True):
             page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
         if with_regs:
             w.write_thread_context(ThreadContext(
-                thread_id=4321, flags=THREAD_FLAG_CURRENT,
-                state=ThreadState.Stopped, name="main", registers=[
-                    ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                    ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"), REG_FLAG_SP),
-                    ThreadRegister("rax", (0xcafe).to_bytes(8, "little"), 0),
+                thread_id=4321, flags=TC_FLAG_CURRENT,
+                state=ThreadState.STOPPED, name="main", registers=[
+                    ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                    ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(8, "little")),
+                    ThreadRegister("rax", 8, 0, (0xcafe).to_bytes(8, "little")),
                 ]))
         w.finalize()
 
@@ -80,15 +80,15 @@ def test_loader_normalises_arm64_aliases_and_arch_byte(tmp_path):
                      cap_bitmap=(1 << CapBit.ThreadContexts))
     with open(p, "wb") as f:
         w = MSLWriter(f, hdr, CompAlgo.NONE)
-        w.write_thread_context(ThreadContext(thread_id=1, flags=THREAD_FLAG_CURRENT, registers=[
-            ThreadRegister("pc", (0x1000).to_bytes(8, "little"), REG_FLAG_PC),
-            ThreadRegister("sp", (0x2000).to_bytes(8, "little"), REG_FLAG_SP),
-            ThreadRegister("fp", (0x3000).to_bytes(8, "little"), 0),
-            ThreadRegister("lr", (0x4000).to_bytes(8, "little"), 0),
+        w.write_thread_context(ThreadContext(thread_id=1, flags=TC_FLAG_CURRENT, registers=[
+            ThreadRegister("pc", 8, REG_ROLE_PC, (0x1000).to_bytes(8, "little")),
+            ThreadRegister("sp", 8, REG_ROLE_SP, (0x2000).to_bytes(8, "little")),
+            ThreadRegister("fp", 8, 0, (0x3000).to_bytes(8, "little")),
+            ThreadRegister("lr", 8, 0, (0x4000).to_bytes(8, "little")),
         ]))
         w.write_thread_context(ThreadContext(thread_id=2, arch=int(ArchType.ARM32), registers=[
-            ThreadRegister("pc", (0x10).to_bytes(4, "little"), REG_FLAG_PC),
-            ThreadRegister("lr", (0x20).to_bytes(4, "little"), 0),
+            ThreadRegister("pc", 4, REG_ROLE_PC, (0x10).to_bytes(4, "little")),
+            ThreadRegister("lr", 4, 0, (0x20).to_bytes(4, "little")),
         ]))
         w.finalize()
     img = load_slice(str(p))
@@ -175,7 +175,7 @@ def _write_code(path, code, regs):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
         w.write_thread_context(ThreadContext(
-            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=1, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=regs))
         w.finalize()
 
@@ -227,18 +227,18 @@ def _write_multithread_slice(path):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
         w.write_thread_context(ThreadContext(
-            thread_id=100, flags=THREAD_FLAG_CURRENT,
-            state=ThreadState.Running, name="main", registers=[
-                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"), REG_FLAG_SP),
-                ThreadRegister("rax", (0xaaaa).to_bytes(8, "little"), 0),
+            thread_id=100, flags=TC_FLAG_CURRENT,
+            state=ThreadState.RUNNING, name="main", registers=[
+                ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(8, "little")),
+                ThreadRegister("rax", 8, 0, (0xaaaa).to_bytes(8, "little")),
             ]))
         w.write_thread_context(ThreadContext(
             thread_id=200, flags=0,
-            state=ThreadState.Stopped, name="worker", registers=[
-                ThreadRegister("rip", SECOND_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", (STACK_VA + 0xe00).to_bytes(8, "little"), REG_FLAG_SP),
-                ThreadRegister("rax", (0xbbbb).to_bytes(8, "little"), 0),
+            state=ThreadState.STOPPED, name="worker", registers=[
+                ThreadRegister("rip", 8, REG_ROLE_PC, SECOND_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0xe00).to_bytes(8, "little")),
+                ThreadRegister("rax", 8, 0, (0xbbbb).to_bytes(8, "little")),
             ]))
         w.finalize()
 
@@ -325,8 +325,8 @@ def test_emulator_step_back_memory(tmp_path):
     code = bytes.fromhex("48c7c042410000" "48890424")
     p = tmp_path / "mem.msl"
     _write_code(p, code, [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("rsp", rsp.to_bytes(8, "little"), REG_FLAG_SP),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("rsp", 8, REG_ROLE_SP, rsp.to_bytes(8, "little")),
     ])
     emu = MSLEmulator(load_slice(str(p)))
     emu.step()                                        # mov rax, 0x4142
@@ -355,8 +355,8 @@ def test_emulator_detects_self_modifying_code(tmp_path):
                          + "c60390" + "ffe3")
     p = tmp_path / "smc.msl"
     _write_code(p, code, [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0x100).to_bytes(8, "little")),
     ])
     emu = MSLEmulator(load_slice(str(p)))
     assert emu.self_modified_exec() == []              # nothing executed yet
@@ -386,8 +386,8 @@ def test_cli_dump_written(tmp_path):
                          + "c60390" + "ffe3")
     p = tmp_path / "smc.msl"
     _write_code(p, code, [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0x100).to_bytes(8, "little")),
     ])
     outdir = tmp_path / "written"
     res = CliRunner().invoke(
@@ -405,8 +405,8 @@ XMM_VAL = 0x0123456789abcdef_fedcba9876543210  # 128-bit
 def test_loader_parses_vector_register(tmp_path):
     p = tmp_path / "v.msl"
     _write_code(p, b"\x90", [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("xmm0", XMM_VAL.to_bytes(16, "little"), 0),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("xmm0", 16, 0, XMM_VAL.to_bytes(16, "little")),
     ])
     img = load_slice(str(p))
     xmm = next(r for r in img.current_thread.registers if r.name == "xmm0")
@@ -421,9 +421,9 @@ def test_emulator_seeds_vector_register(tmp_path):
 
     p = tmp_path / "v.msl"
     _write_code(p, b"\x90", [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("rsp", (STACK_VA + 0x100).to_bytes(8, "little"), REG_FLAG_SP),
-        ThreadRegister("xmm0", XMM_VAL.to_bytes(16, "little"), 0),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0x100).to_bytes(8, "little")),
+        ThreadRegister("xmm0", 16, 0, XMM_VAL.to_bytes(16, "little")),
     ])
     emu = MSLEmulator(load_slice(str(p)))
     assert emu.read_reg("xmm0") == XMM_VAL           # 128-bit reg seeded
@@ -444,9 +444,9 @@ def test_emulator_honors_gs_base(tmp_path):
                          "65488b042560000000")
     p = tmp_path / "gs.msl"
     _write_code(p, code, [
-        ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-        ThreadRegister("rsp", (STACK_VA + 0x200).to_bytes(8, "little"), REG_FLAG_SP),
-        ThreadRegister("gs_base", STACK_VA.to_bytes(8, "little"), 0),
+        ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+        ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0x200).to_bytes(8, "little")),
+        ThreadRegister("gs_base", 8, 0, STACK_VA.to_bytes(8, "little")),
     ])
     emu = MSLEmulator(load_slice(str(p)))
     assert emu.segment_base("gs") == STACK_VA          # fs/gs base seeded
@@ -480,10 +480,10 @@ def test_emulator_peb_address(tmp_path):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[bytes(teb)]))
         w.write_thread_context(ThreadContext(
-            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=1, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=[
-                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("gs_base", STACK_VA.to_bytes(8, "little"), 0),
+                ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                ThreadRegister("gs_base", 8, 0, STACK_VA.to_bytes(8, "little")),
             ]))
         w.finalize()
     emu = MSLEmulator(load_slice(str(p)))
@@ -517,7 +517,7 @@ def _write_x86_slice(path, code, regs, *, extra_regions=()):
                 region_type=RegionType.Stack, page_size=PS,
                 page_states=[PageState.CAPTURED], page_data_chunks=[data]))
         w.write_thread_context(ThreadContext(
-            thread_id=1, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=1, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=regs))
         w.finalize()
 
@@ -534,9 +534,9 @@ def test_emulator_seeds_x86_fs_base_via_gdt(tmp_path):
     code = bytes.fromhex("64a130000000")                # mov eax, fs:[0x30]
     p = tmp_path / "x86fs.msl"
     _write_x86_slice(p, code, [
-        ThreadRegister("eip", CODE_VA.to_bytes(4, "little"), REG_FLAG_PC),
-        ThreadRegister("esp", (STACK_VA + 0xf00).to_bytes(4, "little"), REG_FLAG_SP),
-        ThreadRegister("fs_base", TEB.to_bytes(4, "little"), 0),
+        ThreadRegister("eip", 4, REG_ROLE_PC, CODE_VA.to_bytes(4, "little")),
+        ThreadRegister("esp", 4, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(4, "little")),
+        ThreadRegister("fs_base", 4, 0, TEB.to_bytes(4, "little")),
     ], extra_regions=[(TEB, bytes(teb))])
     emu = MSLEmulator(load_slice(str(p)))
     assert emu.segment_base("fs") == TEB               # GDT-seeded base
@@ -552,8 +552,8 @@ def test_emulator_x86_without_fs_base_still_runs(tmp_path):
 
     p = tmp_path / "x86plain.msl"
     _write_x86_slice(p, b"\x90", [                      # nop
-        ThreadRegister("eip", CODE_VA.to_bytes(4, "little"), REG_FLAG_PC),
-        ThreadRegister("esp", (STACK_VA + 0xf00).to_bytes(4, "little"), REG_FLAG_SP),
+        ThreadRegister("eip", 4, REG_ROLE_PC, CODE_VA.to_bytes(4, "little")),
+        ThreadRegister("esp", 4, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(4, "little")),
     ])
     emu = MSLEmulator(load_slice(str(p)))
     assert emu.segment_base("fs") is None              # no GDT installed
@@ -607,10 +607,10 @@ def _write_parked_slice(path, *, rsp=STACK_VA + 0x100, stack_layout=None):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[bytes(stack)]))
         w.write_thread_context(ThreadContext(
-            thread_id=964, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=964, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=[
-                ThreadRegister("rip", SYS_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", rsp.to_bytes(8, "little"), REG_FLAG_SP),
+                ThreadRegister("rip", 8, REG_ROLE_PC, SYS_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, rsp.to_bytes(8, "little")),
             ]))
         w.finalize()
 

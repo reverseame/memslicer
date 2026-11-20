@@ -7,7 +7,7 @@ from memslicer.msl.types import (
 )
 from memslicer.msl.constants import (
     ArchType, CapBit, CompAlgo, OSType, PageState, RegionType,
-    REG_FLAG_PC, REG_FLAG_SP, THREAD_FLAG_CURRENT, ThreadState,
+    REG_ROLE_PC, REG_ROLE_SP, TC_FLAG_CURRENT, ThreadState,
 )
 
 PS = 4096
@@ -33,11 +33,11 @@ def _write_slice(path):
             region_type=RegionType.Stack, page_size=PS,
             page_states=[PageState.CAPTURED], page_data_chunks=[b"\x00" * PS]))
         w.write_thread_context(ThreadContext(
-            thread_id=7, flags=THREAD_FLAG_CURRENT, state=ThreadState.Stopped,
+            thread_id=7, flags=TC_FLAG_CURRENT, state=ThreadState.STOPPED,
             name="main", registers=[
-                ThreadRegister("rip", CODE_VA.to_bytes(8, "little"), REG_FLAG_PC),
-                ThreadRegister("rsp", (STACK_VA + 0xf00).to_bytes(8, "little"), REG_FLAG_SP),
-                ThreadRegister("rax", (0xcafe).to_bytes(8, "little"), 0),
+                ThreadRegister("rip", 8, REG_ROLE_PC, CODE_VA.to_bytes(8, "little")),
+                ThreadRegister("rsp", 8, REG_ROLE_SP, (STACK_VA + 0xf00).to_bytes(8, "little")),
+                ThreadRegister("rax", 8, 0, (0xcafe).to_bytes(8, "little")),
             ]))
         w.finalize()
 
